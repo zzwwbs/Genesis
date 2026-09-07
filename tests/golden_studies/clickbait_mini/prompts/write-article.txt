@@ -1,0 +1,1 @@
+Write one article title and body consistent with the strategy in: {context}

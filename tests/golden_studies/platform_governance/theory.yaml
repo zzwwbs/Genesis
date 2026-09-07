@@ -1,0 +1,23 @@
+schema_version: "1.0"
+study_id: platform-governance
+theory_family: variation-selection-retention
+constructs:
+  - {id: creator-strategy, theory_role: variation_unit}
+  - {id: performance-history, theory_role: retention_state}
+process_mappings:
+  - {process: formulate-strategy, theory_function: variation}
+  - {process: generate-content, theory_function: variation}
+  - {process: platform-evaluation, theory_function: selection}
+  - {process: user-response, theory_function: selection}
+  - {process: performance-settlement, theory_function: selection}
+  - {process: strategy-update, theory_function: retention}
+  - {process: governance-feedback, theory_function: feedback}
+relations:
+  - {from: formulate-strategy, to: platform-evaluation, relation: produces-variant}
+  - {from: generate-content, to: user-response, relation: produces-artifact}
+  - {from: performance-settlement, to: strategy-update, relation: feeds-retention}
+feedback:
+  - {from: performance-history, to: formulate-strategy, relation: conditions-variation}
+observables:
+  - {id: strategy-diversity, definition: distinct retained strategies per round}
+  - {id: content-exposure, definition: exposed content artifacts per round}

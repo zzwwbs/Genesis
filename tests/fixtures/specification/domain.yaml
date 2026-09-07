@@ -1,0 +1,13 @@
+schema_version: "1.0"
+study_id: platform-governance
+actors: []
+attributes: []
+states: []
+artifacts: []
+mechanisms: []
+institutions: []
+initialization: {}
+visibility: []
+availability: []
+updates: []
+persistence: []

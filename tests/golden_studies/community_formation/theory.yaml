@@ -1,0 +1,14 @@
+schema_version: "1.0"
+study_id: community-formation
+theory_family: interpretation-enactment
+constructs:
+  - {id: shared-meaning, theory_role: interpretation_unit}
+process_mappings:
+  - {process: interpret-event, theory_function: interpretation}
+  - {process: enact-response, theory_function: enactment}
+  - {process: institutionalize-response, theory_function: institutionalization}
+  - {process: community-feedback, theory_function: feedback}
+relations:
+  - {from: interpret-event, to: enact-response, relation: informs}
+observables:
+  - {id: shared-artifact-count, definition: count of shared artifacts}

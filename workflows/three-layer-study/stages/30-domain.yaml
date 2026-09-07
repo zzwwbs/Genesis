@@ -1,0 +1,71 @@
+id: domain
+title: "Layer 3 \u2014 Domain Context"
+opening_question: In the substantive setting being modelled, who or what exists, what
+  can they observe, and what can change?
+instructions: Clarify actors, attributes, states, initialization, artifacts, ownership,
+  mechanisms, institutions, visibility, temporal availability, update rules, persistence,
+  empirical data, provenance, and manipulable context.
+owned_paths:
+- /domain
+clarification:
+  max_turns: 6
+critical_decisions:
+- id: actors-and-population
+  question: Which actor types and executable population instances are required?
+  rationale: They determine actor expansion and initialization.
+  target_paths: [/domain/actors, /domain/states]
+  required: true
+- id: process-state
+  question: Which persistent or transient state is actually used by a declared process?
+  rationale: It determines runtime state and persistence.
+  target_paths: [/domain/states, /domain/persistence]
+  required: true
+- id: artifacts-and-lifecycle
+  question: Which artifacts exist, who owns them, and how long do they remain available?
+  rationale: It determines artifact routing and lifecycle scope.
+  target_paths: [/domain/artifacts]
+  required: true
+- id: visibility-and-availability
+  question: Who may observe each input, and at what time or cardinality?
+  rationale: It determines enforceable context and exposure boundaries.
+  target_paths: [/domain/visibility, /domain/availability]
+  required: true
+- id: updates-and-mechanisms
+  question: Which actions update state, relationships, or institutional mechanisms?
+  rationale: It determines executable state transitions.
+  target_paths: [/domain/updates, /domain/mechanisms, /domain/institutions]
+  required: true
+- id: initialization-and-provenance
+  question: How are required actors and state initialized, and what is their provenance?
+  rationale: It determines whether a run can initialize reproducibly.
+  target_paths: [/domain/initialization]
+  required: true
+depends_on:
+- openness
+- theory
+checklist_items:
+- l3-domain-substance
+- l3-initialization
+ambiguity_topics:
+- actors
+- attributes
+- states
+- initialization
+- artifacts
+- ownership
+- mechanisms
+- institutions
+- visibility
+- temporal-availability
+- updates
+- persistence
+- empirical-data
+- provenance
+- manipulable-context
+completion_rules:
+- rule: required_checklist_complete
+- rule: no_consequential_ambiguity
+- rule: canonical_schema_valid
+templates:
+  domain: templates/domain.yaml
+approval_required: true

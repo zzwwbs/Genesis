@@ -1,0 +1,41 @@
+schema_version: "1.0"
+study_id: platform-governance
+processes:
+  - id: formulate-strategy
+    openness_rationale: Strategy emergence, modification, and persistence are focal phenomena.
+    closure_rationale: A predefined strategy menu would remove the variation the study observes.
+    executor: {mode: generative, model_profile: creator-model, parameters: {temperature: 0.7}}
+    context_policy: creator-strategy-context
+    prompt_ref: formulate-strategy
+    outputs: [{artifact_type: strategy, schema_ref: strategy-schema}]
+    trace_policy: {record_context: true, record_raw_response: true}
+    retry_policy: {max_attempts: 2}
+  - id: generate-content
+    openness_rationale: Content form is not uniquely determined by strategy and is consequential.
+    closure_rationale: A fixed content corpus would remove observed variation in artifacts.
+    executor: {mode: generative, model_profile: creator-model, parameters: {temperature: 0.8}}
+    context_policy: creator-content-context
+    prompt_ref: generate-content
+    dependencies: {after: [formulate-strategy]}
+    outputs: [{artifact_type: content, schema_ref: content-schema}]
+    trace_policy: {record_context: true, record_raw_response: true}
+  - id: platform-evaluation
+    executor: {}
+    context_policy: platform-context
+    dependencies: {after: [generate-content]}
+  - id: user-response
+    executor: {}
+    context_policy: platform-context
+    dependencies: {after: [platform-evaluation]}
+  - id: performance-settlement
+    executor: {}
+    context_policy: platform-context
+    dependencies: {after: [user-response]}
+  - id: strategy-update
+    executor: {}
+    context_policy: creator-strategy-context
+    dependencies: {after: [performance-settlement]}
+  - id: governance-feedback
+    executor: {}
+    context_policy: platform-context
+    dependencies: {after: [strategy-update]}

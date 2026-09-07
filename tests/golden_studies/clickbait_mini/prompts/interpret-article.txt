@@ -1,0 +1,1 @@
+Interpret the selected full article and return a bounded user action: {context}

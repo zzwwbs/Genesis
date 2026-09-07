@@ -1,0 +1,54 @@
+specification_id: platform-governance
+title: Platform governance (conversational)
+description: Elicited interactively through the five-stage chat workflow.
+theory_family: variation-selection-retention
+processes:
+  - formulate-strategy
+  - generate-content
+  - platform-evaluation
+  - user-response
+  - performance-settlement
+  - strategy-update
+  - governance-feedback
+mappings:
+  - {process: formulate-strategy, theory_function: variation}
+  - {process: generate-content, theory_function: variation}
+  - {process: platform-evaluation, theory_function: selection}
+  - {process: user-response, theory_function: selection}
+  - {process: performance-settlement, theory_function: selection}
+  - {process: strategy-update, theory_function: retention}
+  - {process: governance-feedback, theory_function: feedback}
+reopen: openness
+stages:
+  study-foundation:
+    answers:
+      - "A platform where creators produce content and governance rules shape outcomes."
+    draft:
+      - {op: replace, path: /study/title, value: "Platform governance (conversational)"}
+      - {op: replace, path: /study/description, value: "Elicited interactively through the five-stage chat workflow."}
+  openness:
+    answers:
+      - "Strategy choice is open-ended."
+      - {suggestion_index: 0, answer: "Creators decide what to publish."}
+    draft:
+      - {op: replace, path: /openness/processes, value: [{id: formulate-strategy, executor: {mode: deterministic}, context_policy: public}, {id: generate-content, executor: {mode: deterministic}, context_policy: public}, {id: platform-evaluation, executor: {mode: deterministic}, context_policy: public}, {id: user-response, executor: {mode: deterministic}, context_policy: public}, {id: performance-settlement, executor: {mode: deterministic}, context_policy: public}, {id: strategy-update, executor: {mode: deterministic}, context_policy: public}, {id: governance-feedback, executor: {mode: deterministic}, context_policy: public}]}
+  theory:
+    answers:
+      - "Variation, selection, and retention explain aggregate platform outcomes."
+    draft:
+      - {op: replace, path: /theory/theory_family, value: variation-selection-retention}
+      - {op: replace, path: /theory/process_mappings, value: [{process: formulate-strategy, theory_function: variation}, {process: generate-content, theory_function: variation}, {process: platform-evaluation, theory_function: selection}, {process: user-response, theory_function: selection}, {process: performance-settlement, theory_function: selection}, {process: strategy-update, theory_function: retention}, {process: governance-feedback, theory_function: feedback}]}
+      - {op: replace, path: /theory/feedback, value: [{from: performance-history, to: strategy-update, relation: retention-feeds-variation}]}
+      - {op: add, path: /theory/constructs/-, value: {id: creator-strategy, theory_role: variation_unit}}
+  domain:
+    answers:
+      - "Creators, strategies, and performance histories constitute the setting."
+    draft:
+      - {op: replace, path: /domain/actors, value: [{id: creator}]}
+      - {op: replace, path: /domain/artifacts, value: [{id: creator-strategy}, {id: performance-history}]}
+      - {op: replace, path: /domain/mechanisms, value: [{id: platform-recommendation, implements: selection}]}
+  experiment-design:
+    answers:
+      - "Compare visible and hidden performance across repeated rounds."
+    draft:
+      - {op: replace, path: /protocol/time_model/end, value: 12}

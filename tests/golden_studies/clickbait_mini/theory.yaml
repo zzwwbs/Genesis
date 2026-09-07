@@ -1,0 +1,28 @@
+schema_version: "1.0"
+study_id: clickbait-mini
+theory_family: platform-governance-social-influence
+constructs:
+  - {id: strategic-adaptation, theory_role: creator adaptation}
+  - {id: platform-enforcement, theory_role: governance intervention}
+  - {id: bounded-attention, theory_role: user attention constraint}
+  - {id: peer-influence, theory_role: social visibility}
+process_mappings:
+  - {process: form-strategy, theory_function: strategic adaptation}
+  - {process: write-article, theory_function: content production}
+  - {process: detect-clickbait, theory_function: bounded semantic classification}
+  - {process: apply-governance, theory_function: institutional enforcement}
+  - {process: recommend-titles, theory_function: bounded candidate generation}
+  - {process: select-title, theory_function: selective attention}
+  - {process: interpret-article, theory_function: situated interpretation}
+  - {process: update-relations, theory_function: longitudinal feedback}
+  - {process: expose-peers, theory_function: peer influence}
+relations:
+  - {from: strategic-adaptation, to: platform-enforcement, relation: produces governed content}
+  - {from: peer-influence, to: strategic-adaptation, relation: informs later decisions}
+feedback:
+  - {from: creator-memory, to: form-strategy, relation: retained experience}
+delays:
+  - {process: form-strategy, rounds: 1}
+observables:
+  - {id: clickbait-rate, definition: share of detected articles}
+  - {id: creator-revenue, definition: creator revenue after governance}

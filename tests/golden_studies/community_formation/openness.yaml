@@ -1,0 +1,23 @@
+schema_version: "1.0"
+study_id: community-formation
+processes:
+  - id: interpret-event
+    openness_rationale: Interpretation of community events is the focal open phenomenon.
+    closure_rationale: Enumerating interpretations ex ante would pre-determine the outcome.
+    executor: {mode: generative, model_profile: member-model, parameters: {temperature: 0.5}}
+    context_policy: member-context
+    prompt_ref: interpret
+    outputs: [{artifact_type: interpretation, schema_ref: interpretation-schema}]
+  - id: enact-response
+    executor: {}
+    context_policy: member-context
+    dependencies: {after: [interpret-event]}
+    state_effects: [{field: meeting-records, op: set}]
+  - id: institutionalize-response
+    executor: {}
+    context_policy: member-context
+    dependencies: {after: [enact-response]}
+  - id: community-feedback
+    executor: {}
+    context_policy: member-context
+    dependencies: {after: [institutionalize-response]}

@@ -1,0 +1,9 @@
+schema_version: "1.0"
+study_id: community-formation
+time_model: {type: rounds, start: 0, end: 4, step: 1}
+conditions:
+  - {id: baseline}
+replications: 1
+matching: {mode: none}
+random_streams: []
+model_freezing: true

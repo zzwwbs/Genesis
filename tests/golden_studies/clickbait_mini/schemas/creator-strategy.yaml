@@ -1,0 +1,6 @@
+type: object
+properties:
+  framing: {type: string}
+  tactics: {type: array, items: {type: string}}
+required: [framing]
+additionalProperties: true

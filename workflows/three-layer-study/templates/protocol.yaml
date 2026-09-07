@@ -1,0 +1,5 @@
+schema_version: '1.0'
+study_id: '{{study_id}}'
+time_model:
+  type: rounds
+  end: 10

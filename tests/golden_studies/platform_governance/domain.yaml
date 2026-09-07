@@ -1,0 +1,34 @@
+schema_version: "1.0"
+study_id: platform-governance
+actors:
+  - {id: creator, theory_role: variation-producer}
+  - {id: user}
+attributes:
+  - id: audience-size
+    value_type: integer
+    origin: {origin: imported, evidence_refs: [init-population]}
+  - id: orientation
+    value_type: string
+    origin: {origin: imported, evidence_refs: [init-population]}
+states:
+  - {id: population, value_type: object, persistence: across_rounds}
+  - {id: performance-history, value_type: object, persistence: across_rounds}
+  - {id: retained-strategy, value_type: object, initial: {}, persistence: across_rounds}
+artifacts:
+  - {id: creator-strategy, artifact_type: strategy, schema_ref: strategy-schema, visibility: owner}
+  - {id: content, artifact_type: content, schema_ref: content-schema, visibility: platform}
+  - {id: performance-record, artifact_type: record}
+mechanisms:
+  - {id: platform-recommendation, implements: selection}
+  - {id: user-engagement, implements: selection}
+institutions:
+  - {id: governance-regime, type: rule-set}
+initialization:
+  mode: empirical
+  data_source: data/population.csv
+  state_field: population
+  origin: imported
+visibility:
+  - {id: creator-strategy-context, allow: [population, performance-history, retained-strategy]}
+  - {id: creator-content-context, allow: [population, retained-strategy]}
+  - {id: platform-context, allow: [population, retained-strategy]}

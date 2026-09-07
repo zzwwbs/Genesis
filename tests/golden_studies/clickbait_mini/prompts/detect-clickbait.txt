@@ -1,0 +1,1 @@
+Classify clickbait using only the supplied title and body. Return the required schema: {context}

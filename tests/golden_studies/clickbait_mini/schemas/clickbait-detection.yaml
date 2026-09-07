@@ -1,0 +1,8 @@
+type: object
+properties:
+  article_id: {type: string}
+  detected: {type: boolean}
+  confidence: {type: number}
+  items: {type: array, items: {type: object}}
+required: [detected]
+additionalProperties: false

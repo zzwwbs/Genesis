@@ -1,0 +1,61 @@
+id: theory
+title: "Layer 2 \u2014 Theory-Specific Process Logic"
+opening_question: What theoretical explanation should connect generated actions to
+  subsequent social consequences and change over time?
+instructions: Suggest applicable registered theory templates and an exploratory/custom
+  option. Clarify constructs, theoretical functions, Layer 1 process mappings, relations,
+  feedback, transformation, delays, consequence/selection mechanisms, persistence,
+  and observables.
+owned_paths:
+- /theory
+clarification:
+  max_turns: 5
+critical_decisions:
+- id: theoretical-functions
+  question: Which constructs or theoretical functions are needed to answer the focal question?
+  rationale: They define the explanatory roles validated across the process graph.
+  target_paths: [/theory/constructs]
+  required: true
+- id: process-mappings
+  question: How do the declared processes map to those theoretical functions?
+  rationale: It binds executable processes to the claimed explanation.
+  target_paths: [/theory/process_mappings]
+  required: true
+- id: causal-relations
+  question: Which relations or consequence mechanisms connect the theoretical functions?
+  rationale: They define how generated actions acquire consequences.
+  target_paths: [/theory/relations]
+  required: true
+- id: feedback-and-delays
+  question: What feedback, retention, persistence, or delay changes later behavior?
+  rationale: It defines longitudinal causal structure.
+  target_paths: [/theory/feedback, /theory/delays]
+  required: true
+- id: theoretical-observables
+  question: Which observables would indicate the proposed mechanism occurred?
+  rationale: They constrain downstream outcome definitions.
+  target_paths: [/theory/observables]
+  required: true
+depends_on:
+- openness
+checklist_items:
+- l2-theory-logic
+- l2-process-relations
+ambiguity_topics:
+- constructs
+- theory-functions
+- process-mappings
+- relations
+- feedback
+- transformation
+- delays
+- mechanisms
+- persistence
+- observables
+completion_rules:
+- rule: required_checklist_complete
+- rule: no_consequential_ambiguity
+- rule: canonical_schema_valid
+templates:
+  theory: templates/theory.yaml
+approval_required: true

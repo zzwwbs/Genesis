@@ -1,0 +1,66 @@
+id: openness
+title: "Layer 1 \u2014 Generative Openness"
+opening_question: Which participant decisions, interpretations, communications, or
+  creative actions must remain open-ended rather than represented by fixed rules?
+instructions: 'Determine whether each proposed process is scientifically consequential
+  and unresolved ex ante. Do not infer approval. Draft targets: openness.yaml, preliminary
+  prompt files, and schema placeholders.'
+owned_paths:
+- /openness
+- /prompts
+clarification:
+  max_turns: 6
+critical_decisions:
+- id: open-processes
+  question: Which substantively consequential processes must remain open-ended?
+  rationale: It determines which processes require generative or semantic execution.
+  target_paths: [/openness/processes]
+  required: true
+- id: actors-and-triggers
+  question: Who performs each process, and when is it triggered?
+  rationale: It determines actor expansion and scheduling.
+  target_paths: [/openness/processes]
+  required: true
+- id: information-context
+  question: What information may legitimately condition each process?
+  rationale: It determines context-policy references and prevents information leakage.
+  target_paths: [/openness/processes]
+  required: true
+- id: outputs-and-consumers
+  question: What typed artifacts must each process produce for downstream use?
+  rationale: It determines schemas, artifact routing, and process dependencies.
+  target_paths: [/openness/processes]
+  required: true
+- id: executor-bindings
+  question: Which executor, model, and prompt realize each open or semantic process?
+  rationale: It determines executable provider and prompt bindings.
+  target_paths: [/openness/processes, /prompts]
+  required: true
+- id: trace-and-retry
+  question: What trace retention and retry behavior is required for these processes?
+  rationale: It determines reproducibility and failure handling.
+  target_paths: [/openness/processes]
+  required: true
+depends_on:
+- study-foundation
+checklist_items:
+- l1-openness-need
+- l1-selective-closure
+- l1-informational-position
+- l1-output-control
+- l1-model-dependence
+- l1-traceability
+ambiguity_topics:
+- openness-necessity
+- actors
+- triggers
+- informational-position
+- outputs
+- traceability
+completion_rules:
+- rule: required_checklist_complete
+- rule: no_consequential_ambiguity
+- rule: canonical_schema_valid
+templates:
+  openness: templates/openness.yaml
+approval_required: true

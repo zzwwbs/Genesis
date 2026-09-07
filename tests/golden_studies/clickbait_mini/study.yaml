@@ -1,0 +1,15 @@
+schema_version: "1.0"
+study_id: clickbait-mini
+title: Clickbait governance mini conformance study
+description: Four creators and eight users across a matched 3 x 2 governance experiment.
+owners: [genesis-research-team]
+artifact_refs:
+  - creator-strategy
+  - article-title
+  - article-body
+  - clickbait-detection
+  - governance-decision
+  - recommendation-set
+  - title-selection
+  - user-action
+  - peer-exposure

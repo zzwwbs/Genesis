@@ -1,0 +1,13 @@
+schema_version: '1.0'
+study_id: '{{study_id}}'
+processes: []
+# Each processes entry must be a mapping, for example:
+# - id: formulate-strategy
+#   executor: {mode: generative, model_profile: study-model}
+#   context_policy: creator-context
+#   openness_rationale: Strategy content cannot be enumerated in advance.
+#   closure_rationale: Timing and authorised inputs are fixed by the experiment.
+#   prompt_ref: formulate-strategy
+#   outputs: [{artifact_type: strategy, schema_ref: strategy-schema}]
+# Use the supplied canonical schema for exact fields and declare references in
+# the appropriate later stages. Never insert a descriptive sentence as an entry.

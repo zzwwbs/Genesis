@@ -1,0 +1,72 @@
+schema_version: "1.0"
+study_id: clickbait-mini
+actors:
+  - {id: creator, theory_role: strategic content producer}
+  - {id: user, theory_role: bounded audience member}
+  - {id: platform, theory_role: recommender and detector}
+  - {id: regulator, theory_role: governance designer}
+states:
+  - id: population
+    value_type: object
+    initial:
+      creators:
+        - {id: creator-1, topic: health}
+        - {id: creator-2, topic: finance}
+        - {id: creator-3, topic: technology}
+        - {id: creator-4, topic: culture}
+      users:
+        - {id: user-1}
+        - {id: user-2}
+        - {id: user-3}
+        - {id: user-4}
+        - {id: user-5}
+        - {id: user-6}
+        - {id: user-7}
+        - {id: user-8}
+  - {id: latent-strategies, value_type: object, initial: {}, persistence: retained}
+  - id: revenue
+    value_type: object
+    initial: {creator-1: 0, creator-2: 0, creator-3: 0, creator-4: 0}
+    persistence: retained
+  - {id: follows, value_type: array, initial: [], persistence: retained}
+  - {id: creator-memory, value_type: object, initial: {}, persistence: retained}
+artifacts:
+  - {id: creator-strategy, artifact_type: object, schema_ref: creator-strategy, visibility: private, lifecycle_scope: round}
+  - {id: article-title, artifact_type: object, schema_ref: article-title, visibility: public, lifecycle_scope: round}
+  - {id: article-body, artifact_type: object, schema_ref: article-body, visibility: selected, lifecycle_scope: round}
+  - {id: clickbait-detection, artifact_type: object, schema_ref: clickbait-detection, visibility: platform, lifecycle_scope: round}
+  - {id: governance-decision, artifact_type: object, schema_ref: governance-decision, visibility: condition-dependent, lifecycle_scope: round}
+  - {id: recommendation-set, artifact_type: object, schema_ref: recommendation-set, visibility: private, lifecycle_scope: event}
+  - {id: title-selection, artifact_type: object, schema_ref: title-selection, visibility: private, lifecycle_scope: event}
+  - {id: user-action, artifact_type: object, schema_ref: user-action, visibility: public, lifecycle_scope: event}
+  - {id: peer-exposure, artifact_type: object, schema_ref: peer-exposure, visibility: condition-dependent, lifecycle_scope: round}
+visibility:
+  - id: creator-context
+    allow: [state.creator-memory, state.revenue, inputs, condition]
+  - id: detector-context
+    allow: [inputs, condition.factors.governance]
+  - id: governance-context
+    allow: [inputs, condition.factors.governance]
+  - id: title-context
+    allow: [inputs]
+    cardinality: {inputs: 3}
+  - id: full-article-context
+    allow: [inputs]
+    available_when:
+      inputs: {event: article-selected, recipient_match: true, source_match_event: true}
+  - id: user-state-context
+    allow: [state.follows, state.creator-memory, inputs]
+  - id: peer-context
+    allow: [inputs, condition.factors.peer-visibility]
+    cardinality: {inputs: 4}
+    available_when:
+      inputs:
+        predicate: {path: condition.factors.peer-visibility, op: eq, value: high}
+updates:
+  - {state: follows, op: add-relation, declared_by: update-relations}
+  - {state: creator-memory, op: set, declared_by: update-relations}
+  - {state: revenue, op: set, declared_by: apply-governance}
+persistence:
+  - {object: follows, policy: retained-across-rounds}
+  - {object: creator-memory, policy: retained-across-rounds}
+  - {object: revenue, policy: retained-across-rounds}

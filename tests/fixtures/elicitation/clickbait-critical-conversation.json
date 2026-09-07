@@ -1,0 +1,69 @@
+{
+  "opening_answer": "Study how platform governance of clickbait changes creator strategies, comparing none, opaque, and disclosed governance under low and high peer visibility.",
+  "ready_response": {
+    "status": "ready_to_draft",
+    "summary": "The focal question, executable boundary, and comparison objective are covered.",
+    "evidence": [
+      {
+        "claim": "The researcher identified creator strategy, governance conditions, and peer visibility.",
+        "source_turns": [1]
+      }
+    ],
+    "decision_coverage": [
+      {
+        "decision_id": "focal-question",
+        "status": "covered",
+        "evidence_turns": [1]
+      },
+      {
+        "decision_id": "simulation-boundary",
+        "status": "covered",
+        "evidence_turns": [1]
+      },
+      {
+        "decision_id": "comparison-objective",
+        "status": "covered",
+        "evidence_turns": [1]
+      }
+    ],
+    "ambiguities": []
+  },
+  "irrelevant_response": {
+    "status": "needs_clarification",
+    "summary": "The assistant asks for descriptive detail that cannot alter the executable model.",
+    "evidence": [],
+    "decision_coverage": [
+      {
+        "decision_id": "focal-question",
+        "status": "covered",
+        "evidence_turns": [1]
+      },
+      {
+        "decision_id": "simulation-boundary",
+        "status": "covered",
+        "evidence_turns": [1]
+      },
+      {
+        "decision_id": "comparison-objective",
+        "status": "covered",
+        "evidence_turns": [1]
+      }
+    ],
+    "ambiguities": [
+      {
+        "id": "creator-biographies",
+        "decision_id": "creator-biographies",
+        "target_paths": ["/study/description"],
+        "question": "What are the complete biographies of every creator?",
+        "reason": "This supplies descriptive background but does not affect any configured process.",
+        "consequential": true,
+        "suggestions": [
+          {"label": "Detailed", "value": "Provide detailed biographies."},
+          {"label": "Brief", "value": "Provide brief biographies."},
+          {"label": "None", "value": "Do not provide biographies."}
+        ]
+      }
+    ]
+  }
+}
+

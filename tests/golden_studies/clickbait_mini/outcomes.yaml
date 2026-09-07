@@ -1,0 +1,15 @@
+schema_version: "1.0"
+study_id: clickbait-mini
+outcomes:
+  - id: clickbait-rate
+    source: clickbait-detection
+    grouping: [condition_id, phase]
+    aggregation: {op: mean, field: detected}
+  - id: creator-revenue
+    source: governance-decision
+    grouping: [condition_id, phase]
+    aggregation: {op: sum, field: revenue_delta}
+  - id: user-action-rate
+    source: user-action
+    grouping: [condition_id, phase]
+    aggregation: {op: count}

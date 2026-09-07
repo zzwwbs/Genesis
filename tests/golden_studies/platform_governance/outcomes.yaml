@@ -1,0 +1,16 @@
+schema_version: "1.0"
+study_id: platform-governance
+outcomes:
+  - id: strategy-diversity
+    source: events
+    filters: []
+    grouping: []
+    aggregation: {type: trajectory, field: phase}
+    missingness: {policy: exclude}
+    window: {start: 0, end: 6, time_field: time}
+  - id: governance-engagement
+    source: events
+    filters: []
+    grouping: []
+    aggregation: {type: count, field: phase}
+    missingness: {policy: exclude}

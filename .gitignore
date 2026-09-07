@@ -1,0 +1,66 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Office temporary files ---
+~$*.docx
+~$*.doc
+~$*.xlsx
+
+# --- Logs ---
+*.log
+
+# --- GENESIS runtime workspaces (generated local state) ---
+.genesis/
+genesis-workspace/
+studies/
+builds/
+exports/
+checkpoints/
+
+# local agent logs (keep out of public repo)
+.claude/
+
+# generated demo build artifacts (regenerable; canonical packages are source-form)
+demos/demo-workspace/
+
+# demo stage code (executors/runners/example packages) - not part of the public library
+/demos/
+
+# internal development documentation
+/docs/
+
+# internal root design spec (not public)
+/GENESIS_Complete_System_Design_Specification.md

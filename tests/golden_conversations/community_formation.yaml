@@ -1,0 +1,46 @@
+specification_id: community-formation
+title: Community formation (conversational)
+description: Elicited interactively through the five-stage chat workflow.
+theory_family: interpretation-enactment
+processes:
+  - interpret-event
+  - enact-response
+  - institutionalize-response
+  - community-feedback
+mappings:
+  - {process: interpret-event, theory_function: interpretation}
+  - {process: enact-response, theory_function: enactment}
+  - {process: institutionalize-response, theory_function: institutionalization}
+  - {process: community-feedback, theory_function: feedback}
+stages:
+  study-foundation:
+    answers:
+      - "A community builds shared meaning through repeated interaction."
+    draft:
+      - {op: replace, path: /study/title, value: "Community formation (conversational)"}
+      - {op: replace, path: /study/description, value: "Elicited interactively through the five-stage chat workflow."}
+  openness:
+    answers:
+      - "Members interpret events and respond."
+      - "Responses become institutionalized over time."
+    draft:
+      - {op: replace, path: /openness/processes, value: [{id: interpret-event, executor: {mode: deterministic}, context_policy: public}, {id: enact-response, executor: {mode: deterministic}, context_policy: public}, {id: institutionalize-response, executor: {mode: deterministic}, context_policy: public}, {id: community-feedback, executor: {mode: deterministic}, context_policy: public}]}
+  theory:
+    answers:
+      - "Interpretation and enactment institutionalize shared meaning."
+    draft:
+      - {op: replace, path: /theory/theory_family, value: interpretation-enactment}
+      - {op: replace, path: /theory/process_mappings, value: [{process: interpret-event, theory_function: interpretation}, {process: enact-response, theory_function: enactment}, {process: institutionalize-response, theory_function: institutionalization}, {process: community-feedback, theory_function: feedback}]}
+      - {op: replace, path: /theory/relations, value: [{from: institutionalize-response, to: interpret-event, relation: structural}]}
+      - {op: add, path: /theory/constructs/-, value: {id: shared-meaning, theory_role: interpretation_unit}}
+  domain:
+    answers:
+      - "Shared meaning forms across members and artifacts."
+    draft:
+      - {op: replace, path: /domain/actors, value: [{id: member}]}
+      - {op: replace, path: /domain/artifacts, value: [{id: shared-meaning}]}
+  experiment-design:
+    answers:
+      - "Track artifact counts over rounds."
+    draft:
+      - {op: replace, path: /protocol/time_model/end, value: 8}

@@ -1,0 +1,191 @@
+"""Export paper evidence from the workspace into docs/demos/evidence/ (versioned).
+
+Produces:
+- evidence/theory-pilot-large.yaml          - 5.2 excerpt source (approved theory spec)
+- evidence/compiled-build-<hash8>/          - 5.3 excerpt sources (compiled Study Build:
+                                             process_graph.json, processes.json,
+                                             context_policies.json, build_manifest.json, ...)
+- evidence/run-manifest-<run>.json          - 5.4 run manifest (build identity, model/prompt
+                                             versions, seeds, provenance)
+- evidence/trace-chain-<run>.json           - 5.4 trace excerpt: one generated artifact ->
+                                             user response event -> recorded downstream effects
+- evidence/README.md                        - evidence map (item -> file -> what to show)
+
+No model calls are made; only versioned/derived files are written.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+WORKSPACE = ROOT / "genesis-workspace"
+OUT = ROOT / "docs" / "demos" / "evidence"
+PACKAGE = ROOT / "demos" / "large-chain-package"
+BUILD_DIR = WORKSPACE / "builds" / "pilot-large-check"
+RUN_ID = "pilot-large-gate-3"
+
+
+def objs(digest: str):
+    for cand in (
+        WORKSPACE / ".genesis" / "objects" / digest[:2] / digest[2:],
+        WORKSPACE / ".genesis" / "objects" / digest,
+    ):
+        try:
+            return json.loads(cand.read_text())
+        except Exception:
+            continue
+    return None
+
+
+def main() -> int:
+    import sqlite3
+
+    if OUT.is_dir():
+        shutil.rmtree(OUT)
+    OUT.mkdir(parents=True)
+
+    # 1) theory spec (5.2)
+    shutil.copy(PACKAGE / "theory.yaml", OUT / "theory-pilot-large.yaml")
+
+    # 2) compiled Study Build (5.3)
+    manifest = json.loads((BUILD_DIR / "build_manifest.json").read_text())
+    build_hash = str(manifest.get("build_hash", "unknown"))[:8]
+    build_out = OUT / f"compiled-build-{build_hash}"
+    shutil.copytree(BUILD_DIR, build_out)
+
+    # 3) run manifest (5.4)
+    con = sqlite3.connect(WORKSPACE / ".genesis" / "genesis.db")
+    try:
+        row = con.execute("SELECT payload_json FROM runs WHERE run_id=?", (RUN_ID,)).fetchone()
+        if not row:
+            print(f"run {RUN_ID} not found")
+            return 1
+        run_payload = json.loads(row[0])
+        run_manifest = run_payload.get("manifest")
+        (OUT / f"run-manifest-{RUN_ID}.json").write_text(
+            json.dumps(run_manifest, indent=2, sort_keys=True)
+        )
+
+        # 4) trace chain: user-action artifact -> interpret event -> user-act event ->
+        #    resulting analytics record
+        target: dict | None = None
+        producer_event_id = ""
+        for event_id, pref, kind in con.execute(
+            "SELECT event_id, payload_ref, kind FROM events WHERE run_id=?", (RUN_ID,)
+        ).fetchall():
+            payload = objs(str(pref))
+            if payload and payload.get("process_id") == "user-act" and payload.get("phase") == 0:
+                target = payload
+                break
+        if target is None:
+            print("no user-act@0 event")
+            return 1
+        input_refs = target.get("input_refs") or []
+        input_ref = input_refs[0] if input_refs else ""
+        # artifact row + its producer event
+        artifact_row = con.execute(
+            "SELECT artifact_id, payload_ref FROM artifacts WHERE artifact_id=?",
+            (input_ref,),
+        ).fetchone()
+        artifact_value = objs(str(artifact_row[1])) if artifact_row else None
+        # parent events of the user-act event (the interpret event)
+        parent_events = target.get("parent_events") or []
+        chain = {
+            "run_id": RUN_ID,
+            "event": {
+                "event_id": target.get("event_id"),
+                "invocation_id": target.get("invocation_id"),
+                "context_hash": target.get("context_hash"),
+                "input_refs": input_refs,
+                "input_artifact": {
+                    "artifact_id": input_ref,
+                    "value": (artifact_value or {}).get("value"),
+                },
+                "state_delta": target.get("state_delta"),
+                "parent_events": parent_events,
+            },
+            "note": (
+                "One generated user-action artifact is resolved as the input to user-act; "
+                "the state_delta records the resulting analytics change."
+            ),
+        }
+        (OUT / f"trace-chain-{RUN_ID}.json").write_text(
+            json.dumps(chain, indent=2, sort_keys=True, default=str)
+        )
+    finally:
+        con.close()
+
+    # 5) README evidence map
+    first_user_act = None
+    con = sqlite3.connect(WORKSPACE / ".genesis" / "genesis.db")
+    try:
+        for event_id, pref, kind in con.execute(
+            "SELECT event_id, payload_ref, kind FROM events WHERE run_id=?", (RUN_ID,)
+        ).fetchall():
+            payload = objs(str(pref))
+            if payload and payload.get("process_id") == "user-act":
+                first_user_act = payload.get("event_id")
+                break
+    finally:
+        con.close()
+    (OUT / "README.md").write_text(f"""# Paper evidence pack (Mode-B large-chain)
+
+Versioned, generated by `python tools/export_evidence.py` (no model calls).
+Caveat: `{RUN_ID}` is the DIAGNOSTIC gate run; the manuscript should cite the
+CLEAN four-round gate on the candidate build (`compiled-build-{build_hash}/`)
+once it is executed. The candidate build here is compiled but not yet run.
+
+## 5.2 — theory specification excerpt
+- File: `theory-pilot-large.yaml` (package version: see `compiled-build-{build_hash}/build_manifest.json` → package hash / compiler 1.0)
+- Show: the `relations:`/`feedback:` rows — retained performance -> strategies and
+  performance -> formulate-strategy ("reflected outcomes enter subsequent
+  strategy formulation") plus the `retention`/`feedback` constructs.
+- Judgment behind the relationship (use instead of a screenshot of the chat):
+  `docs/demos/2026-09-pilot-protocol-outcome-plan-FROZEN.md` (feedback/one-round
+  latency sections) and the per-process `openness_rationale` fields in
+  `compiled-build-{build_hash}/processes.json`; commit `7eac8ce`/`d447ba0`/`baae85f`
+  record the design decisions.
+- Full identities (appendix): build_manifest.json (build/source/compiler hashes,
+  model_versions, prompt_versions, random_streams).
+
+## 5.3 — compiled Study Build excerpts
+- Directory: `compiled-build-{build_hash}/`
+- Panel A (process graph): `process_graph.json` — nodes + dependency edges; the
+  path user-interpret -> user-act -> update-follow-relation -> recommend is
+  present (deps recorded on each node).
+- Panel B (contracts): from `processes.json` — `user-act` declares
+  `inputs: ["user-action"]`, `context_policy: user-act-context`,
+  deps `["user-interpret"]`, `state_effects` for analytics/actions/user-history;
+  `update-follow-relation` declares `context_policy: follow-context` and the
+  follows state effect; from `context_policies.json` — `user-act-context`
+  allow `["exposure-detail","articles","titles","inputs"]`,
+  `follow-context` allow `["actions","follows"]`.
+- Format note: these ARE the compiled JSON artifacts (study build), not YAML.
+
+## 5.4 — run manifest + provenance trace
+- Run manifest: `run-manifest-{RUN_ID}.json` — build_hash, compiler_version,
+  genesis_version, model_versions (gpt-5.6-luna), prompt_versions, protocol_hash,
+  random_streams (seed 55001), resolved seeds, package hash/version, provenance.
+- Trace excerpt: `trace-chain-{RUN_ID}.json` — one generated `user-action`
+  artifact -> the `user-act` event consuming it (`input_refs` + input value) ->
+  `state_delta` (resulting analytics change); the event carries
+  `invocation_id`, `context_hash`, `parent_events`.
+- Trace-explorer UI: not built; for the paper use the JSON excerpt above
+  (cropped), or request a minimal HTML trace viewer around this schema.
+
+## Rejected authorization probe
+Not part of this repo; if it refers to the earlier UI probe, its full test
+context belongs in the appendix as a test-tooling note, not the run evidence.
+""")
+    print("evidence pack:", sorted(p.name for p in OUT.iterdir()))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

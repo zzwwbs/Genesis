@@ -1,0 +1,4 @@
+type: object
+properties:
+  meaning: {type: string}
+required: [meaning]

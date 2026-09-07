@@ -1,0 +1,15 @@
+schema_version: "1.0"
+study_id: platform-governance
+time_model: {type: rounds, start: 0, end: 6, step: 1}
+termination: []
+conditions:
+  - {id: transparency-visible}
+  - {id: transparency-hidden}
+replications: 2
+matching: {mode: none}
+random_streams:
+  - {id: stream-a, seed: 42}
+model_freezing: true
+budgets: {max_generative_calls: 200}
+checkpoints: {interval: 10}
+replay_retention: {mode: full}

@@ -1,0 +1,4 @@
+schema_version: "1.0"
+study_id: community-formation
+models:
+  - {id: member-model, provider: openai-compatible, model: member-gpt, parameters: {temperature: 0.5}}

@@ -1,0 +1,2 @@
+You are a creator. Given your strategy, produce one content artifact.
+Context: {context}

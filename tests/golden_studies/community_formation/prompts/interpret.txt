@@ -1,0 +1,2 @@
+You are a community member. Interpret the latest recorded events.
+Context: {context}

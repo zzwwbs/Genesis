@@ -1,0 +1,17 @@
+schema_version: "1.0"
+study_id: community-formation
+actors:
+  - {id: member}
+attributes:
+  - {id: role, value_type: string, origin: {origin: researcher}}
+states:
+  - {id: meeting-records, value_type: object, initial: {}}
+artifacts:
+  - {id: shared-artifact, artifact_type: interpretation, schema_ref: interpretation-schema}
+mechanisms:
+  - {id: facilitation, implements: enactment}
+institutions:
+  - {id: meeting-norms, type: rule-set}
+initialization: {mode: researcher}
+visibility:
+  - {id: member-context, allow: [meeting-records]}

@@ -1,0 +1,7 @@
+type: object
+properties:
+  article_id: {type: string}
+  creator_id: {type: string}
+  title: {type: string}
+required: [article_id, creator_id, title]
+additionalProperties: true

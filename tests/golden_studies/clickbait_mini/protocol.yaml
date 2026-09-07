@@ -1,0 +1,21 @@
+schema_version: "1.0"
+study_id: clickbait-mini
+time_model: {type: rounds, start: 1, end: 6, step: 1}
+termination: [{type: phase-end, value: 6}]
+factors:
+  - {id: governance, levels: [none, opaque, disclosed]}
+  - {id: peer-visibility, levels: [low, high]}
+phases:
+  - {id: baseline, start: 1, end: 3}
+  - {id: treatment, start: 4, end: 6}
+replications: 1
+matching:
+  enabled: true
+  shared_streams: [initial-world, conventional]
+random_streams:
+  - {id: initial-world, seed: 1101}
+  - {id: conventional, seed: 2202}
+model_freezing: true
+budgets: {max_events: 1000, max_candidate_titles: 3, max_reads_per_user_round: 1}
+checkpoints: {every_round: true}
+replay_retention: {raw_responses: true, provider_metadata: true}

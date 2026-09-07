@@ -1,0 +1,15 @@
+schema_version: "1.0"
+study_id: platform-governance
+time_model:
+  type: rounds
+  start: 0
+  end: 10
+termination: []
+conditions: []
+replications: 1
+matching: {}
+random_streams: []
+model_freezing: true
+budgets: {}
+checkpoints: {}
+replay_retention: {}

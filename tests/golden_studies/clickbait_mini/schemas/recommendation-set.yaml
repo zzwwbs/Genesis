@@ -1,0 +1,6 @@
+type: object
+properties:
+  user_id: {type: string}
+  title_ids: {type: array, maxItems: 3, items: {type: string}}
+required: [user_id, title_ids]
+additionalProperties: false

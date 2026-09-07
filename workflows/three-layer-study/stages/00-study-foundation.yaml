@@ -1,0 +1,50 @@
+id: study-foundation
+title: Study Foundation
+opening_question: Briefly describe the social phenomenon, research question, intended
+  contribution, and setting you want to simulate.
+instructions: 'Establish the unit and level of analysis, focal phenomenon, population,
+  setting, temporal scope, comparisons, motivation, ownership, and sources. Draft
+  targets: study.yaml and shared study metadata.'
+owned_paths:
+- /study
+clarification:
+  max_turns: 4
+critical_decisions:
+- id: focal-question
+  question: What causal, comparative, or generative question should the simulation answer?
+  rationale: It defines the phenomenon that later processes, conditions, and outcomes must address.
+  target_paths: [/study/description]
+  required: true
+- id: simulation-boundary
+  question: What is the minimum unit, level, and setting the executable model must represent?
+  rationale: It constrains the actors and processes that later layers must instantiate.
+  target_paths: [/study/extensions/genesis.elicitation/simulation-boundary]
+  required: true
+- id: comparison-objective
+  question: What variation or comparison must the experiment eventually distinguish?
+  rationale: It constrains downstream conditions and outcome comparisons.
+  target_paths: [/study/extensions/genesis.elicitation/comparison-objective]
+  required: true
+- id: owners-and-sources
+  question: Which owners and sources should be recorded for documentation?
+  rationale: These values document provenance but do not change execution.
+  target_paths: [/study/owners, /study/source_citations]
+  required: false
+  default_allowed: true
+checklist_items: []
+ambiguity_topics:
+- unit-of-analysis
+- focal-phenomenon
+- population
+- setting
+- temporal-scope
+- comparisons
+- motivation
+- ownership
+- sources
+completion_rules:
+- rule: canonical_schema_valid
+- rule: no_consequential_ambiguity
+templates:
+  study: templates/study.yaml
+approval_required: true

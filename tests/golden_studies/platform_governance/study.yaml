@@ -1,0 +1,6 @@
+schema_version: "1.0"
+study_id: platform-governance
+title: Creator adaptation under platform governance
+description: Evolutionary platform-governance illustration study.
+owners: [researcher-a]
+source_citations: [doi:10.1000/platform-governance]

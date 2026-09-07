@@ -1,0 +1,82 @@
+id: experiment-design
+title: Experiment Design
+opening_question: What comparisons, conditions, replications, and measurements are
+  needed to answer the research question?
+instructions: Clarify the time model, termination, conditions, interventions, replications,
+  random streams, matching, initialization, model profiles, parameter freezing, prompts,
+  complete output schemas, budgets, checkpoints, outcomes, joins, grouping, temporal
+  windows, missingness, replay, and retention.
+owned_paths:
+- /protocol
+- /outcomes
+- /models
+- /schemas
+clarification:
+  max_turns: 6
+critical_decisions:
+- id: time-and-termination
+  question: What time model, phases, and stopping rule does the experiment require?
+  rationale: It determines scheduler phases and termination.
+  target_paths: [/protocol/time_model, /protocol/phases, /protocol/termination]
+  required: true
+- id: conditions-and-interventions
+  question: Which conditions and interventions must be compared, and when do they apply?
+  rationale: It determines experiment cells and treatment realization.
+  target_paths: [/protocol/factors, /protocol/conditions, /protocol/interventions]
+  required: true
+- id: replication-and-randomness
+  question: How many replications, random streams, and matching constraints are needed?
+  rationale: It determines causal comparability and reproducibility.
+  target_paths: [/protocol/replications, /protocol/random_streams, /protocol/matching]
+  required: true
+- id: model-and-schema-freezing
+  question: Which model profiles and structured-output contracts must be frozen?
+  rationale: It determines provider bindings and publication-run stability.
+  target_paths: [/models/models, /protocol/model_freezing]
+  required: true
+- id: outcome-plan
+  question: Which artifact-backed outcomes, aggregations, groups, and windows answer the question?
+  rationale: It determines executable outcome evaluation.
+  target_paths: [/outcomes/outcomes]
+  required: true
+- id: operational-controls
+  question: Which budgets, checkpoints, replay data, and retention settings are required?
+  rationale: It determines run bounds and reproducibility evidence.
+  target_paths: [/protocol/budgets, /protocol/checkpoints, /protocol/replay_retention]
+  required: true
+depends_on:
+- study-foundation
+- openness
+- theory
+- domain
+checklist_items: []
+ambiguity_topics:
+- time-model
+- termination
+- conditions
+- interventions
+- replications
+- random-streams
+- matching
+- initialization
+- model-profiles
+- parameter-freezing
+- prompts
+- schemas
+- budgets
+- checkpoints
+- outcomes
+- joins
+- grouping
+- temporal-windows
+- missingness
+- replay
+- retention
+completion_rules:
+- rule: canonical_schema_valid
+- rule: no_consequential_ambiguity
+templates:
+  protocol: templates/protocol.yaml
+  outcomes: templates/outcomes.yaml
+  models: templates/models.yaml
+approval_required: true

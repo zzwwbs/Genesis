@@ -1,0 +1,8 @@
+type: object
+properties:
+  article_id: {type: string}
+  penalty: {type: number}
+  revenue_delta: {type: number}
+  disclosed: {type: boolean}
+required: [penalty]
+additionalProperties: true

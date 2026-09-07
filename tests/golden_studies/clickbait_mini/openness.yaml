@@ -1,0 +1,113 @@
+schema_version: "1.0"
+study_id: clickbait-mini
+processes:
+  - id: form-strategy
+    actors: {source: population.creators, id_field: id}
+    trigger: {phase: 1, repeat: true}
+    openness_rationale: Creator strategy is an open-ended focal phenomenon.
+    closure_rationale: Only the structured output boundary is fixed.
+    executor: {mode: generative, model_profile: creator-model, parameters: {temperature: 0.7}}
+    context_policy: creator-context
+    prompt_ref: form-strategy
+    inputs: [peer-exposure]
+    outputs: [{artifact_type: creator-strategy, schema_ref: creator-strategy}]
+    trace_policy: {record_context: true, record_raw_response: true}
+    retry_policy: {max_attempts: 2}
+  - id: write-article
+    actors: {source: population.creators, id_field: id}
+    trigger: {phase: 1, repeat: true}
+    dependencies: {after: [form-strategy]}
+    openness_rationale: Article form and framing are endogenous creative products.
+    closure_rationale: Title and body schemas are fixed for downstream use.
+    executor: {mode: generative, model_profile: creator-model, parameters: {temperature: 0.8}}
+    context_policy: creator-context
+    prompt_ref: write-article
+    inputs: [creator-strategy]
+    outputs:
+      - {artifact_type: article-title, schema_ref: article-title}
+      - {artifact_type: article-body, schema_ref: article-body}
+    trace_policy: {record_context: true, record_raw_response: true}
+  - id: detect-clickbait
+    actors: [platform-1]
+    trigger: {phase: 1, repeat: true}
+    dependencies: {after: [write-article]}
+    executor: {mode: semantic-evaluator, model_profile: evaluator-model, parameters: {temperature: 0}}
+    context_policy: detector-context
+    prompt_ref: detect-clickbait
+    inputs: [article-title, article-body]
+    outputs: [{artifact_type: clickbait-detection, schema_ref: clickbait-detection}]
+  - id: apply-governance
+    actors: [platform-1]
+    trigger: {phase: 1, repeat: true}
+    dependencies: {after: [detect-clickbait]}
+    executor:
+      mode: rule
+      parameters:
+        rules:
+          - when:
+              all:
+                - {path: condition.factors.governance, op: eq, value: disclosed}
+                - {path: artifacts.clickbait-detection.0.detected, op: eq, value: true}
+            outputs: {governance-decision: {penalty: 0.5, revenue_delta: -0.5, disclosed: true}}
+            state_effects:
+              revenue: {creator-1: -1, creator-2: -1, creator-3: -1, creator-4: -1}
+          - when:
+              all:
+                - {path: condition.factors.governance, op: eq, value: opaque}
+                - {path: artifacts.clickbait-detection.0.detected, op: eq, value: true}
+            outputs: {governance-decision: {penalty: 0.5, revenue_delta: -0.5, disclosed: false}}
+            state_effects:
+              revenue: {creator-1: -1, creator-2: -1, creator-3: -1, creator-4: -1}
+        default: {outputs: {governance-decision: {penalty: 0.0, revenue_delta: 0.0, disclosed: false}}}
+    context_policy: governance-context
+    inputs: [clickbait-detection]
+    outputs: [{artifact_type: governance-decision, schema_ref: governance-decision}]
+    state_effects: [{field: revenue, op: set}]
+  - id: recommend-titles
+    actors: {source: population.users, id_field: id}
+    trigger: {phase: 1, repeat: true}
+    dependencies: {after: [apply-governance]}
+    executor: {mode: computational, parameters: {entry_point: executor_functions:computational_double}}
+    context_policy: title-context
+    inputs: [article-title, governance-decision]
+    outputs: [{artifact_type: recommendation-set, schema_ref: recommendation-set}]
+  - id: select-title
+    actors: {source: population.users, id_field: id}
+    trigger: {phase: 1, repeat: true}
+    dependencies: {after: [recommend-titles]}
+    executor: {mode: stochastic, parameters: {function: executor_functions:stochastic_tick, random_stream: conventional}}
+    context_policy: title-context
+    inputs: [recommendation-set]
+    outputs: [{artifact_type: title-selection, schema_ref: title-selection}]
+  - id: interpret-article
+    actors: {source: population.users, id_field: id}
+    trigger: {phase: 1, repeat: true}
+    dependencies: {after: [select-title]}
+    executor: {mode: semantic-evaluator, model_profile: evaluator-model, parameters: {temperature: 0}}
+    context_policy: full-article-context
+    prompt_ref: interpret-article
+    inputs: [article-body, title-selection]
+    outputs: [{artifact_type: user-action, schema_ref: user-action}]
+  - id: update-relations
+    actors: {source: population.users, id_field: id}
+    trigger: {phase: 1, repeat: true}
+    dependencies: {after: [interpret-article]}
+    executor:
+      mode: state-transition
+      parameters:
+        operations:
+          - {op: add-relation, state: follows, value: {source: user-1, target: creator-1}}
+          - {op: set, state: creator-memory, value: {last-round-observed: true}}
+    context_policy: user-state-context
+    inputs: [user-action]
+    state_effects:
+      - {field: follows, op: add-relation}
+      - {field: creator-memory, op: set}
+  - id: expose-peers
+    actors: {source: population.creators, id_field: id}
+    trigger: {phase: 1, repeat: true}
+    dependencies: {after: [update-relations]}
+    executor: {mode: computational, parameters: {entry_point: executor_functions:computational_double}}
+    context_policy: peer-context
+    inputs: [user-action]
+    outputs: [{artifact_type: peer-exposure, schema_ref: peer-exposure}]

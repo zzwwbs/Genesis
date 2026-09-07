@@ -1,0 +1,23 @@
+
+id: three-layer-study
+version: "1.0"
+title: Interactive three-layer study design
+instructions: instructions.md
+session_persistence: disk
+theory_templates: theory-templates
+stages:
+  - study-foundation
+  - openness
+  - theory
+  - domain
+  - experiment-design
+invalidation:
+  openness.processes:
+    - theory.process_mappings
+    - domain.mechanisms
+    - domain.artifacts
+    - outcomes.outcomes
+  domain.states:
+    - openness.inputs
+    - protocol.conditions
+    - outcomes.outcomes
