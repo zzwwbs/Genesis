@@ -610,7 +610,9 @@ def test_limit_reached_with_unresolved_questions_approves_with_deferred_notes(
     result = service.approve_elicitation_stage(session["session_id"], approved_by="researcher")
     assert result["status"] != "failed"
     stored = service._elicitation_engine.require_session(session["session_id"])
-    foundation = stored.stages.get("study-foundation") or stored.stages.get(stored.current_stage)
+    assert stored.stages.get("study-foundation") or stored.stages.get(stored.current_stage), (
+        "the limited stage must still resolve"
+    )
     approved_stages = [
         progress for progress in stored.stages.values() if progress.status == "approved"
     ]

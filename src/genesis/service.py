@@ -37,7 +37,7 @@ from genesis.elicitation import (
     SpecificationPatch as ElicitationSpecificationPatch,
 )
 from genesis.extensions import ExtensionManifest, ExtensionRegistry
-from genesis.persistence import PersistenceCoordinator
+from genesis.persistence import ObjectRef, PersistenceCoordinator
 from genesis.providers import (
     OpenAICompatibleProvider,
     ProviderExecutor,
@@ -2629,7 +2629,7 @@ class GenesisService:
         # artifacts (detection). Synthesize flat rows so the plan's semantics match
         # the driver-side aggregation over the same sources.
         derived_rows: list[dict[str, Any]] = []
-        seen_analytic: set[tuple] = set()
+        seen_analytic: set[tuple[Any, Any]] = set()
         seen_articles: set[str] = set()
         for event in event_rows:
             delta = event.get("state_delta") or {}
@@ -2660,7 +2660,7 @@ class GenesisService:
         for row in artifact_rows:
             if row.get("process_id") != "evaluate-clickbait":
                 continue
-            artifact_id = row.get("artifact_id")
+            artifact_id = str(row.get("artifact_id") or "")
             if artifact_id in seen_detections:
                 continue
             seen_detections.add(artifact_id)
@@ -4168,7 +4168,7 @@ class GenesisService:
                 phase = int(action.get("phase", event.get("phase", 0)))
                 rule_applied = "first realized follow"
             else:
-                earliest: tuple = (10**9, 10**9, "")
+                earliest: tuple[int, int, str] = (10**9, 10**9, "")
                 for event in self.trace_run(run_id):
                     delta = event.get("state_delta") or {}
                     for record in delta.get("analytics") or []:
@@ -4186,7 +4186,7 @@ class GenesisService:
                 rule_applied = "natural non-follow (earliest high-engagement user)"
         else:
             if phase is None:
-                candidates = []
+                candidates: list[tuple[int, int]] = []
                 for event in self.trace_run(run_id):
                     delta = event.get("state_delta") or {}
                     for record in delta.get("analytics") or []:
@@ -4208,7 +4208,7 @@ class GenesisService:
             self.trace_run(run_id), key=lambda e: (e.get("phase", 0), e.get("commit_order", 0))
         )
         steps: list[dict[str, Any]] = []
-        seen_first: set[tuple] = set()
+        seen_first: set[tuple[Any, Any]] = set()
         brief_artifact_id = ""
         brief_value: dict[str, Any] = {}
         action_artifact_id = ""
@@ -4220,10 +4220,10 @@ class GenesisService:
             if (
                 event.get("process_id") == "recommend"
                 and event.get("phase") == phase
-                and "exposure" not in steps
+                and not any(s.get("step") == "exposure" for s in steps)
             ):
-                detail = delta.get("exposure-detail") or {}
-                if isinstance(detail, dict) and user in detail:
+                detail: dict[str, Any] = delta.get("exposure-detail") or {}
+                if isinstance(detail, dict) and str(user) in [str(k) for k in detail]:
                     steps.append(
                         {
                             "step": "exposure",
@@ -4234,7 +4234,7 @@ class GenesisService:
             if (
                 event.get("process_id") == "select-titles"
                 and event.get("phase") == phase
-                and user in (event.get("actors") or [])
+                and user in [str(a) for a in (event.get("actors") or ())]
             ):
                 for record in delta.get("selections") or []:
                     if isinstance(record, dict) and record.get("user") == user:
@@ -4249,7 +4249,7 @@ class GenesisService:
             if (
                 event.get("process_id") == "user-interpret"
                 and event.get("phase") == phase
-                and user in (event.get("actors") or [])
+                and user in [str(a) for a in (event.get("actors") or ())]
             ):
                 input_refs = list(event.get("input_refs") or ())
                 brief_artifact_id = input_refs[0] if input_refs else ""
@@ -4263,16 +4263,16 @@ class GenesisService:
             if (
                 event.get("process_id") == "user-act"
                 and event.get("phase") == phase
-                and user in (event.get("actors") or [])
+                and user in [str(a) for a in (event.get("actors") or ())]
             ):
                 input_refs = list(event.get("input_refs") or ())
                 action_artifact_id = input_refs[0] if input_refs else ""
                 analytics_row = None
                 for record in delta.get("analytics") or []:
                     if isinstance(record, dict) and record.get("user") == user:
-                        key = (record.get("user"), record.get("phase"))
-                        if key not in seen_first:
-                            seen_first.add(key)
+                        analytics_key = (record.get("user"), record.get("phase"))
+                        if analytics_key not in seen_first:
+                            seen_first.add(analytics_key)
                             analytics_row = record
                 steps.append(
                     {
@@ -4350,6 +4350,7 @@ class GenesisService:
         machinery is not reconstructed.
         """
         import hashlib
+        import sqlite3
 
         source_path = self.resolve_path(source)
         if not source_path.is_dir():
@@ -4412,11 +4413,7 @@ class GenesisService:
             (object_root / digest[:2]).mkdir(parents=True, exist_ok=True)
             (object_root / digest[:2] / digest[2:]).write_bytes(payload_json.encode())
             self.persistence._record_object(
-                type(
-                    "_ObjectRef",
-                    (),
-                    {"digest": digest, "media_type": "application/json", "size": len(payload_json)},
-                )
+                ObjectRef(digest=digest, media_type="application/json", size=len(payload_json))
             )
             return digest
 
@@ -4426,9 +4423,9 @@ class GenesisService:
         # instead of silently producing an empty trace under a fresh run id.
         burst = [str(e.get("event_id", "")) for e in events[:50] if e.get("event_id")]
         if burst:
+            placeholders = ",".join(["?"] * len(burst))
             existing = self.persistence.connection.execute(
-                "SELECT event_id FROM events WHERE event_id IN (%s) LIMIT 1"
-                % ",".join("?" * len(burst)),
+                f"SELECT event_id FROM events WHERE event_id IN ({placeholders}) LIMIT 1",
                 burst,
             ).fetchone()
             if existing is not None:
