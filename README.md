@@ -168,9 +168,10 @@ Replays (`full`/`artifact`/`partial`/`branch`) are available through the Run vie
 ```bash
 ruff check src tests tools
 ruff format --check src tests tools
+mypy src
 python -m pytest -q
-python tools/check_measurement_isolation.py
-python tools/check_traceability.py
 ```
+
+`tools/check_measurement_isolation.py` and `tools/check_traceability.py` are internal-development utilities that validate non-public study assets (a candidate study package and the requirements-traceability map); they are not part of the public CI checks.
 
 External commands remain disabled in the first local release. Network model providers require an explicitly configured OpenAI-compatible profile and researcher-supplied credentials. Workspace extensions must be explicitly enabled and should be treated as trusted code.

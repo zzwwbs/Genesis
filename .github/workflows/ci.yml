@@ -17,5 +17,4 @@ jobs:
       - run: ruff check src tests tools/check_traceability.py
       - run: ruff format --check src tests tools/check_traceability.py
       - run: mypy src
-      - run: python tools/check_traceability.py
       - run: pytest
