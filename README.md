@@ -2,9 +2,12 @@
 
 GENESIS is a local-first generative agent-based modelling system for researchers studying complex social dynamics. Release 1 is a Python modular monolith: study specifications are authored as versioned YAML, compiled into immutable builds, executed locally, and persisted in SQLite with content-addressed objects. Analytical exports can be queried with the lightweight analysis layer and extended later with DuckDB/Parquet.
 
-This README doubles as a run recipe for an AI agent: it explains how to author, compile, execute, and inspect a study end to end using only this repository — no pre-built experiment package is required.
+This README provides two instruction sets:
 
-## Quick start
+- **[Part 1 — Instructions for an AI agent](#part-1--instructions-for-an-ai-agent)**: how to author, compile, execute, and inspect a study headlessly using only this repository — no pre-built experiment package required.
+- **[Part 2 — Instructions for a human researcher](#part-2--instructions-for-a-human-researcher)**: the interactive, approval-gated web workflow (specification elicitation, running, and inspecting studies in the browser).
+
+## Quick start (both)
 
 ```bash
 python -m venv .venv
@@ -15,31 +18,37 @@ genesis version
 genesis serve --workspace ./genesis-workspace
 ```
 
-The API binds to `127.0.0.1` by default. Open http://127.0.0.1:8000/ui for the browser workflow or http://127.0.0.1:8000/docs for the API console.
+Open http://127.0.0.1:8000/ui for the browser workflow or http://127.0.0.1:8000/docs for the API console.
 
-## Configure an OpenAI-compatible model
+---
 
-Generative processes call a model through a **model profile**; deterministic-only studies need none. In `/ui` → Models: enter a profile ID, compatible base URL, model name, and the name of an environment variable holding the API key (for example `OPENAI_API_KEY`). Set it before starting the server:
+# Part 1 — Instructions for an AI agent
+
+This part is written for an agent driving GENESIS programmatically. Workflows that require a human in the loop are described in Part 2.
+
+## 1. Configure an OpenAI-compatible model
+
+Generative processes call a model through a **model profile**; deterministic-only studies need none. A profile needs a compatible base URL, model name, and an API key read from an environment variable:
 
 ```bash
 export OPENAI_API_KEY="your-key"
-genesis serve --workspace ./genesis-workspace --port 8765
+genesis serve --workspace ./genesis-workspace
 ```
 
-Save the profile, use **Check key** and **Test connection**, then select the profile for generative processes. The key is read by the server at request time and is never stored in the profile, study YAML, SQLite database, build, or export. Compilation makes no provider calls; model calls occur only during an explicit connection test or execution of an approved run.
+```python
+from genesis.service import GenesisService
+svc = GenesisService("./genesis-workspace")
+svc.create_model_profile({
+    "id": "openai-default", "provider": "openai-compatible",
+    "model": "<model>", "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+})
+svc.test_model_profile("openai-default")
+```
 
-## The browser workflow (approval-gated)
+The key is read at request time and never stored in the profile, study YAML, SQLite database, build, or export. Compilation makes no provider calls.
 
-The `/ui` workflow is deliberately approval-gated:
-
-1. **Models** — register and test a model profile (above).
-2. **Specification** — author the study through the three-layer elicitation (staged workflow declared in `workflows/three-layer-study/`): study foundation → openness → theory → domain → experiment design. Each stage: the assistant asks clarifying questions (three editable suggestions per question) → request a draft → review the preview (YAML diff, files, evidence, assumptions, warnings) → approve explicitly; approving writes a new immutable package version. Revisions mark dependent downstream stages `needs_review`. After the final approval the package is approved and versioned.
-3. **Run** — compile the approved specification (15 JSON artifacts under `builds/<study>/`, immutable build hash), then create and execute a run. Every run freezes a manifest: build/source/compiler hashes, model and prompt versions, seeds, and data provenance.
-4. **Outputs** — inspect the run: dashboard counts, outcome evaluation, full run trace, phase-grouped trace explorer, natural trace (frozen rule), per-user traces, and the exportable evidence bundle. Runs executed elsewhere can be imported from an exported bundle.
-
-Alternatively, author the canonical package directly as YAML and compile headlessly (below), or use the chat elicitation API (`POST /elicitation/sessions` with `workflow_id: three-layer-study`) for scripted authoring.
-
-## The canonical study package
+## 2. The canonical study package
 
 A study is 7 YAML files plus optional `prompts/`, `schemas/`, `data/` directories:
 
@@ -51,7 +60,7 @@ A study is 7 YAML files plus optional `prompts/`, `schemas/`, `data/` directorie
 - `outcomes.yaml` — outcome measures over events/artifacts/states
 - `models.yaml` — model profiles used by generative processes
 
-## Headless run (scripted agent)
+## 3. Headless run
 
 ```python
 from genesis.service import GenesisService
@@ -65,12 +74,12 @@ events = svc.trace_run("run-1")
 svc.export_run("run-1", "exports/run-1")
 ```
 
-## Implementing processes
+## 4. Implementing processes
 
 - **Computational** processes declare `executor.parameters.entry_point = "module:function"`. The function receives a `ProcessInvocation` with `actor_ids`, `phase`, a read-only `context` scoped by the process's context policy (allow-listed state; mutable collections are frozen — use `collections.abc.Mapping`, never `isinstance(dict)`), and `inputs` (resolved artifact instances). Return a `ProcessResult` with `outputs` and declared `state_effects`. Reference implementations live in `tests/executor_functions.py`; contracts are exercised by `tests/test_actor_instance_execution.py` and `tests/test_artifact_instance_routing.py`.
 - **Generative** processes declare `prompt_ref` (a `prompts/*.txt` template supporting `{context}`, `{actor_ids}`, `{phase}`), an `outputs` artifact with a JSON schema, and `openness_rationale`/`closure_rationale`. The model must answer with schema-valid JSON only; schemas use single JSON types (union `type` arrays are not supported by validation).
 
-## Key concepts for agents
+## 5. Key concepts for agents
 
 - **Prior-phase dependency semantics** — `dependencies.after` gates a process on the dependency's last completed phase; use it for one-round causal latency (e.g., performance → reflection → next-round strategy).
 - **Terminal settlement** — add a settlement-only phase after the final content round: content processes declare `terminal_skip: true` (default) and only settlement runs there. Set `GENESIS_TERMINAL_PHASE=<end>` before launching for run-scale control.
@@ -78,17 +87,7 @@ svc.export_run("run-1", "exports/run-1")
 - **Immutability & provenance** — builds, events, artifacts, and state snapshots are content-hashed; replays (full/artifact/partial/branch) reconstruct traces from the same records; exported run bundles carry `run_manifest.json` + `events.json` + `artifacts.json` plus an `integrity.json` digest manifest and can be imported into any workspace (`tools/export_traces.py`, `tools/rename_run.py` for trace slicing and re-keyed copies).
 - **Trace selection for evidence** — pick ONE trace per run under a rule frozen *before* execution (e.g., the first naturally occurring target event, else a documented fallback), then render it deterministically with `GET /runs/{id}/natural-trace`. Post-hoc browsing (`?user=&phase=`) is for inspection, not evidence.
 
-## Package layout
-
-- `genesis.specification` — canonical Pydantic schemas and validation contracts.
-- `genesis.compiler` — package loading, cross-reference validation, deterministic builds, integrity manifests.
-- `genesis.persistence` — SQLite WAL coordinator and content-addressed object storage.
-- `genesis.runtime` — immutable invocation/result contracts, context/state/artifact services, scheduler, executors, run controller.
-- `genesis.providers` — provider-neutral model adapters, deterministic mock, recorded-artifact provider.
-- `genesis.provenance` / `genesis.replay` — immutable lineage and replay modes.
-- `genesis.analysis` — declarative outcome evaluation and JSON/CSV export helpers.
-
-## Useful endpoints
+## 6. Useful endpoints
 
 | Purpose | Endpoint |
 |---|---|
@@ -99,9 +98,72 @@ svc.export_run("run-1", "exports/run-1")
 | Compiled process graph | `GET /builds/{ref}/processes` |
 | Export / import run bundles | `POST /exports` · `POST /runs/import` |
 | Replays | `POST /runs/{id}/replays` (`full`/`artifact`/`partial`/`branch`) |
-| Elicitation | `POST /elicitation/sessions` (chat authoring) |
+| Elicitation (scripted authoring) | `POST /elicitation/sessions` with `workflow_id: three-layer-study` |
 
-## Development
+---
+
+# Part 2 — Instructions for a human researcher
+
+This part walks a human through the interactive web workflow in `/ui`. Every state-changing step is approval-gated: drafts cannot be compiled until they are explicitly approved.
+
+## 1. Configure a model in the UI
+
+Open `/ui` → **Models**. Enter a profile ID, the OpenAI-compatible base URL, the model name, and the name of an environment variable containing the API key (for example `OPENAI_API_KEY`). Set that variable before starting the server:
+
+```bash
+export OPENAI_API_KEY="your-key"
+genesis serve --workspace ./genesis-workspace --port 8765
+```
+
+Save the profile, use **Check key** and **Test connection**, then select the profile for the generative process. Deterministic-only studies can skip this step.
+
+## 2. Specification — chat-first three-layer elicitation
+
+Open `/ui` → **Specification**. Authoring is a conversational, stage-by-stage workflow (the staged workflow content — stages, questions, templates, invalidation — lives under `workflows/three-layer-study/` and is configurable without code changes):
+
+1. **Start a session** in the chat workspace (or `POST /elicitation/sessions` with `specification_id`, `workflow_id: three-layer-study`, `model_profile_id`, `researcher_id`).
+2. **Answer the opening question.** The assistant asks one clarifying question at a time, each with exactly three editable suggestions — select, edit, or ignore them; free-form answers are first-class researcher evidence.
+3. **Request a draft** and **review the preview**: YAML diff, full files, evidence, assumptions, warnings, and errors.
+4. **Approve each stage explicitly.** Approval writes a new immutable package version. Use *revise* to return to clarification, or *cancel* to discard the in-memory session.
+5. **Upstream revisions** mark dependent downstream stages `needs_review`; re-approve them to continue.
+6. After the **final stage approval** the package is approved and versioned — ready to compile.
+
+Notes: unfinished sessions are intentionally in-memory only — a service restart discards them, while every accepted specification version survives. Provider errors leave the session retryable at the same question. Alternatively, author the 7 canonical YAML files directly and import them (`POST /imports`).
+
+## 3. Run — compile and execute
+
+Open `/ui` → **Run**:
+
+1. **Compile** the approved specification. Compilation is deterministic and makes no provider calls; it emits a build directory (`builds/<study>/`, 15 JSON artifacts) with an immutable build hash, plus validation and integrity manifests.
+2. **Create and execute** the run. Every run freezes a manifest recording its configuration: build/source/compiler hashes, model and prompt versions, condition, random streams and resolved seeds, and data provenance.
+3. Inspect the run status and review errors if any phase fails; retry policy and failure handling are recorded in the run log.
+
+## 4. Outputs — inspect the evidence
+
+Open `/ui` → **Outputs**. Choose the run from the **Explore run** selector (demo runs and imported bundles both appear):
+
+- **Dashboard** — overview counts of studies, builds, runs, experiments.
+- **Evaluate outcomes** — the Outcome Plan applied to the selected run (aggregates computed from the executed trace).
+- **Show run trace / Trace explorer** — the run's events as an ordered list or grouped by phase.
+- **Natural trace (frozen rule)** — the single rule-selected trace for the run (evidence-grade; deterministic).
+- **Trace by user…** — inspect any individual user's chain (ad-hoc, labeled `user-specified`).
+- **Process map** — the compiled process graph for the run's build.
+- **Export evidence bundle** — writes the full evidence package (outcomes, events, artifacts, manifests, integrity digests) to `exports/…`.
+- **Import run bundle…** — load a run exported elsewhere (integrity-verified) into this workspace for exploration.
+
+Replays (`full`/`artifact`/`partial`/`branch`) are available through the Run view and `POST /runs/{id}/replays` and reconstruct a run's trace from its recorded boundaries.
+
+## 5. Package layout (for maintainers)
+
+- `genesis.specification` — canonical Pydantic schemas and validation contracts.
+- `genesis.compiler` — package loading, cross-reference validation, deterministic builds, integrity manifests.
+- `genesis.persistence` — SQLite WAL coordinator and content-addressed object storage.
+- `genesis.runtime` — immutable invocation/result contracts, context/state/artifact services, scheduler, executors, run controller.
+- `genesis.providers` — provider-neutral model adapters, deterministic mock, recorded-artifact provider.
+- `genesis.provenance` / `genesis.replay` — immutable lineage and replay modes.
+- `genesis.analysis` — declarative outcome evaluation and JSON/CSV export helpers.
+
+## 6. Development
 
 ```bash
 ruff check src tests tools
