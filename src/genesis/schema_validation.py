@@ -18,7 +18,13 @@ from typing import Any
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from referencing import Registry, Resource
-from referencing.exceptions import Unresolvable
+from referencing.exceptions import (
+    InvalidAnchor,
+    NoSuchAnchor,
+    NoSuchResource,
+    PointerToNowhere,
+    Unresolvable,
+)
 from referencing.jsonschema import DRAFT202012
 
 PACKAGE_DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -203,37 +209,51 @@ class PackageSchemaCatalog:
             registry = registry.with_resource(f"genesis://schemas/{schema_id}", resource)
             registry = registry.with_resource(schema_id, resource)
         self._registry = registry
-        # F13: reject unresolved references at catalog construction, before any
-        # model invocation. Only local ``#/...`` fragments and registered
-        # package schema ids may be referenced (SCH-004).
+        # F13/F11: reject unresolved references at catalog construction,
+        # before any model invocation. Each schema's document base is its
+        # registered package key, so local fragments and package-scoped
+        # references resolve through the same registry resolver the real
+        # validator uses.
         for schema_id, schema in self._schemas.items():
-            self._assert_resolvable_refs(schema_id, schema)
+            self._assert_resolvable_refs(schema_id, schema, document_uri=schema_id)
         self._validators: dict[str, Draft202012Validator] = {}
 
-    def _assert_resolvable_refs(self, schema_id: str, schema: Any, pointer: str = "#") -> None:
+    def _assert_resolvable_refs(
+        self, schema_id: str, schema: Any, document_uri: str, pointer: str = "#"
+    ) -> None:
         if not isinstance(schema, (dict, list)):
             return
         if isinstance(schema, dict):
             ref = schema.get("$ref")
             if isinstance(ref, str):
-                if ref.startswith("#"):
-                    # Local fragment must resolve within the same schema
-                    # document (a plain $defs/... pointer, or "#" itself).
-                    Draft202012Validator({"$ref": ref}, registry=self._registry)
-                elif ref in self._schemas or ref in self._registry:
-                    pass
-                else:
-                    raise SchemaValidationError(
-                        SCHEMA_REFERENCE_INVALID,
-                        schema_id,
-                        f"schema '{schema_id}' references unresolved schema '{ref}' "
-                        f"at {pointer}; references must stay within the package registry",
-                    )
+                self._resolve_reference(schema_id, ref, document_uri, pointer)
             for key, value in schema.items():
-                self._assert_resolvable_refs(schema_id, value, f"{pointer}/{key}")
+                self._assert_resolvable_refs(schema_id, value, document_uri, f"{pointer}/{key}")
         else:
             for index, item in enumerate(schema):
-                self._assert_resolvable_refs(schema_id, item, f"{pointer}/{index}")
+                self._assert_resolvable_refs(schema_id, item, document_uri, f"{pointer}/{index}")
+
+    def _resolve_reference(self, schema_id: str, ref: str, document_uri: str, pointer: str) -> None:
+        # F11: resolve the reference through the registry resolver with the
+        # document as the base URI, so local fragments (#/$defs/x) and
+        # package-scoped references (b#/$defs/value) resolve the same way
+        # the real validator would. Raising on an unresolvable reference at
+        # construction catches missing fragments before any model invocation.
+        try:
+            resolver = self._registry.resolver(document_uri)
+            resolver.lookup(ref)
+        except (
+            Unresolvable,
+            PointerToNowhere,
+            NoSuchResource,
+            NoSuchAnchor,
+            InvalidAnchor,
+        ) as exc:
+            raise SchemaValidationError(
+                SCHEMA_REFERENCE_INVALID,
+                schema_id,
+                f"schema '{schema_id}' references unresolved schema '{ref}' at {pointer}: {exc}",
+            ) from exc
 
     def __contains__(self, schema_id: str) -> bool:
         return schema_id in self._schemas

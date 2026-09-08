@@ -293,3 +293,23 @@ def test_web_ui_exposes_workspace_and_patch_review_controls(tmp_path: Path) -> N
         "listBuilds()",
     ):
         assert marker in html, f"missing UI control {marker}"
+
+
+def test_web_ui_requires_explicit_replay_execute_confirmation(tmp_path: Path) -> None:
+    """F7: the browser replay flow must show the preview and require an
+    explicit Execute confirmation before submitting execution."""
+    from fastapi.testclient import TestClient
+
+    from genesis.app import create_app
+
+    client = TestClient(create_app(tmp_path / "workspace"))
+    response = client.get("/ui")
+    assert response.status_code == 200
+    html = response.text
+    # The preview is fetched into a variable the researcher can inspect...
+    assert (
+        "const preview = await request(`/runs/${encodeURIComponent(run)}/replays/preview`" in html
+    )
+    # ...and execution only proceeds after an explicit confirmation prompt.
+    assert "confirm('Review the replay preview above, then confirm execution." in html
+    assert "Replay preview discarded — nothing was executed." in html

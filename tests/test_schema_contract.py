@@ -452,3 +452,120 @@ def test_boolean_schema_compiles_into_build(tmp_path: Path) -> None:
     assert build.study_id == "bool-schema"
     schemas = __import__("json").loads((build.path / "schemas.json").read_text())
     assert schemas["never"] is False
+
+
+# ---------------------------------------------------------------------------
+# F1 (effect): process.outputs[].schema_ref is enforced at the commit boundary
+# ---------------------------------------------------------------------------
+
+
+def test_process_declared_output_schema_is_enforced(tmp_path: Path) -> None:
+    """F1: a schema declared on process.outputs[] is enforced even when the
+    domain artifact catalog entry lacks a schema_ref."""
+    from genesis.service import GenesisService
+
+    service = GenesisService(tmp_path / "workspace")
+    try:
+        draft = service.create_specification(
+            {
+                "id": "process-schema-bound",
+                "title": "psb",
+                "processes": [
+                    {
+                        "id": "measure",
+                        "executor": {
+                            "mode": "rule",
+                            "parameters": {
+                                "rules": [
+                                    {
+                                        "when": [{"path": "inputs.x", "op": "eq", "value": 1}],
+                                        "outputs": {"score": 99},
+                                    }
+                                ]
+                            },
+                        },
+                        "context_policy": "public",
+                        "outputs": [{"artifact_type": "score", "schema_ref": "score"}],
+                        "state_effects": [{"field": "counter", "op": "set"}],
+                    }
+                ],
+                "theory": {"theory_family": "exploratory"},
+                # domain artifact entry deliberately has NO schema_ref
+                "domain": {
+                    "artifacts": [{"id": "score", "artifact_type": "object"}],
+                    "states": [{"id": "counter", "value_type": "integer", "initial": 0}],
+                },
+                "protocol": {"time_model": {"type": "rounds", "end": 1}},
+                "outcomes": [],
+                "models": [],
+            }
+        )
+        schema_dir = (
+            tmp_path
+            / "workspace"
+            / ".genesis"
+            / "specifications"
+            / "process-schema-bound"
+            / "schemas"
+        )
+        schema_dir.mkdir(parents=True)
+        (schema_dir / "score.yaml").write_text(
+            "type: object\nrequired: [score]\nproperties:\n"
+            "  score: {type: integer, minimum: 0, maximum: 10}\n"
+        )
+        rev = service.update_specification(
+            "process-schema-bound", {"description": "x"}, draft["version"]
+        )
+        service.approve_specification("process-schema-bound", rev["version"], "researcher")
+        compiled = service.compile_study(
+            None, "builds/process-schema-bound", specification_id="process-schema-bound"
+        )
+        service.create_run(
+            {"id": "psb-run", "study_id": "process-schema-bound", "build": compiled["path"]}
+        )
+        with pytest.raises(Exception, match="process measure failed"):
+            service.execute_run(
+                "psb-run", executor_overrides={"measure": lambda inv: {"score": 99}}
+            )
+        assert service.get_run("psb-run")["status"] == "failed"
+        # Nothing committed: no score artifact, state stays at initial 0.
+        artifacts = [a for a in service.artifacts_for_run("psb-run")]
+        assert not any(
+            isinstance(a.get("payload"), dict)
+            and a["payload"].get("declared_artifact_id") == "score"
+            for a in artifacts
+        )
+        history = service.persistence.list_state_history("psb-run")
+        states = [snapshot for _version, snapshot in history]
+        assert len(states) == 1 and states[0].get("counter") == 0
+    finally:
+        service.close()
+
+
+# ---------------------------------------------------------------------------
+# F11 (effect): reference preflight resolves fragments via the registry
+# ---------------------------------------------------------------------------
+
+
+def test_package_scoped_fragment_reference_is_accepted() -> None:
+    """F11: b#/$defs/value resolves through the registry."""
+    catalog = PackageSchemaCatalog(
+        {
+            "b": {"$defs": {"value": {"type": "string"}}},
+            "a": {"$ref": "b#/$defs/value"},
+        }
+    )
+    assert catalog.validate("a", "ok") == []
+
+
+def test_missing_local_fragment_is_rejected_at_construction() -> None:
+    """F11: #/$defs/missing fails at catalog construction, not at validate."""
+    with pytest.raises(SchemaValidationError) as exc:
+        _catalog({"a": {"$defs": {"ok": {"type": "integer"}}, "$ref": "#/$defs/missing"}})
+    assert exc.value.code == SCHEMA_REFERENCE_INVALID
+
+
+def test_valid_local_fragment_is_accepted() -> None:
+    """F11: #/$defs/ok resolves within the document."""
+    catalog = _catalog({"a": {"$defs": {"ok": {"type": "integer"}}, "$ref": "#/$defs/ok"}})
+    assert catalog.validate("a", 7) == []

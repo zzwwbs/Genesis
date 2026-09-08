@@ -1057,20 +1057,31 @@
         const run = selectedRun();
         let preview_token;
         if (mode === 'partial' || mode === 'branch') {
-          // F10: the backend requires a read-only preview and a confirmed
-          // digest-bound token before executing a partial/branch replay.
+          // F7: fetch the preview first and REQUIRE an explicit Execute
+          // confirmation. The researcher must inspect the effective
+          // intervention and warnings before any execution happens.
           const previewBody = {mode, justification};
           if (boundary) previewBody.boundary = boundary;
           if (overrides) previewBody.overrides = overrides;
           const preview = await request(`/runs/${encodeURIComponent(run)}/replays/preview`, {method:'POST', body:JSON.stringify(previewBody)});
           if (!preview.preview_token) throw new Error('preview did not return a confirmation token');
+          const previewText = JSON.stringify({
+            effective_condition: preview.effective_condition,
+            effective_factors: preview.effective_factors,
+            inherited_replication: preview.inherited_replication,
+            evidence_requirements: preview.evidence_requirements,
+            warnings: preview.warnings,
+          }, null, 2);
+          show('analysis-output', {preview, preview_text: previewText});
+          const confirmExecute = confirm('Review the replay preview above, then confirm execution. The preview shown in the output panel is NOT executed until you confirm here.');
+          if (!confirmExecute) { show('analysis-output', 'Replay preview discarded — nothing was executed.'); return; }
           preview_token = preview.preview_token;
         }
         const body = {mode}; if (boundary) body.boundary = boundary; if (justification) body.justification = justification;
         if (overrides) body.overrides = overrides;
         if (preview_token) body.preview_token = preview_token;
         const result = await request(`/runs/${encodeURIComponent(run)}/replays`, {method:'POST', body:JSON.stringify(body)});
-        show('analysis-output', {replay_run_id: result.run_id, source_run_id: result.source_run_id, mode, boundary: boundary || 'none', overrides: overrides || undefined});
+        show('analysis-output', {replay_run_id: result.run_id, source_run_id: result.source_run_id, mode, boundary: boundary || 'none', overrides: overrides || undefined, executed: true});
       } catch (e) { show('analysis-output', e.message); }
     }
     function renderTraceView(result) {

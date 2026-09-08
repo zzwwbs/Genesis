@@ -395,3 +395,117 @@ def test_process_selection_must_be_dependency_closed(tmp_path, monkeypatch) -> N
         pass
     finally:
         service.close()
+
+
+def test_phase_boundary_beyond_execution_is_rejected(tmp_path, monkeypatch) -> None:
+    """F9: a phase boundary with no retained checkpoint evidence is rejected,
+    even when non-negative."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(ValueError, match="REPLAY_BOUNDARY_UNSUPPORTED"):
+            service.replay_preview(
+                "source-strict-3", mode=ReplayMode.PARTIAL, boundary="phase:999999"
+            )
+    finally:
+        service.close()
+
+
+def test_terminal_phase_boundary_reports_checkpoint_available(tmp_path, monkeypatch) -> None:
+    """F9: the terminal boundary (one past the last executed phase) is valid
+    and reports a checkpoint when retained evidence exists."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        preview = service.replay_preview(
+            "source-strict-3", mode=ReplayMode.PARTIAL, boundary="phase:1"
+        )
+        assert preview["evidence_requirements"]["checkpoint_available"] is True
+    finally:
+        service.close()
+
+
+def test_overrides_rejected_for_partial_preview(tmp_path, monkeypatch) -> None:
+    """F10: partial replay refuses overrides at preview time."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(ValueError, match="REPLAY_CONFIGURATION_INVALID"):
+            service.replay_preview(
+                "source-strict-3",
+                mode=ReplayMode.PARTIAL,
+                boundary="phase:1",
+                overrides={"policy": "lenient"},
+            )
+    finally:
+        service.close()
+
+
+def test_overrides_rejected_for_partial_execution(tmp_path, monkeypatch) -> None:
+    """F10: partial replay refuses overrides at execution time."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(ValueError, match="REPLAY_CONFIGURATION_INVALID"):
+            service.replay_run(
+                "source-strict-3",
+                mode=ReplayMode.PARTIAL,
+                boundary="phase:1",
+                overrides={"policy": "lenient"},
+            )
+    finally:
+        service.close()
+
+
+def test_replay_preserves_source_experiment_seed(tmp_path, monkeypatch) -> None:
+    """F5: a replay child inherits the ROOT source's experiment id in its seed
+    derivation, so the manifest seed equals the source's even when the child
+    run record has no experiment id of its own."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        # Give the source an experiment identity (execute_protocol-style runs).
+        build_ref = service.get_run("source-strict-3").get("build")
+        service.persistence.create_experiment(
+            {
+                "experiment_id": "experiment-1",
+                "study_id": "replay-config-study",
+                "build_ref": build_ref,
+                "protocol_hash": "h",
+            }
+        )
+        import json as _json
+
+        payload = service.get_run("source-strict-3")
+        payload = dict(payload)
+        payload["experiment_id"] = "experiment-1"
+        service.persistence.connection.execute(
+            "UPDATE runs SET experiment_id = ?, payload_json = ? WHERE run_id = ?",
+            ("experiment-1", _json.dumps(payload), "source-strict-3"),
+        )
+        source = service.get_run("source-strict-3")
+        assert source.get("experiment_id") == "experiment-1"
+        # The child derives randomness from the ROOT identity: source run id,
+        # its experiment, condition and replication.
+        from genesis.runtime import derive_seed
+
+        expected_root_seed = derive_seed(
+            0,
+            "source-strict-3",
+            "run-manifest",
+            experiment_id="experiment-1",
+            condition_id="strict",
+            replication=3,
+        )
+        preview = service.replay_preview(
+            "source-strict-3", mode=ReplayMode.PARTIAL, boundary="phase:1"
+        )
+        replay = service.replay_run(
+            "source-strict-3",
+            mode=ReplayMode.PARTIAL,
+            boundary="phase:1",
+            preview_token=preview["preview_token"],
+        )
+        child = service.get_run(replay["run_id"])
+        assert child.get("experiment_id") is None
+        # F5: the replay child's seed equals the root-derived value (including
+        # the source experiment id), not a derivation with the child's own
+        # (empty) experiment identity.
+        assert child["manifest"]["seeds"]["conventional"] == expected_root_seed
+    finally:
+        service.close()

@@ -66,31 +66,10 @@ def test_precedence_binding_adds_schedule_edge() -> None:
     assert "write-after-strategy" in plan.resolved
 
 
-def test_feedback_binding_one_round_lag_requires_initial_policy() -> None:
-    """THY-002: positive lag needs an explicit initial policy, else rejected."""
+def test_feedback_context_executable_binding_is_rejected() -> None:
+    """F2: feedback-context execution is unsupported, so it fails compilation
+    loudly instead of being recorded as resolved while processes run without it."""
     plan = compile_theory_execution(
-        {
-            "feedback": [
-                {
-                    "id": "perf-to-strategy",
-                    "from": "performance-state",
-                    "to": "form-strategy",
-                    "relation": "adapts to prior performance",
-                    "execution": {
-                        "kind": "feedback_context",
-                        "source": {"kind": "state", "id": "performance-state"},
-                        "consumer_process": "form-strategy",
-                        "context_slot": "prior-performance",
-                        "lag_rounds": 1,
-                    },
-                }
-            ]
-        },
-        known_processes=PROCESSES,
-        known_mechanisms=set(),
-    )
-    assert "THEORY_INITIAL_POLICY_REQUIRED" in _codes(plan)
-    ok = compile_theory_execution(
         {
             "feedback": [
                 {
@@ -112,13 +91,33 @@ def test_feedback_binding_one_round_lag_requires_initial_policy() -> None:
         known_processes=PROCESSES,
         known_mechanisms=set(),
     )
-    assert ok.valid
-    assert len(ok.feedback_bindings) == 1
-    binding = ok.feedback_bindings[0]
-    assert binding[1] == "performance-state"
-    assert binding[2] == "form-strategy"
-    assert binding[3] == "prior-performance"
-    assert binding[4] == 1
+    assert "THEORY_FEEDBACK_UNSUPPORTED" in _codes(plan)
+    assert not plan.feedback_bindings
+    # A one-round lag without an initial policy is also unsupported (the
+    # runtime cannot apply either), never recorded as resolved.
+    plan2 = compile_theory_execution(
+        {
+            "feedback": [
+                {
+                    "id": "perf-to-strategy",
+                    "from": "performance-state",
+                    "to": "form-strategy",
+                    "relation": "adapts to prior performance",
+                    "execution": {
+                        "kind": "feedback_context",
+                        "source": {"kind": "state", "id": "performance-state"},
+                        "consumer_process": "form-strategy",
+                        "context_slot": "prior-performance",
+                        "lag_rounds": 1,
+                    },
+                }
+            ]
+        },
+        known_processes=PROCESSES,
+        known_mechanisms=set(),
+    )
+    assert "THEORY_FEEDBACK_UNSUPPORTED" in _codes(plan2)
+    assert not plan2.feedback_bindings
 
 
 def test_zero_lag_dependency_cycle_is_rejected() -> None:
@@ -280,6 +279,8 @@ def test_unknown_process_and_unsupported_kind_fail_visibly() -> None:
 
 
 def test_plan_is_versioned_and_serializable() -> None:
+    # F2: executable feedback bindings are rejected, so the serializable plan
+    # records the unsupported issue instead of a resolved feedback binding.
     plan = compile_theory_execution(
         {
             "feedback": [
@@ -304,8 +305,9 @@ def test_plan_is_versioned_and_serializable() -> None:
     )
     serialized = plan.to_dict()
     assert serialized["version"] == 1
-    assert serialized["feedback_bindings"][0]["lag_rounds"] == 1
-    assert serialized["feedback_bindings"][0]["initial"]["policy"] == "skip_consumer"
+    assert serialized["feedback_bindings"] == []
+    codes = {issue["code"] for issue in serialized["issues"]}
+    assert "THEORY_FEEDBACK_UNSUPPORTED" in codes
 
 
 # ---------------------------------------------------------------------------

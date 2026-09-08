@@ -200,50 +200,21 @@ def compile_theory_execution(
             plan.resolved[decl_id] = f"precedence {producer} -> {consumer} (lag {lag})"
             continue
         if kind == "feedback_context":
-            consumer = binding.get("consumer_process")
-            source = binding.get("source") or {}
-            source_id = str(source.get("id") or "") if isinstance(source, Mapping) else ""
-            context_slot = binding.get("context_slot")
-            lag = binding.get("lag_rounds", 0)
-            initial = binding.get("initial") or {}
-            if not require_process(decl_type, decl_id, consumer):
-                continue
-            if not source_id or not context_slot:
-                plan.issues.append(
-                    TheoryExecutionIssue(
-                        "THEORY_BINDING_INCOMPLETE",
-                        decl_type,
-                        decl_id,
-                        "feedback_context requires source.id and context_slot",
-                    )
+            # F2: the runtime does not yet execute lagged or first-round
+            # feedback-context semantics (context-slot injection, lag
+            # retention, initial policies). Silently recording the binding as
+            # "resolved" while a process executes without it is dishonest:
+            # unsupported executable declarations fail compilation loudly
+            # (spec §6.3, THY-006).
+            plan.issues.append(
+                TheoryExecutionIssue(
+                    "THEORY_FEEDBACK_UNSUPPORTED",
+                    decl_type,
+                    decl_id,
+                    "feedback_context execution is not supported by this runtime; "
+                    "keep the declaration as an annotation (execution.kind: "
+                    "annotation) or remove the executable binding",
                 )
-                continue
-            if not isinstance(lag, int) or lag < 0:
-                plan.issues.append(
-                    TheoryExecutionIssue(
-                        "THEORY_LAG_INVALID",
-                        decl_type,
-                        decl_id,
-                        "feedback_context lag_rounds must be a nonnegative integer",
-                    )
-                )
-                continue
-            if lag > 0 and not initial:
-                plan.issues.append(
-                    TheoryExecutionIssue(
-                        "THEORY_INITIAL_POLICY_REQUIRED",
-                        decl_type,
-                        decl_id,
-                        "positive-lag feedback requires an explicit initial policy "
-                        "for history that does not exist yet",
-                    )
-                )
-                continue
-            plan.feedback_bindings.append(
-                (decl_id, source_id, str(consumer), str(context_slot), int(lag), dict(initial))
-            )
-            plan.resolved[decl_id] = (
-                f"feedback_context {source_id} -> {consumer} slot {context_slot} (lag {lag})"
             )
             continue
         if kind == "mechanism_binding":

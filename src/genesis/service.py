@@ -39,6 +39,7 @@ from genesis.elicitation import (
 )
 from genesis.evidence import (
     ExportMode,
+    _is_contained_relative,
     evaluate_capabilities,
     publish_bundle,
     stage_bundle,
@@ -1755,16 +1756,19 @@ class GenesisService:
         # lineage, so recorded streams and runtime draws stay stable across
         # child IDs, replay-of-replay, imports and creation times.
         seed_identity = self._root_source_run_id(run)
-        # The seed inputs are the root run's identity; condition/replication
-        # for replay children are inherited from the source, and a derived
-        # branch condition identity must not change the RNG derivation.
+        # The seed inputs are the root run's identity: experiment, condition
+        # and replication are inherited from the ROOT source, and a derived
+        # branch condition identity or an empty child experiment id must not
+        # change the RNG derivation (F5).
         seed_condition_id = condition_id
         seed_replication = replication
+        seed_experiment_id = str(run.get("experiment_id", ""))
         if run.get("replay_of"):
             try:
                 root = self.get_run(seed_identity)
                 seed_condition_id = str(root.get("condition_id", condition_id))
                 seed_replication = int(root.get("replication", replication))
+                seed_experiment_id = str(root.get("experiment_id", seed_experiment_id))
             except KeyError:
                 pass
         streams: dict[str, Any] = {
@@ -1772,7 +1776,7 @@ class GenesisService:
                 0,
                 seed_identity,
                 "run-manifest",
-                experiment_id=str(run.get("experiment_id", "")),
+                experiment_id=seed_experiment_id,
                 condition_id=seed_condition_id,
                 replication=seed_replication,
                 matching_key=(
@@ -1787,7 +1791,7 @@ class GenesisService:
                     int(stream.get("seed", 0)),
                     seed_identity,
                     stream_id,
-                    experiment_id=str(run.get("experiment_id", "")),
+                    experiment_id=seed_experiment_id,
                     condition_id=seed_condition_id,
                     replication=seed_replication,
                     matching_key=(stream_id if matched and stream_id in shared_streams else None),
@@ -2273,30 +2277,26 @@ class GenesisService:
         # kind (generative, rule, computational, fallback, ...).
         output_schema_validator: Callable[[str, Any], list[str]] | None = None
         commit_catalog = None
-        artifact_schema_ref: dict[str, str] = {}
         if build_ref and schema_catalog:
             try:
                 commit_catalog = PackageSchemaCatalog(schema_catalog)
-                artifact_schema_ref = {
-                    str(artifact_id): str(entry.get("schema_ref", ""))
-                    for artifact_id, entry in artifact_catalog.items()
-                    if isinstance(entry, Mapping) and entry.get("schema_ref")
-                }
             except SchemaValidationError:
                 # An unusable schema catalog fails validation per request
                 # through the per-executor validator; leave the boundary
                 # validator unbound for such malformed builds.
                 commit_catalog = None
         if commit_catalog is not None:
+            catalog = commit_catalog
 
-            def output_schema_validator(artifact_id: str, value: Any) -> list[str]:
-                schema_ref = artifact_schema_ref.get(artifact_id)
-                if schema_ref is None or schema_ref not in schema_catalog:
+            # F1: the validator resolves the schema REF directly (from the
+            # executing process's output declaration); no domain-artifact
+            # indirection is involved.
+            def output_schema_validator(schema_ref: str, value: Any) -> list[str]:
+                if schema_ref not in schema_catalog:
                     return []
-                assert commit_catalog is not None
                 return [
                     f"{diagnostic.instance_pointer or 'root'}: {diagnostic.message}"
-                    for diagnostic in commit_catalog.validate(schema_ref, value)
+                    for diagnostic in catalog.validate(schema_ref, value)
                 ]
 
         controller = RunController(
@@ -2310,11 +2310,28 @@ class GenesisService:
             output_schema_validator=output_schema_validator,
         )
         try:
+            # F5: randomness derives from the ROOT source's experiment,
+            # condition and replication — never from a replay child's own
+            # (possibly empty) experiment id or a derived branch condition id.
+            # The intervention (effective) condition is still supplied as the
+            # invocation input; only the seed inputs are root-inherited.
+            root_id = self._root_source_run_id(run)
+            seed_experiment_id = str(run.get("experiment_id", ""))
+            seed_condition_id = str(run.get("condition_id", "base"))
+            seed_replication = int(run.get("replication", 1))
+            if run.get("replay_of"):
+                try:
+                    root = self.get_run(root_id)
+                    seed_experiment_id = str(root.get("experiment_id", seed_experiment_id))
+                    seed_condition_id = str(root.get("condition_id", seed_condition_id))
+                    seed_replication = int(root.get("replication", seed_replication))
+                except KeyError:
+                    pass
             controller.run(
                 run_id,
-                experiment_id=str(run.get("experiment_id", "")),
-                condition_id=str(run.get("condition_id", "base")),
-                replication=int(run.get("replication", 1)),
+                experiment_id=seed_experiment_id,
+                condition_id=seed_condition_id,
+                replication=seed_replication,
                 seed_identity=self._root_source_run_id(run),
                 phase_start=int(protocol.get("time_model", {}).get("start") or 0)
                 if build_ref
@@ -2586,7 +2603,7 @@ class GenesisService:
         build_ref = source.get("build") or source.get("build_path")
         if not build_ref:
             raise ValueError("REPLAY_SOURCE_MISSING: source run has no compiled build")
-        self._validate_replay_request(mode, artifact_ids, boundary, justification)
+        self._validate_replay_request(mode, artifact_ids, boundary, justification, overrides)
         build_path = self.resolve_path(build_ref)
         StudyCompiler.verify_build(build_path)
         protocol = json.loads((build_path / "protocol.json").read_text())
@@ -2653,6 +2670,34 @@ class GenesisService:
             warnings.append("branch suffix regenerates with the source RNG stream identity")
         if event_boundary is not None:
             warnings.append("event boundary freezes every invocation committed before the event")
+        # F9: a phase boundary must lie within the phases actually executed by
+        # the source run, and checkpoint availability depends on retained
+        # recorded evidence for the prefix — not merely on a non-negative
+        # integer being supplied.
+        executed_phases: set[int] = set()
+        recorded_outputs = bool(self._recorded_process_outputs(run_id, artifact_ids))
+        checkpoint_available = False
+        if phase_boundary is not None:
+            if phase_boundary < 0:
+                raise ValueError("REPLAY_BOUNDARY_UNSUPPORTED: phase boundary must be non-negative")
+            executed_phases = {int(event.get("phase", 0)) for event in self.trace_run(run_id)}
+            # F9: a phase boundary is only valid up to one past the last
+            # executed phase (the terminal state after the run completed);
+            # anything beyond claims a checkpoint with no retained evidence.
+            if executed_phases and phase_boundary > (max(executed_phases) + 1):
+                raise ValueError(
+                    "REPLAY_BOUNDARY_UNSUPPORTED: phase boundary "
+                    f"{phase_boundary} is beyond the source run's executed phases "
+                    f"(max {max(executed_phases)}); there is no checkpoint evidence "
+                    "for a boundary after the run completed"
+                )
+            frozen_keys = self._frozen_invocation_keys(
+                run_id,
+                self._recorded_process_outputs(run_id, artifact_ids),
+                phase_boundary=phase_boundary,
+                event_boundary=event_boundary,
+            )
+            checkpoint_available = bool(frozen_keys) and recorded_outputs
         return {
             "source_run_id": run_id,
             "mode": mode.value,
@@ -2662,8 +2707,8 @@ class GenesisService:
             "effective_factors": dict(effective_factors),
             "inherited_replication": int(source.get("replication", 1)),
             "evidence_requirements": {
-                "recorded_outputs": bool(self._recorded_process_outputs(run_id, artifact_ids)),
-                "checkpoint_available": bool(phase_boundary is not None and phase_boundary >= 0),
+                "recorded_outputs": recorded_outputs,
+                "checkpoint_available": checkpoint_available,
             },
             "warnings": warnings,
             "preview_token": preview_token,
@@ -2675,7 +2720,13 @@ class GenesisService:
         artifact_ids: tuple[str, ...],
         boundary: str | None,
         justification: str | None,
+        overrides: Mapping[str, Any] | None = None,
     ) -> None:
+        if overrides and mode != ReplayMode.BRANCH:
+            raise ValueError(
+                "REPLAY_CONFIGURATION_INVALID: overrides are only accepted for "
+                f"branch replay, not {mode.value}"
+            )
         if mode == ReplayMode.PARTIAL and not boundary:
             raise ValueError("partial replay requires a boundary")
         if mode == ReplayMode.BRANCH:
@@ -2764,13 +2815,90 @@ class GenesisService:
 
     @staticmethod
     def _generative_process_ids(build_ref: str | Path) -> set[str]:
+        """Process ids that invoke an LLM: generative AND semantic-evaluator.
+
+        F4: recorded-output retrieval and full-replay substitution must cover
+        every LLM-invoking executor, not only ``mode == generative``.
+        """
         build_path = Path(build_ref) if isinstance(build_ref, Path) else Path(str(build_ref))
         processes = json.loads((build_path / "processes.json").read_text())
         return {
             str(process["id"])
             for process in processes
-            if process.get("executor", {}).get("mode") == "generative"
+            if process.get("executor", {}).get("mode") in {"generative", "semantic-evaluator"}
         }
+
+    def _reconstruct_imported_build(
+        self, source_path: Path, bundle_manifest: Mapping[str, Any] | None, target_id: str
+    ) -> tuple[str, bool]:
+        """Restore a verified executable build from a reproducibility bundle.
+
+        F3: when the bundle carries the executable build files, reconstruct
+        them under ``builds/``, write a fresh integrity manifest, register the
+        build so replay/reexecution work, and return (build_ref, restored).
+        When no executable files are present, import stays exploration-only.
+        """
+        executable_files = (
+            "processes.json",
+            "process_graph.json",
+            "context_policies.json",
+            "state_model.json",
+            "artifact_catalog.json",
+            "outcome_plan.json",
+            "protocol.json",
+            "build_manifest.json",
+            "validation_report.json",
+        )
+        if not all((source_path / name).is_file() for name in executable_files):
+            return "", False
+        build_manifest = json.loads((source_path / "build_manifest.json").read_text())
+        build_hash = str(build_manifest.get("build_hash", ""))
+        if not build_hash:
+            raise ValueError(
+                "IMPORT_BUILD: reproducibility bundle has no build_hash in build_manifest.json"
+            )
+        build_dir = self.workspace / "builds" / f"{target_id}-imported-{build_hash[:8]}"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        for name in executable_files:
+            target = build_dir / name
+            target.write_bytes((source_path / name).read_bytes())
+        for name in (
+            "model_profiles.json",
+            "prompt_templates.json",
+            "initialization.json",
+            "data_manifest.json",
+            "schemas.json",
+            "package_closure.json",
+            "theory_execution_plan.json",
+        ):
+            if (source_path / name).is_file():
+                (build_dir / name).write_bytes((source_path / name).read_bytes())
+        # Regenerate the integrity manifest for the reconstructed build and
+        # verify it (mirrors the compiler's per-file digest table).
+        integrity: dict[str, str] = {}
+        for path in sorted(build_dir.rglob("*")):
+            if path.is_file():
+                integrity[path.relative_to(build_dir).as_posix()] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+        if "build_manifest.json" in integrity:
+            integrity["manifest_hash"] = integrity["build_manifest.json"]
+        (build_dir / "integrity_manifest.json").write_text(
+            json.dumps(integrity, sort_keys=True, indent=2) + "\n"
+        )
+        StudyCompiler.verify_build(build_dir)
+        self.persistence.record_study_build(
+            {
+                "build_hash": build_hash,
+                "study_id": str(build_manifest.get("study_id", "")),
+                "package_version": 0,
+                "package_content_hash": "",
+                "compiler_version": str(build_manifest.get("compiler_version", "1.0")),
+                "created_at": datetime.now(UTC).isoformat(),
+                "path": str(build_dir),
+            }
+        )
+        return str(build_dir.relative_to(self.workspace)), True
 
     def replay_run(
         self,
@@ -2841,7 +2969,7 @@ class GenesisService:
                     "retrieval": True,
                 },
             }
-        self._validate_replay_request(mode, artifact_ids, boundary, justification)
+        self._validate_replay_request(mode, artifact_ids, boundary, justification, overrides)
         build_path = self.resolve_path(build_ref)
         StudyCompiler.verify_build(build_path)
         processes = json.loads((build_path / "processes.json").read_text())
@@ -2853,6 +2981,18 @@ class GenesisService:
         normalized_boundary, phase_boundary, event_boundary, frozen_processes = (
             self._normalize_boundary(mode, boundary, process_ids, dependency_map)
         )
+        # F9: a phase boundary beyond the source's executed phases must fail
+        # even on the execution path (preview and execution agree). The
+        # terminal state (one past the last executed phase) is the final
+        # valid boundary; anything further has no retained evidence.
+        if phase_boundary is not None and mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH}:
+            executed_phases = {int(e.get("phase", 0)) for e in self.trace_run(run_id)}
+            if executed_phases and phase_boundary > (max(executed_phases) + 1):
+                raise ValueError(
+                    "REPLAY_BOUNDARY_UNSUPPORTED: phase boundary "
+                    f"{phase_boundary} is beyond the source run's executed phases "
+                    f"(max {max(executed_phases)})"
+                )
         source_condition = {
             "id": str(source.get("condition_id", "base")),
             "factors": dict((source.get("condition") or {}).get("factors", {})),
@@ -2901,10 +3041,13 @@ class GenesisService:
                     "configuration; re-run replay_preview and confirm"
                 )
         inherited_replication = int(source.get("replication", 1))
-        generative_ids = {
+        # F4: recorded substitution must cover every executor that invokes an
+        # LLM — generative AND semantic-evaluator — so FULL replay never makes
+        # a fresh provider call for either.
+        llm_ids = {
             str(process["id"])
             for process in processes
-            if process.get("executor", {}).get("mode") == "generative"
+            if process.get("executor", {}).get("mode") in {"generative", "semantic-evaluator"}
         }
         recorded = self._recorded_process_outputs(run_id, artifact_ids)
         frozen_keys = self._frozen_invocation_keys(
@@ -2914,13 +3057,10 @@ class GenesisService:
         if mode == ReplayMode.FULL:
             # Spec §5.1: FULL reuses recorded invocations for the complete
             # trajectory and fails if required records are unavailable.
-            missing = sorted(generative_ids - set(recorded))
+            missing = sorted(llm_ids - set(recorded))
             if missing:
-                raise ValueError(
-                    "REPLAY_EVIDENCE_INCOMPLETE: full replay requires recorded "
-                    "invocations for: " + ", ".join(missing)
-                )
-            for process_id in sorted(generative_ids):
+                raise ValueError("REPLAY_EVIDENCE_INCOMPLETE: full replay requires recorded ")
+            for process_id in sorted(llm_ids):
                 executor_overrides[process_id] = _RecordedExecutor(
                     recorded[process_id]
                     if isinstance(recorded[process_id], list)
@@ -3200,9 +3340,20 @@ class GenesisService:
             if isinstance(declared_id, str):
                 artifact_sources.setdefault(declared_id, []).append(artifact_row)
         state_rows = []
+        # F8: annotate each committed snapshot with the protocol phase of the
+        # event that committed it, so "each_completed_round" can select the
+        # final snapshot of each completed round instead of one per process
+        # invocation.
+        version_phase: dict[int, int] = {}
+        for event in event_rows:
+            version = event.get("state_version")
+            phase = event.get("phase")
+            if isinstance(version, int) and isinstance(phase, int):
+                version_phase[version] = phase
         for version, snapshot in self.persistence.list_state_history(run_id):
             row = dict(snapshot)
             row["state_version"] = version
+            row["_round"] = version_phase.get(version)
             state_rows.append(row)
         # OUT-005: generic outcome derivation. When the outcome plan declares
         # datasets, rows are materialized ONCE by the fixed operation registry
@@ -5156,10 +5307,22 @@ class GenesisService:
                 manifest = json.loads(integrity_path.read_text())
             except json.JSONDecodeError as exc:
                 raise ValueError("IMPORT_INTEGRITY: bundle integrity manifest is invalid") from exc
+            # F6: the legacy path must apply the same protections as the modern
+            # bundle manifest — required-file coverage, contained relative
+            # paths, actual member sizes and the size limit. An empty or
+            # incomplete integrity manifest must not bypass these checks.
+            if not isinstance(manifest, dict):
+                raise ValueError("IMPORT_INTEGRITY: bundle integrity manifest is invalid")
             total = 0
+            seen: set[str] = set()
             for relative, digest in manifest.items():
+                if not _is_contained_relative(str(relative)):
+                    raise ValueError(f"IMPORT_INTEGRITY: unsafe member path '{relative}'")
+                if relative in seen:
+                    raise ValueError(f"IMPORT_INTEGRITY: duplicate member path '{relative}'")
+                seen.add(relative)
                 asset = source_path / relative
-                if not asset.is_file():
+                if not asset.is_file() or asset.is_symlink():
                     raise ValueError(f"IMPORT_INTEGRITY: bundle member '{relative}' is missing")
                 total += asset.stat().st_size
                 actual = hashlib.sha256(asset.read_bytes()).hexdigest()
@@ -5167,8 +5330,19 @@ class GenesisService:
                     raise ValueError(
                         f"IMPORT_INTEGRITY: bundle member '{relative}' fails its digest"
                     )
-                if total > size_limit_bytes:
-                    raise ValueError(f"IMPORT_SIZE: bundle exceeds {size_limit_bytes} bytes")
+            present = {
+                path.relative_to(source_path).as_posix()
+                for path in source_path.rglob("*")
+                if path.is_file() and path.name != "integrity.json"
+            }
+            unlisted = sorted(present - seen)
+            if unlisted:
+                raise ValueError(
+                    "IMPORT_INTEGRITY: incomplete member coverage; unlisted files: "
+                    + ", ".join(unlisted[:10])
+                )
+            if total > size_limit_bytes:
+                raise ValueError(f"IMPORT_SIZE: bundle exceeds {size_limit_bytes} bytes")
         run_manifest = json.loads((source_path / "run_manifest.json").read_text())
         target_id = run_id or str(run_manifest.get("run_id", ""))
         if not target_id:
@@ -5194,10 +5368,17 @@ class GenesisService:
         imported_manifest = dict(run_manifest)
         imported_manifest.setdefault("origin", {}).update(origin)
         imported_manifest["imported_outcomes"] = "snapshot"
+        # F3: restore and register the verified executable build when the
+        # bundle carries one, so replay/reexecution capabilities are real.
+        restored_build, build_restored = self._reconstruct_imported_build(
+            source_path, bundle_manifest, target_id
+        )
+        if build_restored:
+            imported_manifest["build_restored"] = True
         run_payload = {
             "id": target_id,
             "manifest": imported_manifest,
-            "build": "",
+            "build": restored_build,
             "imported_outcomes": outcomes,
             "study_id": run_manifest.get("study_id", ""),
             "status": str(run_manifest.get("status", "completed")),

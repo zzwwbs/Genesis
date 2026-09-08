@@ -483,3 +483,119 @@ def test_process_selection_must_be_dependency_closed(tmp_path: Path, monkeypatch
             service.replay_preview("source-1", mode=ReplayMode.PARTIAL, boundary="embellish")
     finally:
         service.close()
+
+
+# ---------------------------------------------------------------------------
+# F4 (effect): FULL replay substitutes semantic-evaluator executors too
+# ---------------------------------------------------------------------------
+
+
+def test_full_replay_covers_semantic_evaluator(tmp_path: Path, monkeypatch) -> None:
+    """F4: a semantic-evaluator process is a recorded LLM invocation; FULL
+    replay must substitute it and make zero fresh provider calls."""
+    import json as _json
+
+    svc_module = __import__("genesis.service", fromlist=["service"])
+    service = GenesisService(tmp_path / "workspace")
+    try:
+        service.create_model_profile(
+            {
+                "id": "mp",
+                "provider": "openai-compatible",
+                "base_url": "https://example.test/v1",
+                "model": "m1",
+                "api_key_env": "GENESIS_FAKE_KEY",
+            }
+        )
+        draft = service.create_specification(
+            {
+                "id": "eval-replay-study",
+                "title": "ers",
+                "models": [
+                    {"id": "mp", "provider": "openai-compatible", "model": "m1", "parameters": {}}
+                ],
+                "processes": [
+                    {
+                        "id": "gen",
+                        "openness_rationale": "x",
+                        "closure_rationale": "y",
+                        "executor": {"mode": "generative", "model_profile": "mp"},
+                        "context_policy": "public",
+                        "prompt_ref": "compose",
+                        "outputs": [{"artifact_type": "text", "schema_ref": "eval-out"}],
+                    },
+                    {
+                        "id": "eval",
+                        "openness_rationale": "x",
+                        "closure_rationale": "y",
+                        "executor": {"mode": "semantic-evaluator", "model_profile": "mp"},
+                        "context_policy": "public",
+                        "prompt_ref": "compose",
+                        "outputs": [{"artifact_type": "verdict", "schema_ref": "judge-out"}],
+                    },
+                    {"id": "finalize", "executor": {}, "context_policy": "public"},
+                ],
+                "theory": {"theory_family": "exploratory"},
+                "domain": {
+                    "artifacts": [
+                        {"id": "eval-out", "artifact_type": "text"},
+                        {"id": "judge-out", "artifact_type": "text"},
+                    ]
+                },
+                "protocol": {"time_model": {"type": "rounds", "end": 1}},
+                "outcomes": [],
+                "prompts": {"compose": "Compose from {context}"},
+            }
+        )
+        schema_dir = (
+            tmp_path / "workspace" / ".genesis" / "specifications" / "eval-replay-study" / "schemas"
+        )
+        schema_dir.mkdir(parents=True)
+        (schema_dir / "eval-out.yaml").write_text(
+            "type: object\nproperties:\n  text: {type: string}\nrequired: [text]\n"
+        )
+        (schema_dir / "judge-out.yaml").write_text(
+            "type: object\nproperties:\n  text: {type: string}\nrequired: [text]\n"
+        )
+        rev = service.update_specification(
+            "eval-replay-study", {"description": "with schema"}, draft["version"]
+        )
+        service.approve_specification("eval-replay-study", rev["version"], "researcher")
+        compiled = service.compile_study(
+            None, "builds/eval-replay-study", specification_id="eval-replay-study"
+        )
+        service.create_run(
+            {"id": "eval-src", "study_id": "eval-replay-study", "build": compiled["path"]}
+        )
+        original = svc_module.OpenAICompatibleProvider
+        calls: list[str] = []
+
+        class CountingProvider:
+            provider = "openai-compatible"
+
+            def __init__(self, **_kw):
+                pass
+
+            def generate(self, request):
+                calls.append(request.model)
+                text = _json.dumps({"text": "x"})
+                return ProviderResponse(
+                    text,
+                    self.provider,
+                    request.model,
+                    f"req-{len(calls)}",
+                    parsed=_json.loads(text),
+                )
+
+        svc_module.OpenAICompatibleProvider = CountingProvider  # type: ignore[misc]
+        try:
+            service.execute_run("eval-src")
+            assert len(calls) == 2, "source: gen + eval each make one call"
+            calls.clear()
+            replay = service.replay_run("eval-src", mode=ReplayMode.FULL)
+            assert calls == [], "FULL replay must make zero fresh provider calls"
+            assert service.get_run(replay["run_id"])["status"] == "completed"
+        finally:
+            svc_module.OpenAICompatibleProvider = original  # type: ignore[misc]
+    finally:
+        service.close()

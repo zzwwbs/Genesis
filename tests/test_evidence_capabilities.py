@@ -448,3 +448,91 @@ def test_export_returns_existing_destination_paths(tmp_path: Path) -> None:
             assert path.is_relative_to((workspace / "exports" / "final").resolve())
     finally:
         service.close()
+
+
+# ---------------------------------------------------------------------------
+# F3 (effect): reproducibility imports restore the executable build and replay
+# ---------------------------------------------------------------------------
+
+
+def test_reproducibility_import_restores_build_and_replays(tmp_path: Path) -> None:
+    """F3: importing a reproducibility bundle restores + registers the build,
+    so replay no longer fails with REPLAY_SOURCE_MISSING."""
+    from genesis.replay import ReplayMode
+
+    workspace = _prepared_workspace(tmp_path)
+    service = GenesisService(workspace)
+    try:
+        service.export_run("evidence-run", "exports/full", mode=ExportMode.REPRODUCIBILITY)
+        bundle = workspace / "exports" / "full"
+        other = tmp_path / "other-workspace"
+        (other / "imports").mkdir(parents=True)
+        shutil.copytree(bundle, other / "imports" / "bundle")
+        importer = GenesisService(other)
+        try:
+            importer.import_run(other / "imports" / "bundle", run_id="imported-full")
+            record = importer.get_run("imported-full")
+            assert record.get("build"), "imported run must carry a restored build"
+            assert record.get("manifest", {}).get("build_restored") is True
+            # Replay works against the verified build.
+            replay = importer.replay_run("imported-full", mode=ReplayMode.FULL)
+            assert replay["run_id"].startswith("imported-full-replay-")
+        finally:
+            importer.close()
+    finally:
+        service.close()
+
+
+# ---------------------------------------------------------------------------
+# F6 (effect): legacy import path applies coverage/containment/size checks
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_import_rejects_empty_integrity_manifest(tmp_path: Path) -> None:
+    """F6: an empty integrity.json must not bypass coverage checks."""
+    service = GenesisService(tmp_path / "workspace-import")
+    bundle = service.workspace / "legacy-bundle"
+    bundle.mkdir()
+    (bundle / "run_manifest.json").write_text(
+        json.dumps({"run_id": "legacy-run", "status": "completed"})
+    )
+    (bundle / "events.json").write_text(json.dumps([{"event_id": "e1"}]))
+    (bundle / "artifacts.json").write_text(json.dumps([]))
+    (bundle / "integrity.json").write_text("{}")
+    try:
+        with pytest.raises(ValueError, match="IMPORT_INTEGRITY"):
+            service.import_run(bundle, run_id="legacy-run", size_limit_bytes=1)
+    finally:
+        service.close()
+
+
+def test_legacy_import_enforces_containment_and_size(tmp_path: Path) -> None:
+    """F6: legacy members must stay contained and count toward the size limit."""
+    service = GenesisService(tmp_path / "workspace-import2")
+    bundle = service.workspace / "legacy-bundle2"
+    bundle.mkdir()
+    (bundle / "run_manifest.json").write_text(
+        json.dumps({"run_id": "legacy-run2", "status": "completed"})
+    )
+    (bundle / "events.json").write_text(json.dumps([{"event_id": "e1"}]))
+    (bundle / "artifacts.json").write_text(json.dumps([]))
+    import hashlib as _hashlib
+
+    (bundle / "integrity.json").write_text(
+        json.dumps(
+            {
+                "run_manifest.json": _hashlib.sha256(
+                    (bundle / "run_manifest.json").read_bytes()
+                ).hexdigest(),
+                "events.json": _hashlib.sha256((bundle / "events.json").read_bytes()).hexdigest(),
+                "artifacts.json": _hashlib.sha256(
+                    (bundle / "artifacts.json").read_bytes()
+                ).hexdigest(),
+            }
+        )
+    )
+    try:
+        with pytest.raises(ValueError, match="IMPORT_SIZE"):
+            service.import_run(bundle, run_id="legacy-run2", size_limit_bytes=1)
+    finally:
+        service.close()

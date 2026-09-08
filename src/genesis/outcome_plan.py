@@ -175,10 +175,24 @@ def materialize_datasets(
                         record = {field: record[field]}
                     rows.append(record)
             elif snapshot == "each_completed_round":
+                # F8: keep the FINAL committed snapshot of each completed
+                # round, not one row per state commit (a phase may contain
+                # several process invocations). Rows annotated with a
+                # ``_round`` phase collapse to the last snapshot of that
+                # phase; unannotated rows are each treated as their own round.
+                round_rows: dict[Any, dict[str, Any]] = {}
                 for entry in state_rows:
                     record = _snapshot(entry)
-                    if record is not None:
-                        rows.append(dict(record))
+                    if record is None:
+                        continue
+                    row = dict(record)
+                    round_key = row.get("_round")
+                    if round_key is None:
+                        round_rows.setdefault(id(row), row)
+                    else:
+                        round_rows[round_key] = row
+                for row in round_rows.values():
+                    rows.append(row)
         for step in dataset.get("fields") or []:
             if isinstance(step, Mapping):
                 rows = [_apply_fields(dict(row), [step]) for row in rows]

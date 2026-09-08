@@ -1670,21 +1670,28 @@ class RunController:
                             result.status == "succeeded"
                             and self.output_schema_validator is not None
                         ):
+                            # F1: the schema comes from the executing process's
+                            # own output declaration (process.outputs[].schema_ref),
+                            # not from a separate domain-artifact id, so a
+                            # process-declared schema is always enforced.
                             declared_outputs = process.get("outputs") or []
-                            declared_ids = {
-                                str(decl.get("artifact_type", ""))
-                                for decl in declared_outputs
-                                if isinstance(decl, Mapping) and decl.get("artifact_type")
-                            }
+                            declared_schemas: list[tuple[str, str]] = []
+                            for decl in declared_outputs:
+                                if not isinstance(decl, Mapping):
+                                    continue
+                                artifact_type = decl.get("artifact_type")
+                                schema_ref = decl.get("schema_ref")
+                                if isinstance(artifact_type, str) and isinstance(schema_ref, str):
+                                    declared_schemas.append((artifact_type, schema_ref))
                             schema_errors: list[str] = []
-                            for artifact_id, value in (result.outputs or {}).items():
-                                if str(artifact_id) not in declared_ids:
+                            for artifact_id, schema_ref in declared_schemas:
+                                if artifact_id not in (result.outputs or {}):
                                     continue
                                 # Normalize frozen mappingproxies to plain
                                 # JSON-able values before schema validation.
-                                schema_value = _plain(value)
+                                schema_value = _plain(result.outputs[artifact_id])
                                 for message in self.output_schema_validator(
-                                    str(artifact_id), schema_value
+                                    schema_ref, schema_value
                                 ):
                                     schema_errors.append(f"{artifact_id}: {message}")
                             if schema_errors:

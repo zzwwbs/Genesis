@@ -446,3 +446,31 @@ def test_conditional_and_with_field_pass_the_model() -> None:
         }
     )
     assert arithmetic.with_field == "b"
+
+
+# ---------------------------------------------------------------------------
+# F8 (effect): each_completed_round = final snapshot per round, not per commit
+# ---------------------------------------------------------------------------
+
+
+def test_each_completed_round_selects_final_snapshot_per_round() -> None:
+    """F8: multiple state commits within one phase yield one round observation."""
+    from genesis.outcome_plan import materialize_datasets
+
+    state_rows = [
+        {"counter": 1, "state_version": 1, "_round": 0},
+        {"counter": 3, "state_version": 2, "_round": 0},
+        {"counter": 7, "state_version": 3, "_round": 1},
+    ]
+    plan = {
+        "datasets": [
+            {
+                "id": "rounds",
+                "source": {"kind": "state", "snapshot": "each_completed_round"},
+            }
+        ]
+    }
+    rows = materialize_datasets(plan, {"events": [], "artifacts": [], "state": state_rows})
+    observed = rows["rounds"]
+    assert len(observed) == 2, "two rounds, not three commits"
+    assert [row["counter"] for row in observed] == [3, 7]
