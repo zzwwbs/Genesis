@@ -4,4 +4,4 @@ properties:
   article_id: {type: string}
   action: {type: string, enum: [read, like, share, follow, unfollow, ignore]}
 required: [user_id, article_id, action]
-additionalProperties: false
+additionalProperties: true

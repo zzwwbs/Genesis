@@ -10,6 +10,7 @@ specification subsystem.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -17,7 +18,8 @@ import tempfile
 import threading
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -300,6 +302,10 @@ class PatchPreviewService:
                 (schema_dir / f"{schema_id}.json").write_text(json.dumps(content))
             prompts = candidate.get("prompts")
             prompt_dir = tmp_path / "prompts"
+            if isinstance(prompts, dict) and prompt_dir.exists():
+                for existing in prompt_dir.glob("*.txt"):
+                    if existing.stem not in prompts:
+                        existing.unlink()
             if isinstance(prompts, dict) and prompts:
                 prompt_dir.mkdir(exist_ok=True)
                 for prompt_id, content in prompts.items():
@@ -1306,22 +1312,52 @@ class ElicitationSession(BaseModel):
 
 
 class ElicitationSessionStore:
-    """Lock-protected sessions with optional atomic local persistence."""
+    """Sessions with atomic JSON persistence and a shared local-process lock."""
 
     def __init__(self, path: Path | None = None) -> None:
         self._sessions: dict[str, ElicitationSession] = {}
         self._idempotency: OrderedDict[tuple[str, str], tuple[str, dict[str, Any]]] = OrderedDict()
         self._idempotency_limit = 128
         self._lock = threading.RLock()
+        self._lock_depth = 0
         self._path = path
-        if path is not None and path.exists():
-            saved = json.loads(path.read_text())
+        with self._access():
+            pass
+
+    def _reload(self) -> None:
+        if self._path is not None and self._path.exists():
+            saved = json.loads(self._path.read_text())
             self._sessions = {
                 key: ElicitationSession.model_validate(value)
                 for key, value in saved["sessions"].items()
             }
+            self._idempotency.clear()
             for session_id, key, digest, result in saved.get("idempotency", []):
                 self._idempotency[(session_id, key)] = (digest, result)
+
+    @contextmanager
+    def _access(self) -> Iterator[None]:
+        """Reload once per outer operation; keep nested mutations under one lock.
+
+        Lock a stable sidecar, not the JSON inode replaced by atomic saves.
+        Holding this across run_idempotent also serializes replay checks across
+        service instances. This uses the local Unix filesystem's advisory locks.
+        """
+        with self._lock:
+            if self._lock_depth or self._path is None:
+                yield
+                return
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = self._path.with_name(self._path.name + ".lock")
+            with lock_path.open("a+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                self._lock_depth += 1
+                try:
+                    self._reload()
+                    yield
+                finally:
+                    self._lock_depth -= 1
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _save(self) -> None:
         if self._path is None:
@@ -1349,18 +1385,18 @@ class ElicitationSessionStore:
                 os.unlink(temporary)
 
     def list_sessions(self) -> list[ElicitationSession]:
-        with self._lock:
+        with self._access():
             return [session.model_copy(deep=True) for session in self._sessions.values()]
 
     @property
     def idempotency_size(self) -> int:
-        with self._lock:
+        with self._access():
             return len(self._idempotency)
 
     def get_idempotency(
         self, session_id: str, key: str, payload_hash: str
     ) -> dict[str, Any] | None:
-        with self._lock:
+        with self._access():
             record = self._idempotency.get((session_id, key))
             if record is None:
                 return None
@@ -1379,7 +1415,7 @@ class ElicitationSessionStore:
         payload_hash: str,
         result: dict[str, Any],
     ) -> None:
-        with self._lock:
+        with self._access():
             existing = self._idempotency.get((session_id, key))
             if existing is not None and existing[0] != payload_hash:
                 raise ValueError(
@@ -1399,7 +1435,7 @@ class ElicitationSessionStore:
         mutation: Callable[[], dict[str, Any]],
     ) -> dict[str, Any]:
         """Serialize one mutation and cache a bounded replay-safe result."""
-        with self._lock:
+        with self._access():
             if key:
                 cached = self.get_idempotency(session_id, key, payload_hash)
                 if cached is not None:
@@ -1410,12 +1446,12 @@ class ElicitationSessionStore:
             return deepcopy(result)
 
     def put(self, session: ElicitationSession) -> None:
-        with self._lock:
+        with self._access():
             self._sessions[session.session_id] = session.model_copy(deep=True)
             self._save()
 
     def get(self, session_id: str) -> ElicitationSession:
-        with self._lock:
+        with self._access():
             try:
                 return self._sessions[session_id].model_copy(deep=True)
             except KeyError as exc:
@@ -1426,7 +1462,7 @@ class ElicitationSessionStore:
 
     def update(self, session_id: str, mutator: Any) -> ElicitationSession:
         """Mutate inside the lock; returns a deep copy."""
-        with self._lock:
+        with self._access():
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(
@@ -1440,7 +1476,7 @@ class ElicitationSessionStore:
             return session.model_copy(deep=True)
 
     def delete(self, session_id: str) -> None:
-        with self._lock:
+        with self._access():
             self._sessions.pop(session_id, None)
             self._idempotency = OrderedDict(
                 (key, value) for key, value in self._idempotency.items() if key[0] != session_id

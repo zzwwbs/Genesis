@@ -1135,10 +1135,12 @@ class RunController:
         artifact_store: Any | None = None,
         persistence: Any | None = None,
         status_provider: Callable[[], str] | None = None,
+        output_schema_validator: Callable[[str, Any], list[str]] | None = None,
     ):
         self.scheduler, self.registry, self.context_engine = scheduler, registry, context_engine
         self.state_store, self.persistence = state_store, persistence
         self.artifact_store = artifact_store
+        self.output_schema_validator = output_schema_validator
         self.status_provider = status_provider
         self.status = "created"
         self.results: list[ProcessResult] = []
@@ -1444,6 +1446,7 @@ class RunController:
         condition: Mapping[str, Any] | None = None,
         matching: Mapping[str, Any] | None = None,
         terminal_phase: int | None = None,
+        seed_identity: str | None = None,
     ) -> list[str]:
         if self.status in {"paused", "cancelled", "completed", "failed"}:
             return []
@@ -1558,7 +1561,7 @@ class RunController:
                         inputs=resolved_inputs,
                         seed=derive_seed(
                             seed,
-                            run_id,
+                            seed_identity or run_id,
                             item.process_id,
                             actor_seed_id,
                             experiment_id=experiment_id,
@@ -1658,6 +1661,45 @@ class RunController:
                                     status="skipped",
                                     outputs=dict(retry_policy.get("fallback_outputs", {})),
                                     metadata={**_plain(result.metadata), "skipped_fallback": True},
+                                )
+                        # F3/SCH-002: every declared artifact output — including a
+                        # fallback — must satisfy its declared schema before any
+                        # state or artifact commit. This is the common
+                        # output-commit boundary, so all executors are covered.
+                        if (
+                            result.status == "succeeded"
+                            and self.output_schema_validator is not None
+                        ):
+                            declared_outputs = process.get("outputs") or []
+                            declared_ids = {
+                                str(decl.get("artifact_type", ""))
+                                for decl in declared_outputs
+                                if isinstance(decl, Mapping) and decl.get("artifact_type")
+                            }
+                            schema_errors: list[str] = []
+                            for artifact_id, value in (result.outputs or {}).items():
+                                if str(artifact_id) not in declared_ids:
+                                    continue
+                                # Normalize frozen mappingproxies to plain
+                                # JSON-able values before schema validation.
+                                schema_value = _plain(value)
+                                for message in self.output_schema_validator(
+                                    str(artifact_id), schema_value
+                                ):
+                                    schema_errors.append(f"{artifact_id}: {message}")
+                            if schema_errors:
+                                metadata = dict(_plain(result.metadata))
+                                metadata.update(
+                                    {
+                                        "code": "OUTPUT_VALIDATION_FAILED",
+                                        "schema_valid": False,
+                                        "validation_errors": schema_errors,
+                                    }
+                                )
+                                result = ProcessResult(
+                                    status="failed",
+                                    outputs=result.outputs,
+                                    metadata=metadata,
                                 )
                         if result.status == "failed":
                             self.failures.append(
@@ -1839,9 +1881,15 @@ class RunController:
                             trace = process.get("trace_policy", {})
                             trace = trace if isinstance(trace, Mapping) else {}
                             storage_outputs = dict(_plain(result.outputs))
+                            omit_provider_bodies = trace.get("record_raw_response", True) is False
+                            storage_metadata = (
+                                _event_safe_metadata(result.metadata)
+                                if omit_provider_bodies
+                                else _plain(result.metadata)
+                            )
                             if (
-                                trace.get("record_raw_response", True) is False
-                                and process.get("executor", {}).get("mode") == "generative"
+                                omit_provider_bodies
+                                and (process.get("executor", {}).get("mode") == "generative")
                                 and "response" in storage_outputs
                             ):
                                 storage_outputs["response"] = "<raw-response-not-recorded>"
@@ -1854,12 +1902,12 @@ class RunController:
                             payload = json.dumps(
                                 {
                                     "outputs": storage_outputs,
-                                    "raw_response": _plain(result.metadata.get("raw_response")),
+                                    "raw_response": storage_metadata.get("raw_response"),
                                     "parsed_response": _plain(
-                                        result.metadata.get("parsed_response")
+                                        storage_metadata.get("parsed_response")
                                     ),
                                     "provider_attempts": _plain(
-                                        result.metadata.get("provider_attempts", [])
+                                        storage_metadata.get("provider_attempts", [])
                                     ),
                                     "process_id": item.process_id,
                                     "invocation_id": call.invocation_id,

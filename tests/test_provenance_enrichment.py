@@ -147,6 +147,42 @@ def test_record_raw_response_false_redacts_generative_raw_response(tmp_path: Pat
     assert len(artifacts) == 1
     payload = json.loads(artifacts[0]["payload"])
     assert payload["outputs"]["response"] == "<raw-response-not-recorded>"
+    assert payload["raw_response"] is None
+    assert payload["parsed_response"] is None
+    assert all("raw_response" not in attempt for attempt in payload["provider_attempts"])
+    assert all("parsed_response" not in attempt for attempt in payload["provider_attempts"])
+    assert payload["provider_attempts"][0]["request_id"]
+    assert all(b"mock:" not in path.read_bytes() for path in (tmp_path / "objects").glob("??/*"))
+
+
+def test_raw_response_policy_preserves_structured_simulation_outputs(tmp_path: Path) -> None:
+    class StructuredExecutor:
+        def execute(self, _invocation: ProcessInvocation) -> ProcessResult:
+            return ProcessResult(
+                outputs={"strategy": {"score": 0.5}},
+                metadata={
+                    "raw_response": '{"score": 0.5}',
+                    "parsed_response": {"score": 0.5},
+                    "provider_attempts": [
+                        {"raw_response": "invalid-first-attempt", "request_id": "r1"}
+                    ],
+                },
+            )
+
+    processes = [
+        {
+            "id": "generate",
+            "executor": {"mode": "generative"},
+            "context_policy": "public",
+            "trace_policy": {"record_raw_response": False},
+        }
+    ]
+    _, artifacts = _run(tmp_path, processes, {"generate": StructuredExecutor()})
+    payload = json.loads(artifacts[0]["payload"])
+    assert payload["outputs"] == {"strategy": {"score": 0.5}}
+    assert payload["raw_response"] is None
+    assert payload["parsed_response"] is None
+    assert payload["provider_attempts"] == [{"request_id": "r1"}]
 
 
 def test_record_raw_response_true_keeps_generative_raw_response(tmp_path: Path) -> None:

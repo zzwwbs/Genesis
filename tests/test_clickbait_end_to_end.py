@@ -75,6 +75,9 @@ def _overrides() -> dict[str, object]:
         return {
             "recommendation-set": {
                 "user_id": invocation.actor_ids[0],
+                "title_ids": [
+                    record["value"]["article_id"] for _instance_id, record in titles
+                ],
                 "candidates": [
                     {
                         "title_instance_id": instance_id,

@@ -3,4 +3,4 @@ properties:
   user_id: {type: string}
   article_id: {type: string}
 required: [user_id, article_id]
-additionalProperties: false
+additionalProperties: true

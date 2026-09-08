@@ -16,6 +16,8 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
+from .execution_manifest import build_package_closure
+from .schema_validation import PackageSchemaCatalog, SchemaValidationError
 from .specification.models import (
     DomainSpec,
     ModelsSpec,
@@ -26,6 +28,7 @@ from .specification.models import (
     StudySpec,
     TheorySpec,
 )
+from .theory_execution import compile_theory_execution
 
 CANONICAL: dict[str, type[StrictModel]] = {
     "study": StudySpec,
@@ -85,12 +88,12 @@ def _resolve_context_policies(domain: DomainSpec) -> list[dict[str, Any]]:
     return policies
 
 
-def _schema_catalog(source: Path) -> dict[str, dict[str, Any]]:
+def _schema_catalog(source: Path) -> dict[str, Any]:
     """Parse every schema asset under ``schemas/`` into a JSON Schema catalog (AW-18)."""
     schema_dir = source / "schemas"
     if not schema_dir.is_dir():
         return {}
-    catalog: dict[str, dict[str, Any]] = {}
+    catalog: dict[str, Any] = {}
     for path in sorted(schema_dir.glob("*")):
         if not path.is_file() or path.suffix not in {".yaml", ".yml", ".json"}:
             continue
@@ -98,8 +101,12 @@ def _schema_catalog(source: Path) -> dict[str, dict[str, Any]]:
             value = yaml.safe_load(path.read_text())
         except yaml.YAMLError as exc:
             raise ValueError(f"SCHEMA_INVALID: schema {path.name} is not valid YAML/JSON") from exc
-        if not isinstance(value, dict):
-            raise ValueError(f"SCHEMA_INVALID: schema {path.name} must be an object")
+        # F13: boolean schemas (true/false) are valid under the package dialect
+        # and must be accepted here, matching the runtime catalog validator.
+        if not isinstance(value, (dict, bool)):
+            raise ValueError(
+                f"SCHEMA_INVALID: schema {path.name} must be an object or boolean schema"
+            )
         catalog[path.stem] = value
     return catalog
 
@@ -537,6 +544,36 @@ class StudyCompiler:
                 )
         return errors, warnings
 
+    def _compile_theory_execution(self, loaded: dict[str, Any]) -> Any:
+        """Compile explicit theory execution bindings into a versioned plan.
+
+        The plan is a derived, inspectable artifact: it records precedence
+        edges, feedback-context bindings, verified mechanism bindings and
+        annotation-only declarations, plus coverage and validation issues.
+        """
+        openness = loaded["openness"]
+        domain = loaded["domain"]
+        theory = loaded["theory"]
+        process_ids = self._ids(openness.processes)
+        mechanism_ids = self._ids(domain.mechanisms) if hasattr(domain, "mechanisms") else set()
+        existing_dependencies: dict[str, list[str]] = {}
+        for process in openness.processes:
+            dependencies = process.dependencies
+            after = (
+                dependencies.get("after", [])
+                if isinstance(dependencies, dict)
+                else dependencies
+            )
+            if isinstance(after, list):
+                existing_dependencies[str(process.id)] = [str(dep) for dep in after]
+        theory_dict = theory.model_dump(mode="json")
+        return compile_theory_execution(
+            theory_dict,
+            known_processes=process_ids,
+            known_mechanisms=mechanism_ids,
+            existing_dependencies=existing_dependencies,
+        )
+
     def _prompt_exists(self, prompt_ref: str) -> bool:
         prompt_dir = self.source / "prompts"
         suffixes = ("", ".yaml", ".yml", ".json", ".txt")
@@ -552,6 +589,34 @@ class StudyCompiler:
         errors = self._validate(loaded)
         theory_errors, theory_warnings = self._validate_theory(loaded)
         errors.extend(theory_errors)
+        # Compile-time theory execution plan (G2/THY-001): researcher-approved
+        # execution bindings compile into schedule edges, context bindings and
+        # verified mechanisms; unsupported or unresolved bindings fail here.
+        theory_plan = self._compile_theory_execution(loaded)
+        for issue in theory_plan.issues:
+            if issue.code != "THEORY_ANNOTATION_WITHOUT_REASON":
+                errors.append(
+                    {
+                        "code": issue.code,
+                        "severity": "error",
+                        "path": f"/theory/{issue.declaration_type}/"
+                        f"{issue.declaration_id or ''}",
+                        "message": issue.message,
+                    }
+                )
+        # Compile-time schema checks: every declared schema must be a valid
+        # Draft 2020-12 schema in the package dialect (SCH-001/004).
+        try:
+            PackageSchemaCatalog(_schema_catalog(self.source))
+        except SchemaValidationError as exc:
+            errors.append(
+                {
+                    "code": exc.code,
+                    "severity": "error",
+                    "path": f"/schemas/{exc.schema_id}",
+                    "message": str(exc),
+                }
+            )
         if errors:
             raise ValidationIssue(
                 [
@@ -602,15 +667,46 @@ class StudyCompiler:
             ]
             for p in loaded["openness"].processes
         }
+        # THY-004: unify theory-generated zero-lag precedence edges into the
+        # compiled schedule, deduplicated against declared openness
+        # dependencies. Positive-lag edges remain recorded in the theory
+        # execution plan as temporal contracts, not same-round scheduling.
+        for producer, consumer, lag in theory_plan.precedence_edges:
+            if lag != 0:
+                continue
+            existing = {entry["dependency"] for entry in process_graph.get(consumer, [])}
+            if str(producer) in existing:
+                continue
+            process_graph.setdefault(str(consumer), []).append(
+                {"dependency": str(producer), "delayed": False, "delay": None}
+            )
+            process_graph[str(consumer)].sort(key=lambda entry: str(entry["dependency"]))
         theory_functions = {
             mapping.process: mapping.theory_function
             for mapping in loaded["theory"].process_mappings
         }
+        # THY-004: apply zero-lag theory precedence edges to the *compiled
+        # process definitions* (processes.json), which is the schedule the
+        # runtime Scheduler actually reads. process_graph.json stays as the
+        # inspectable rendered graph, but execution order must reflect the
+        # approved theory bindings, not only the advisory file.
+        theory_after: dict[str, list[str]] = {}
+        for producer, consumer, lag in theory_plan.precedence_edges:
+            if lag != 0:
+                continue
+            theory_after.setdefault(str(consumer), []).append(str(producer))
         compiled_processes = []
         for process in loaded["openness"].processes:
             record = process.model_dump(mode="json")
             if process.id in theory_functions:
                 record["theory_function"] = theory_functions[process.id]
+            theory_deps = theory_after.get(str(process.id), [])
+            if theory_deps:
+                added = [dep for dep in theory_deps if dep != str(process.id)]
+                current_after = list(record.get("dependencies", {}).get("after", []))
+                merged = sorted(set(current_after).union(added))
+                record.setdefault("dependencies", {})
+                record["dependencies"]["after"] = merged
             compiled_processes.append(record)
         files = {
             "processes.json": compiled_processes,
@@ -629,7 +725,12 @@ class StudyCompiler:
             "artifact_catalog.json": [
                 a.model_dump(mode="json") for a in loaded["domain"].artifacts
             ],
-            "outcome_plan.json": [o.model_dump(mode="json") for o in loaded["outcomes"].outcomes],
+            "outcome_plan.json": {
+                "datasets": [
+                    d.model_dump(mode="json") for d in loaded["outcomes"].datasets
+                ],
+                "outcomes": [o.model_dump(mode="json") for o in loaded["outcomes"].outcomes],
+            },
             "protocol.json": loaded["protocol"].model_dump(mode="json"),
             "initialization.json": (
                 loaded["domain"].initialization.model_dump(mode="json")
@@ -652,6 +753,7 @@ class StudyCompiler:
                 ],
             },
         }
+        files["theory_execution_plan.json"] = theory_plan.to_dict()
         manifest = {
             "build_hash": build_hash,
             "compiler_version": self.compiler_version,
@@ -659,6 +761,12 @@ class StudyCompiler:
             "study_id": loaded["study"].study_id,
             "canonical_artifacts": sorted(canonical),
         }
+        # Pin the approved package into an immutable content-addressed closure
+        # (spec §2.1): original bytes, per-member digests/sizes/media types.
+        # Export and replay later read this closure, never the editable package.
+        package_closure = build_package_closure(self.source)
+        manifest["package_closure_digest"] = package_closure.digest
+        files["package_closure.json"] = package_closure.manifest
         files["build_manifest.json"] = manifest
         integrity = {}
         data_dir = self.source / "data"
@@ -671,6 +779,14 @@ class StudyCompiler:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(asset.read_bytes())
                 destination.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        # Preserve original package asset bytes inside the build's closure dir.
+        closure_root = self.source
+        for asset in package_closure.manifest["assets"]:
+            source_asset = closure_root / Path(asset["path"])
+            destination = temp / "closure" / Path(asset["path"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source_asset.read_bytes())
+            destination.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
         for filename, value in files.items():
             path = temp / filename
             path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
@@ -722,11 +838,19 @@ class StudyCompiler:
                 "initialization.json",
                 "data_manifest.json",
                 "schemas.json",
+                "package_closure.json",
+                "theory_execution_plan.json",
             }
             expected_keys = set(expected) - {"manifest_hash"}
             if not expected_keys <= (required | optional):
                 unknown = expected_keys - (required | optional)
-                if any(not str(name).startswith("data/") for name in unknown):
+                closure_unknown = [
+                    name
+                    for name in unknown
+                    if str(name).startswith("closure/")
+                    or str(name).startswith("data/")
+                ]
+                if len(closure_unknown) != len(unknown):
                     raise ValueError("BUILD_INTEGRITY: unexpected expected-file set")
             if not required <= expected_keys:
                 raise ValueError("BUILD_INTEGRITY: incomplete expected-file set")

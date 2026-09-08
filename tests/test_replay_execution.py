@@ -130,46 +130,58 @@ def _outputs_for(artifacts: list[dict], process_id: str) -> dict:
     raise AssertionError(f"no artifact for {process_id}")
 
 
-def test_full_rerun_produces_a_second_realisation(tmp_path: Path, monkeypatch) -> None:
+def test_full_rerun_reuses_recorded_invocations(tmp_path: Path, monkeypatch) -> None:
+    """Spec §5.1: FULL reuses recorded invocations; it is not a fresh draw."""
     service = _source_run(tmp_path, monkeypatch)
+    monkeypatch.setattr("genesis.service.OpenAICompatibleProvider", RaisingProvider)
     try:
         source_artifacts = service.artifacts_for_run("source-1")
         source_compose = _outputs_for(source_artifacts, "compose")
         replay = service.replay_run("source-1", mode=ReplayMode.FULL)
-        assert replay["run_id"] != "source-1"
+        assert replay["run_id"].startswith("source-1-replay-")
         assert replay["source_run_id"] == "source-1"
         rerun_compose = _outputs_for(replay["artifacts"], "compose")
-        # A second realisation draws distinct generative outputs.
-        assert rerun_compose != source_compose
-        fallback_text = str(rerun_compose["response"])
-        assert fallback_text.startswith("gen-") or (
-            isinstance(rerun_compose["response"], dict)
-            and str(rerun_compose["response"].get("text", "")).startswith("gen-")
-        )
+        # FULL reproduces the recorded trajectory exactly — the recorded
+        # invocation, not a fresh generative draw (no provider constructed).
+        assert rerun_compose == source_compose
+        events = {
+            event["process_id"]: event.get("metadata", {}).get("recorded")
+            for event in service.trace_run(replay["run_id"])
+            if event.get("kind") == "process_completed"
+        }
+        assert events["compose"] is True
+        assert events["embellish"] is True
     finally:
         service.close()
 
 
-def test_artifact_replay_invokes_no_provider(tmp_path: Path, monkeypatch) -> None:
+def test_full_replay_rejects_overrides(tmp_path: Path, monkeypatch) -> None:
+    """§5.1: FULL replay does not accept factor overrides."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(ValueError, match="REPLAY_CONFIGURATION_INVALID"):
+            service.replay_run(
+                "source-1", mode=ReplayMode.FULL, overrides={"policy": "lenient"}
+            )
+    finally:
+        service.close()
+
+
+def test_artifact_replay_is_retrieval_only(tmp_path: Path, monkeypatch) -> None:
+    """Spec §5.1: artifact replay retrieves retained artifacts, no child run."""
     service = _source_run(tmp_path, monkeypatch)
     monkeypatch.setattr("genesis.service.OpenAICompatibleProvider", RaisingProvider)
     try:
         source_artifacts = service.artifacts_for_run("source-1")
         source_compose = _outputs_for(source_artifacts, "compose")
         replay = service.replay_run("source-1", mode=ReplayMode.ARTIFACT)
-        assert replay["run_id"] != "source-1"
-        # Recorded outputs are reproduced exactly (ACC-009).
+        assert replay["run_id"] == "source-1"
+        assert replay["lineage"].get("retrieval") is True
+        # Recorded outputs are retrieved exactly; no child run is created.
         assert _outputs_for(replay["artifacts"], "compose") == source_compose
-        replay_run_id = replay["run_id"]
-        events = service.trace_run(replay_run_id)
-        recorded = {
-            event["process_id"]: event.get("metadata", {}).get("recorded")
-            for event in events
-            if event.get("kind") == "process_completed"
-        }
-        assert recorded["compose"] is True
-        assert recorded["embellish"] is True
-        assert recorded["finalize"] is not True
+        runs = {run["id"] for run in service.list_runs()}
+        assert "source-1" in runs
+        assert not any(run_id.startswith("source-1-replay-") for run_id in runs)
     finally:
         service.close()
 
@@ -179,7 +191,13 @@ def test_partial_replay_freezes_only_selected_processes(tmp_path: Path, monkeypa
     try:
         source_artifacts = service.artifacts_for_run("source-1")
         source_compose = _outputs_for(source_artifacts, "compose")
-        replay = service.replay_run("source-1", mode=ReplayMode.PARTIAL, boundary="compose")
+        preview = service.replay_preview("source-1", mode=ReplayMode.PARTIAL, boundary="compose")
+        replay = service.replay_run(
+            "source-1",
+            mode=ReplayMode.PARTIAL,
+            boundary="compose",
+            preview_token=preview["preview_token"],
+        )
         # Frozen process reproduces recorded output; others are fresh draws.
         assert _outputs_for(replay["artifacts"], "compose") == source_compose
         replay_run_id = replay["run_id"]
@@ -199,16 +217,15 @@ def test_branch_replay_requires_a_justification(tmp_path: Path, monkeypatch) -> 
     try:
         with pytest.raises(ValueError, match="justification"):
             service.replay_run("source-1", mode=ReplayMode.BRANCH, boundary="compose")
-        replay = service.replay_run(
-            "source-1",
-            mode=ReplayMode.BRANCH,
-            boundary="compose",
-            justification="test governance counterfactual",
-        )
-        assert replay["lineage"]["justification"] == "test governance counterfactual"
-        record = service.get_run(replay["run_id"])
-        assert record["replay_of"] == "source-1"
-        assert record["replay_mode"] == "branch"
+        # RPL-004: a branch on a study with no branchable factor change is
+        # rejected rather than silently producing an identical child.
+        with pytest.raises(ValueError, match="REPLAY_NO_EFFECTIVE_CHANGE"):
+            service.replay_preview(
+                "source-1",
+                mode=ReplayMode.BRANCH,
+                boundary="compose",
+                justification="test governance counterfactual",
+            )
     finally:
         service.close()
 
@@ -381,7 +398,15 @@ def test_partial_replay_phase_boundary_freezes_prefix(tmp_path: Path, monkeypatc
     try:
         source_phases = _phase_outputs(service, "boundary-source", "compose")
         assert len(source_phases) >= 2
-        replay = service.replay_run("boundary-source", mode=ReplayMode.PARTIAL, boundary="phase:1")
+        preview = service.replay_preview(
+            "boundary-source", mode=ReplayMode.PARTIAL, boundary="phase:1"
+        )
+        replay = service.replay_run(
+            "boundary-source",
+            mode=ReplayMode.PARTIAL,
+            boundary="phase:1",
+            preview_token=preview["preview_token"],
+        )
         replay_phases = _phase_outputs(service, replay["run_id"], "compose")
         # Phase 0 is frozen to its recorded output; phase >= 1 re-executed live
         # (a fresh provider draw, distinct from the recorded one).
@@ -405,7 +430,7 @@ def test_replay_rejects_unknown_event_boundary(tmp_path: Path, monkeypatch) -> N
     service = _repeat_source(tmp_path, monkeypatch)
     try:
         with _pytest.raises(ValueError, match="REPLAY_BOUNDARY"):
-            service.replay_run(
+            service.replay_preview(
                 "boundary-source", mode=ReplayMode.PARTIAL, boundary="event:missing-event"
             )
     finally:
@@ -449,3 +474,14 @@ def test_selective_executor_selects_by_actor_parity() -> None:
         invocation = ProcessInvocation("i-1", "r-1", "compose", actor_ids=(actor,), phase=0)
         result = executor.execute(invocation)
         assert result.outputs["who"] == expected
+
+
+def test_process_selection_must_be_dependency_closed(tmp_path: Path, monkeypatch) -> None:
+    """F9: freezing a consumer without freezing its dependency is rejected."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        # In the replay study, embellish depends on compose (after: [compose]).
+        with pytest.raises(ValueError, match="REPLAY_BOUNDARY_UNSUPPORTED"):
+            service.replay_preview("source-1", mode=ReplayMode.PARTIAL, boundary="embellish")
+    finally:
+        service.close()

@@ -118,6 +118,35 @@ def _prepare_session(service: GenesisService) -> dict:
     return service.get_elicitation(session["session_id"])
 
 
+def test_prompt_removal_survives_preview_and_approval_payload(service: GenesisService) -> None:
+    form = service.get_specification("study")["form"]
+    form["prompts"] = {"old": "Original prompt"}
+    service.update_specification("study", form, 1)
+    workflow = service._workflow_registry.get("three-layer-study")
+    directory = service._specification_dir("study")
+    patch = SpecificationPatch.model_validate(
+        {
+            "stage_id": "openness",
+            "base_specification_version": 2,
+            "operations": [{"op": "replace", "path": "/prompts", "value": {}}],
+            "evidence": [{"target": "/prompts", "source_turns": [1]}],
+        }
+    )
+    preview = service._patch_preview.preview(
+        patch=patch,
+        stage=workflow.stage("openness"),
+        workflow=workflow,
+        current_form=form,
+        source_turn_ids={1},
+        package_hash=service._package_content_hash(directory),
+        live_directory=directory,
+    )
+    assert preview["candidate_form"]["prompts"] == {}
+    assert (directory / "prompts/old.txt").exists()
+    service.update_specification("study", preview["candidate_form"], 2)
+    assert not (directory / "prompts/old.txt").exists()
+
+
 def test_output_schema_can_be_deferred_then_authored_and_persisted(service: GenesisService) -> None:
     from genesis.compiler import StudyCompiler
 

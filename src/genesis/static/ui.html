@@ -878,18 +878,29 @@
         document.getElementById('elicitation-preview-tab').hidden = true;
       }
     }
-    async function elicitationRequestTimeout() {
-      const profile = await request(`/llm/profiles/${encodeURIComponent(elicitationSession.model_profile_id)}`);
+    async function elicitationRequestTimeout(profileId = elicitationSession.model_profile_id) {
+      const profile = await request(`/llm/profiles/${encodeURIComponent(profileId)}`);
       // Leave room for three schema-repair attempts and parameter-compatibility retries.
       return Math.max(180000, Number(profile.timeout || 60) * 9000 + 30000);
+    }
+    function prepareElicitationMutation(endpoint, payload = {}, modelCall = false) {
+      // Capture one logical operation before installing its retry callback. Never
+      // rebuild it from mutable UI/session state after an uncertain response.
+      const url = `/elicitation/sessions/${elicitationSessionId}/${endpoint}`;
+      const body = JSON.stringify({...payload, expected_version: elicitationVersion});
+      const key = mutationKey(endpoint);
+      const profileId = elicitationSession && elicitationSession.model_profile_id;
+      return async () => request(url, {method:'POST', body,
+        headers:{'Idempotency-Key':key},
+        timeoutMs:modelCall ? await elicitationRequestTimeout(profileId) : 180000});
     }
     async function sendElicitation() {
       if (!requireElicitationSession()) return;
       const answer = document.getElementById('elicitation-composer').value.trim();
       if (!answer) { showElicitationError(new Error('Enter a response or choose a suggestion.')); return; }
+      const mutate = prepareElicitationMutation('messages', {answer, response_mode:'free_form', suggestion_index: selectedSuggestionIndex}, true);
       await performElicitationAction('Processing your response and updating the draft…', async () => {
-        const payload = {answer, response_mode:'free_form', suggestion_index: selectedSuggestionIndex, expected_version: elicitationVersion};
-        const session = await request(`/elicitation/sessions/${elicitationSessionId}/messages`, {method:'POST', body:JSON.stringify(payload), headers:{'Idempotency-Key':mutationKey('message')}, timeoutMs: await elicitationRequestTimeout()});
+        const session = await mutate();
         document.getElementById('elicitation-composer').value = '';
         resetSuggestionSelection();
         renderElicitation(session);
@@ -897,8 +908,9 @@
     }
     async function draftElicitation() {
       if (!requireElicitationSession()) return;
+      const mutate = prepareElicitationMutation('draft', {}, true);
       await performElicitationAction('Generating a structured stage draft…', async () => {
-        const session = await request(`/elicitation/sessions/${elicitationSessionId}/draft`, {method:'POST', body:JSON.stringify({expected_version: elicitationVersion}), headers:{'Idempotency-Key':mutationKey('draft')}, timeoutMs: await elicitationRequestTimeout()});
+        const session = await mutate();
         renderElicitation(session);
       });
     }
@@ -912,8 +924,9 @@
     }
     async function approveElicitation() {
       if (!requireElicitationSession()) return;
+      const mutate = prepareElicitationMutation('approve', {approved_by:'researcher'});
       await performElicitationAction('Recording explicit stage approval…', async () => {
-        const session = await request(`/elicitation/sessions/${elicitationSessionId}/approve`, {method:'POST', body:JSON.stringify({approved_by:'researcher', expected_version: elicitationVersion}), headers:{'Idempotency-Key':mutationKey('approve')}, timeoutMs: 180000});
+        const session = await mutate();
         renderElicitation(session);
       });
     }
@@ -924,15 +937,17 @@
     }
     async function saveDraftEdit() {
       if (!requireElicitationSession()) return;
+      const mutate = prepareElicitationMutation('edit', {filename:document.getElementById('draft-editor-file').value, content:document.getElementById('draft-editor-content').value});
       await performElicitationAction('Validating your YAML edits…', async () => {
-        const body = {filename:document.getElementById('draft-editor-file').value, content:document.getElementById('draft-editor-content').value, expected_version:elicitationVersion};
-        const session = await request(`/elicitation/sessions/${elicitationSessionId}/edit`, {method:'POST', body:JSON.stringify(body), headers:{'Idempotency-Key':mutationKey('edit')}});
+        const session = await mutate();
         renderElicitation(session);
       });
     }
     async function reviseElicitation() {
+      if (!requireElicitationSession()) return;
+      const mutate = prepareElicitationMutation('revise');
       await performElicitationAction('Opening the draft for feedback…', async () => {
-        const session = await request(`/elicitation/sessions/${elicitationSessionId}/revise`, {method:'POST', body:JSON.stringify({expected_version: elicitationVersion}), headers:{'Idempotency-Key':mutationKey('revise')}, timeoutMs: 180000});
+        const session = await mutate();
         renderElicitation(session);
         document.getElementById('elicitation-composer').focus();
       });
@@ -942,16 +957,18 @@
       const stageId = requestedStageId || prompt('Stage id to reopen (e.g. openness):', '');
       if (!stageId) return;
       if (!confirm('Reopen this stage for revision? This restarts its clarification round, discards the current pending draft, and may require downstream stages to be reviewed again. To view history only, use the left panel.')) return;
+      const mutate = prepareElicitationMutation('reopen', {stage_id:stageId});
       await performElicitationAction('Reopening the approved stage…', async () => {
-        const session = await request(`/elicitation/sessions/${elicitationSessionId}/reopen`, {method:'POST', body:JSON.stringify({stage_id: stageId, expected_version: elicitationVersion}), headers:{'Idempotency-Key':mutationKey('reopen')}, timeoutMs: 180000});
+        const session = await mutate();
         renderElicitation(session);
         toggleStageRail(false);
       });
     }
     async function cancelElicitation() {
       if (!elicitationSessionId) return;
+      const mutate = prepareElicitationMutation('cancel');
       await performElicitationAction('Ending the local session…', async () => {
-        await request(`/elicitation/sessions/${elicitationSessionId}/cancel`, {method:'POST', body:JSON.stringify({expected_version: elicitationVersion}), headers:{'Idempotency-Key':mutationKey('cancel')}});
+        await mutate();
         elicitationSessionId = null; elicitationSession = null; elicitationVersion = null; elicitationPreview = null;
         resetSuggestionSelection();
         document.getElementById('elicitation-chat').style.display = 'none';
@@ -1032,11 +1049,28 @@
       try {
         const mode = prompt('Replay mode (full / artifact / partial / branch):', 'artifact');
         if (!mode) return;
-        const boundary = prompt('Boundary (phase:N or event:<id>, optional):', '') || undefined;
+        const boundary = prompt('Boundary (phase:N, event:<id>, or process names; required for partial/branch):', '') || undefined;
         const justification = prompt('Justification (required for branch):', '') || undefined;
+        const overridesText = prompt('Branch factor overrides as JSON (e.g. {"policy":"lenient"}) — optional:', '');
+        let overrides = undefined;
+        if (overridesText) { try { overrides = JSON.parse(overridesText); } catch (_e) { show('analysis-output', 'Invalid JSON for overrides: ' + overridesText); return; } }
+        const run = selectedRun();
+        let preview_token;
+        if (mode === 'partial' || mode === 'branch') {
+          // F10: the backend requires a read-only preview and a confirmed
+          // digest-bound token before executing a partial/branch replay.
+          const previewBody = {mode, justification};
+          if (boundary) previewBody.boundary = boundary;
+          if (overrides) previewBody.overrides = overrides;
+          const preview = await request(`/runs/${encodeURIComponent(run)}/replays/preview`, {method:'POST', body:JSON.stringify(previewBody)});
+          if (!preview.preview_token) throw new Error('preview did not return a confirmation token');
+          preview_token = preview.preview_token;
+        }
         const body = {mode}; if (boundary) body.boundary = boundary; if (justification) body.justification = justification;
-        const result = await request(`/runs/${encodeURIComponent(selectedRun())}/replays`, {method:'POST', body:JSON.stringify(body)});
-        show('analysis-output', {replay_run_id: result.run_id, source_run_id: result.source_run_id, mode, boundary: boundary || 'none'});
+        if (overrides) body.overrides = overrides;
+        if (preview_token) body.preview_token = preview_token;
+        const result = await request(`/runs/${encodeURIComponent(run)}/replays`, {method:'POST', body:JSON.stringify(body)});
+        show('analysis-output', {replay_run_id: result.run_id, source_run_id: result.source_run_id, mode, boundary: boundary || 'none', overrides: overrides || undefined});
       } catch (e) { show('analysis-output', e.message); }
     }
     function renderTraceView(result) {

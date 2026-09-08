@@ -13,10 +13,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from genesis.runtime import ProcessInvocation, ProcessResult
+from genesis.schema_validation import SchemaDiagnostic
+from genesis.schema_validation import validate_schema as _authoritative_validate_schema
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,7 @@ class ProviderExecutor:
         prompt_template: str = "{context}",
         parameters: dict[str, Any] | None = None,
         output_schema: dict[str, Any] | None = None,
+        output_schema_validator: Callable[[Any], list[SchemaDiagnostic]] | None = None,
         output_key: str = "response",
         mode: str = "generative",
         max_repairs: int = 1,
@@ -74,6 +78,7 @@ class ProviderExecutor:
         self.prompt_template = prompt_template
         self.parameters = dict(parameters or {})
         self.output_schema = output_schema
+        self.output_schema_validator = output_schema_validator
         self.output_key = output_key
         self.mode = mode
         self.max_repairs = max(0, int(max_repairs))
@@ -82,6 +87,20 @@ class ProviderExecutor:
     def _raise_if_cancelled(self) -> None:
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise ValueError("PROVIDER_CANCELLED: provider call cancelled before execution")
+
+    def _schema_messages(self, value: Any) -> list[str]:
+        """Human-readable validation messages for repair prompts and metadata.
+
+        Uses the authoritative catalog-backed validator when one is bound
+        (SCH-002: the same resolver and dialect as compilation), otherwise the
+        standalone Draft 2020-12 validator for a directly supplied schema.
+        """
+        if self.output_schema_validator is not None:
+            return [
+                f"{diagnostic.instance_pointer or 'root'}: {diagnostic.message}"
+                for diagnostic in self.output_schema_validator(value)
+            ]
+        return validate_schema(self.output_schema or {}, value)
 
     def _estimated_cost(self, usage: dict[str, int]) -> float | None:
         """Estimate cost from usage and configured per-1k-token prices (AW-18)."""
@@ -126,7 +145,7 @@ class ProviderExecutor:
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
         value = response.parsed if response.parsed is not None else response.text
         if self.output_schema is not None:
-            errors = validate_schema(self.output_schema, value)
+            errors = self._schema_messages(value)
             repairs = 0
             while errors and repairs < self.max_repairs:
                 self._raise_if_cancelled()
@@ -149,7 +168,7 @@ class ProviderExecutor:
                     }
                 )
                 value = response.parsed if response.parsed is not None else response.text
-                errors = validate_schema(self.output_schema, value)
+                errors = self._schema_messages(value)
             metadata: dict[str, Any] = {
                 "mode": self.mode,
                 "provider": response.provider,
@@ -443,40 +462,14 @@ class RecordedArtifactProvider:
 
 
 def validate_schema(schema: dict[str, Any], value: Any, path: str = "root") -> list[str]:
-    """Validate a value against a JSON-Schema subset (AW-18).
+    """Validate a value under Draft 2020-12, returning human-readable messages.
 
-    Supports ``type`` (object/array/string/number/integer/boolean),
-    ``required``, and ``properties``. Errors are human-readable strings used
-    for bounded repair prompts.
+    Delegates to the authoritative package validator (SCH-001/002), so the same
+    dialect and semantics back repair prompts, runtime enforcement and
+    compile-time checks. ``path`` is accepted for API compatibility; messages
+    carry full instance paths derived from the validator.
     """
-
-    declared = schema.get("type")
-    if declared == "object":
-        if not isinstance(value, dict):
-            return [f"{path}: expected object, got {type(value).__name__}"]
-        errors = []
-        for key in schema.get("required", []):
-            if key not in value:
-                errors.append(f"{path}.{key}: required property is missing")
-        for key, sub in (schema.get("properties") or {}).items():
-            if key in value and isinstance(sub, dict):
-                errors.extend(validate_schema(sub, value[key], f"{path}.{key}"))
-        return errors
-    if declared == "array":
-        if not isinstance(value, list):
-            return [f"{path}: expected array, got {type(value).__name__}"]
-        items_schema = schema.get("items")
-        errors = []
-        if isinstance(items_schema, dict):
-            for index, item in enumerate(value):
-                errors.extend(validate_schema(items_schema, item, f"{path}[{index}]"))
-        return errors
-    if declared in {"string", "number", "integer", "boolean"}:
-        mapping = {"string": str, "number": int | float, "integer": int, "boolean": bool}
-        expected = mapping[declared]
-        ok = isinstance(value, expected) and not (declared == "integer" and isinstance(value, bool))
-        return [] if ok else [f"{path}: expected {declared}, got {type(value).__name__}"]
-    return []
+    return _authoritative_validate_schema(schema, value)
 
 
 class ProviderRegistry:

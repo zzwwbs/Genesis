@@ -335,10 +335,16 @@ def create_app(
         try:
             run_id = str(payload.get("run_id", payload.get("id", "")))
             output = str(payload.get("output", ""))
+            mode = str(payload.get("mode", "exploration"))
             if not run_id or not output:
                 return _error("VALIDATION_ERROR", "run_id and output are required", 422)
-            paths = service.export_run(run_id, output)
-            return {"run_id": run_id, "paths": [str(path) for path in paths], "status": "exported"}
+            paths = service.export_run(run_id, output, mode=mode)
+            return {
+                "run_id": run_id,
+                "mode": mode,
+                "paths": [str(path) for path in paths],
+                "status": "exported",
+            }
         except Exception as exc:
             return _service_error(exc)
 
@@ -544,6 +550,21 @@ def create_app(
         except Exception as exc:
             return _service_error(exc)
 
+    @app.post("/runs/{run_id}/replays/preview")
+    def replay_preview(run_id: str, payload: dict[str, Any] | None = None) -> Any:
+        body = payload or {}
+        try:
+            return service.replay_preview(
+                run_id,
+                mode=ReplayMode(body.get("mode", "full")),
+                artifact_ids=tuple(body.get("artifact_ids", ())),
+                boundary=body.get("boundary"),
+                overrides=body.get("overrides"),
+                justification=body.get("justification"),
+            )
+        except Exception as exc:
+            return _service_error(exc)
+
     @app.post("/runs/{run_id}/replays")
     def replay(run_id: str, payload: dict[str, Any] | None = None) -> Any:
         body = payload or {}
@@ -555,6 +576,7 @@ def create_app(
                 boundary=body.get("boundary"),
                 overrides=body.get("overrides"),
                 justification=body.get("justification"),
+                preview_token=body.get("preview_token"),
             )
         except Exception as exc:
             return _service_error(exc)

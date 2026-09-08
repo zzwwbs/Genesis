@@ -257,14 +257,39 @@ class TheoryProcessMapping(StrictModel):
     theory_function: str
 
 
+class TheoryExecutionBinding(StrictModel):
+    """An explicit researcher-approved operational binding (spec §6.1).
+
+    Every executable declaration must name one supported kind; ``annotation``
+    is the only nonexecutable classification and is reported in the theory
+    coverage report without changing the runtime. ``precedence`` maps a
+    producer/consumer process pair; ``feedback_context`` binds a retained
+    source to a consumer's context slot (with lag and an explicit initial
+    policy); ``mechanism_binding`` verifies that one declared mechanism/
+    transition already realizes the relation, adding no second transition.
+    """
+
+    kind: Literal["precedence", "feedback_context", "mechanism_binding", "annotation"]
+    reason: str | None = None
+    producer_process: StableId | None = None
+    consumer_process: StableId | None = None
+    lag_rounds: int = 0
+    source: dict[str, Any] | None = None
+    context_slot: str | None = None
+    initial: dict[str, Any] | None = None
+    mechanism: StableId | None = None
+
+
 class TheoryRelation(StrictModel):
     """A between-object relation; ``source``/``target`` serialize as ``from``/``to``."""
 
     model_config = ConfigDict(populate_by_name=True)
 
+    id: StableId | None = None
     source: StableId = Field(alias="from")
     target: StableId = Field(alias="to")
     relation: str
+    execution: TheoryExecutionBinding | None = None
 
 
 class TheoryFeedback(StrictModel):
@@ -272,14 +297,20 @@ class TheoryFeedback(StrictModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
+    id: StableId | None = None
     source: StableId = Field(alias="from")
     target: StableId = Field(alias="to")
     relation: str
+    execution: TheoryExecutionBinding | None = None
 
 
 class TheoryDelay(StrictModel):
+    """A process delay; executable delays must name an affected binding."""
+
+    id: StableId | None = None
     process: StableId
     rounds: int = 0
+    execution: TheoryExecutionBinding | None = None
 
 
 class ActorSpec(StrictModel):
@@ -400,6 +431,7 @@ class TimeModel(StrictModel):
 class ProtocolFactor(StrictModel):
     id: StableId
     levels: list[str | int | float | bool] = Field(min_length=1)
+    branchable: bool = Field(default=False)
 
 
 class ProtocolPhase(StrictModel):
@@ -445,6 +477,47 @@ class ProtocolSpec(CanonicalArtifact):
         return self
 
 
+class OutcomeDatasetSource(StrictModel):
+    """Typed source of one named outcome dataset (spec §7.1).
+
+    ``events`` reads a nested record list from a dotted path on committed
+    events (e.g. ``state_delta.analytics``); ``artifacts`` reads retained
+    artifacts of a declared artifact type or process; ``state`` reads state
+    snapshots (``final`` or ``each_completed_round``). Cumulative snapshots
+    must not be mistaken for independent delta events.
+    """
+
+    kind: Literal["events", "artifacts", "state"]
+    path: str | None = None
+    artifact_type: StableId | None = None
+    process: StableId | None = None
+    state: StableId | None = None
+    snapshot: Literal["final", "each_completed_round"] | None = None
+
+
+class OutcomeDatasetField(StrictModel):
+    """One derived field via a fixed operation-registry step (no code execution)."""
+
+    name: str
+    op: Literal["copy", "literal", "arithmetic", "comparison", "conditional"]
+    value: Any | None = None
+    field: str | None = None
+    with_field: str | None = None
+    operator: str | None = None
+    condition: dict[str, Any] | None = None
+    else_value: Any | None = None
+
+
+class OutcomeDataset(StrictModel):
+    """A named, versioned row relation feeding one or more outcomes."""
+
+    id: StableId
+    source: OutcomeDatasetSource
+    fields: list[OutcomeDatasetField] = Field(default_factory=list)
+    deduplicate_on: list[str] = Field(default_factory=list)
+    missing: Literal["retain_null", "drop"] = "retain_null"
+
+
 class OutcomeSpec(StrictModel):
     id: StableId
     source: list[StableId] | StableId
@@ -461,6 +534,7 @@ class OutcomeSpec(StrictModel):
 
 class OutcomesSpec(CanonicalArtifact):
     outcomes: list[OutcomeSpec] = Field(default_factory=list)
+    datasets: list[OutcomeDataset] = Field(default_factory=list)
 
 
 class ModelProfile(StrictModel):

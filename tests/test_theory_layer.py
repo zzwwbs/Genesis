@@ -152,6 +152,104 @@ def test_valid_vsr_package_compiles(tmp_path: Path) -> None:
     codes = {item["code"] for item in report["warnings"]}
     assert "THEORY_FUNCTION_MISSING" not in codes
     assert "OUTPUT_SCHEMA_MISSING" not in codes
+    # THY-001: the executed build carries a versioned theory execution plan.
+    plan = json.loads((build.path / "theory_execution_plan.json").read_text())
+    assert plan["version"] == 1
+    assert isinstance(plan["annotations"], list)
+
+
+def test_precedence_binding_changes_compiled_schedule(tmp_path: Path) -> None:
+    from genesis.compiler import StudyCompiler
+
+    openness = {
+        "schema_version": "1.0",
+        "study_id": "platform-governance",
+        "processes": [
+            {
+                "id": "formulate-strategy",
+                "executor": {"mode": "deterministic"},
+                "context_policy": "public",
+                "outputs": [{"artifact_type": "strategy", "schema_ref": "strategy-schema"}],
+                "openness_rationale": "strategy form is the focal phenomenon",
+                "closure_rationale": "bounded options would constrain the process",
+            },
+            {
+                "id": "publish",
+                "executor": {"mode": "deterministic"},
+                "context_policy": "public",
+                "dependencies": {"after": []},
+            },
+        ],
+    }
+    theory = {
+        "schema_version": "1.0",
+        "study_id": "platform-governance",
+        "theory_family": "institutional",
+        "relations": [
+            {
+                "id": "strategy-before-publish",
+                "from": "strategy",
+                "to": "publication",
+                "relation": "strategy precedes publication",
+                "execution": {
+                    "kind": "precedence",
+                    "producer_process": "formulate-strategy",
+                    "consumer_process": "publish",
+                    "lag_rounds": 0,
+                },
+            }
+        ],
+    }
+    domain = {
+        "schema_version": "1.0",
+        "study_id": "platform-governance",
+        "artifacts": [{"id": "strategy", "artifact_type": "object"}],
+    }
+    source = _write_package(tmp_path, openness=openness, theory=theory, domain=domain)
+    strategies = source / "schemas"
+    strategies.mkdir(exist_ok=True)
+    (strategies / "strategy-schema.yaml").write_text(
+        "type: object\nproperties:\n  text: {type: string}\n"
+    )
+    # The openness process declares no dependency, so the theory binding
+    # (already satisfied by an empty after list vs unknown is fine) must not
+    # conflict; the plan must record the compiled edge.
+    build = StudyCompiler(source).compile(tmp_path / "precedence-build")
+    plan = json.loads((build.path / "theory_execution_plan.json").read_text())
+    edges = plan["precedence_edges"]
+    assert any(
+        edge["producer"] == "formulate-strategy"
+        and edge["consumer"] == "publish"
+        and edge["lag_rounds"] == 0
+        for edge in edges
+    )
+
+
+def test_unsupported_theory_binding_fails_compilation(tmp_path: Path) -> None:
+    theory = {
+        "schema_version": "1.0",
+        "study_id": "platform-governance",
+        "theory_family": "institutional",
+        "relations": [
+            {
+                "id": "ghost",
+                "from": "strategy",
+                "to": "publish",
+                "relation": "x",
+                "execution": {
+                    "kind": "precedence",
+                    "producer_process": "missing-process",
+                    "consumer_process": "publish",
+                    "lag_rounds": 0,
+                },
+            }
+        ],
+    }
+    source = _write_package(tmp_path, theory=theory)
+    with pytest.raises(ValidationIssue) as excinfo:
+        StudyCompiler(source).compile(tmp_path / "ghost-build")
+    codes = {issue.code for issue in excinfo.value.issues}
+    assert "THEORY_PROCESS_UNKNOWN" in codes
 
 
 def test_generative_process_without_closure_rationale_raises_openness_incomplete(

@@ -10,7 +10,8 @@ import re
 import shutil
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -36,13 +37,26 @@ from genesis.elicitation import (
 from genesis.elicitation import (
     SpecificationPatch as ElicitationSpecificationPatch,
 )
+from genesis.evidence import (
+    ExportMode,
+    evaluate_capabilities,
+    publish_bundle,
+    stage_bundle,
+    verify_bundle_manifest_and_size,
+    write_bundle_manifest,
+)
+from genesis.execution_manifest import (
+    canonical_json,
+    resolve_execution_manifest,
+    scientific_config_digest,
+)
 from genesis.extensions import ExtensionManifest, ExtensionRegistry
+from genesis.outcome_plan import compile_outcome_plan, materialize_datasets
 from genesis.persistence import ObjectRef, PersistenceCoordinator
 from genesis.providers import (
     OpenAICompatibleProvider,
     ProviderExecutor,
     ProviderRequest,
-    validate_schema,
 )
 from genesis.replay import ReplayMode
 from genesis.runtime import (
@@ -62,6 +76,7 @@ from genesis.runtime import (
     derive_seed,
     expand_protocol_conditions,
 )
+from genesis.schema_validation import PackageSchemaCatalog, SchemaDiagnostic, SchemaValidationError
 from genesis.specification.models import StrictModel
 
 _STATE_TYPES: dict[str, type] = {
@@ -178,6 +193,7 @@ _FORM_FIELDS: frozenset[str] = frozenset(
         "checkpoints",
         "replay_retention",
         "outcomes",
+        "datasets",
     }
 )
 
@@ -1061,7 +1077,10 @@ class GenesisService:
                 checkpoints=pick(protocol_block, "checkpoints", {}),
                 replay_retention=pick(protocol_block, "replay_retention", {}),
             ),
-            "outcomes": artifact(outcomes=payload.get("outcomes", [])),
+            "outcomes": artifact(
+                outcomes=payload.get("outcomes", []),
+                datasets=payload.get("datasets", []),
+            ),
             "models": artifact(models=payload.get("models", [])),
         }
 
@@ -1070,12 +1089,28 @@ class GenesisService:
         path.write_text(yaml.safe_dump(value, sort_keys=False))
 
     def _write_specification_files(self, directory: Path, payload: dict[str, Any]) -> None:
+        # Validate and serialize the entire candidate before touching live files.
+        prompts = payload.get("prompts", {})
+        if not isinstance(prompts, dict):
+            raise ValueError("PROMPTS: prompts must be an object")
+        for prompt_id, content in prompts.items():
+            self._validate_specification_id(prompt_id)
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError(f"PROMPT_CONTENT: prompt '{prompt_id}' must be non-empty text")
         schemas = payload.get("schemas", {})
         self._validate_schema_files(schemas)
+        canonical = self._canonical_specification(payload)
+        for value in canonical.values():
+            yaml.safe_dump(value, sort_keys=False)
+        for content in schemas.values():
+            json.dumps(content)
         directory.mkdir(parents=True, exist_ok=True)
-        for name, value in self._canonical_specification(payload).items():
+        for name, value in canonical.items():
             self._write_yaml(directory / f"{name}.yaml", value)
-        prompts = payload.get("prompts", {})
+        if "prompts" in payload and (directory / "prompts").exists():
+            for existing in (directory / "prompts").glob("*.txt"):
+                if existing.stem not in prompts:
+                    existing.unlink()
         if prompts:
             if not isinstance(prompts, dict):
                 raise ValueError("PROMPTS: prompts must be an object")
@@ -1098,14 +1133,55 @@ class GenesisService:
 
     @staticmethod
     def _validate_schema_files(schemas: Any) -> None:
+        """Metaschema-validate package schemas at write time (SCH-001/006).
+
+        Boolean and empty schemas are valid under the package dialect; any
+        other malformed declaration fails here with the typed schema code.
+        """
         if not isinstance(schemas, dict):
             raise ValueError("SCHEMA_INVALID: schemas must map IDs to JSON Schema objects")
         for schema_id, content in schemas.items():
             GenesisService._validate_specification_id(schema_id)
-            if not isinstance(content, dict) or not content:
-                raise ValueError(f"SCHEMA_INVALID: '{schema_id}' requires a nonempty schema object")
+            if not isinstance(content, (dict, bool)):
+                raise ValueError(f"SCHEMA_INVALID: '{schema_id}' must be a schema object")
+        try:
+            PackageSchemaCatalog(schemas)
+        except SchemaValidationError as exc:
+            raise ValueError(
+                f"SCHEMA_INVALID: {exc.code}: {exc}"
+            ) from exc
+
+    @contextmanager
+    def _package_transaction(self, specification_id: str) -> Iterator[None]:
+        """Restore files and registry rows if a package edit fails."""
+        directory = self._specification_dir(specification_id)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with self.persistence._lock, tempfile.TemporaryDirectory(
+            prefix=".package-edit-", dir=directory.parent
+        ) as temporary:
+            backup = Path(temporary) / "before"
+            if directory.exists():
+                shutil.copytree(directory, backup, symlinks=True)
+            connection = self.persistence.connection
+            connection.execute("SAVEPOINT package_edit")
+            try:
+                yield
+                connection.execute("RELEASE SAVEPOINT package_edit")
+            except Exception:
+                connection.execute("ROLLBACK TO SAVEPOINT package_edit")
+                connection.execute("RELEASE SAVEPOINT package_edit")
+                if directory.exists():
+                    directory.rename(Path(temporary) / "failed")
+                if backup.exists():
+                    backup.rename(directory)
+                raise
 
     def create_specification(self, payload: dict[str, Any]) -> dict[str, Any]:
+        specification_id = self._validate_specification_id(payload.get("id"))
+        with self._package_transaction(specification_id):
+            return self._create_specification(payload)
+
+    def _create_specification(self, payload: dict[str, Any]) -> dict[str, Any]:
         specification_id = self._validate_specification_id(payload.get("id"))
         directory = self._specification_dir(specification_id)
         if directory.exists():
@@ -1151,6 +1227,12 @@ class GenesisService:
         return [json.loads(path.read_text()) for path in sorted(root.glob("*/metadata.json"))]
 
     def update_specification(
+        self, specification_id: str, payload: dict[str, Any], expected_version: int
+    ) -> dict[str, Any]:
+        with self._package_transaction(specification_id):
+            return self._update_specification(specification_id, payload, expected_version)
+
+    def _update_specification(
         self, specification_id: str, payload: dict[str, Any], expected_version: int
     ) -> dict[str, Any]:
         current = self.get_specification(specification_id)
@@ -1581,6 +1663,7 @@ class GenesisService:
             "condition": dict(run.get("condition", {})),
         }
         protocol: dict[str, Any] = {}
+        build_manifest: dict[str, Any] = {}
         build_ref = run.get("build") or run.get("build_path")
         if build_ref:
             build_path = self.resolve_path(build_ref)
@@ -1668,14 +1751,31 @@ class GenesisService:
         matching = matching if isinstance(matching, dict) else {}
         shared_streams = matching.get("shared_streams", [])
         matched = matching.get("enabled") is True and isinstance(shared_streams, list)
+        # RPL/§2.2: a replay child derives randomness from the ROOT source identity,
+        # never from its own child run ID or from an intermediate replay in a
+        # lineage, so recorded streams and runtime draws stay stable across
+        # child IDs, replay-of-replay, imports and creation times.
+        seed_identity = self._root_source_run_id(run)
+        # The seed inputs are the root run's identity; condition/replication
+        # for replay children are inherited from the source, and a derived
+        # branch condition identity must not change the RNG derivation.
+        seed_condition_id = condition_id
+        seed_replication = replication
+        if run.get("replay_of"):
+            try:
+                root = self.get_run(seed_identity)
+                seed_condition_id = str(root.get("condition_id", condition_id))
+                seed_replication = int(root.get("replication", replication))
+            except KeyError:
+                pass
         streams: dict[str, Any] = {
             "conventional": derive_seed(
                 0,
-                str(run["id"]),
+                seed_identity,
                 "run-manifest",
                 experiment_id=str(run.get("experiment_id", "")),
-                condition_id=condition_id,
-                replication=replication,
+                condition_id=seed_condition_id,
+                replication=seed_replication,
                 matching_key=(
                     "conventional" if matched and "conventional" in shared_streams else None
                 ),
@@ -1686,14 +1786,46 @@ class GenesisService:
                 stream_id = str(stream["id"])
                 streams[stream_id] = derive_seed(
                     int(stream.get("seed", 0)),
-                    str(run["id"]),
+                    seed_identity,
                     stream_id,
                     experiment_id=str(run.get("experiment_id", "")),
-                    condition_id=condition_id,
-                    replication=replication,
+                    condition_id=seed_condition_id,
+                    replication=seed_replication,
                     matching_key=(stream_id if matched and stream_id in shared_streams else None),
                 )
         manifest["seeds"] = streams
+        # Effective execution identity (spec §2.2): one immutable manifest
+        # resolved before execution, with the package closure digest pinned at
+        # compile time and a scientific configuration digest independent of the
+        # local run ID.
+        package_closure_digest = str(build_manifest.get("package_closure_digest", ""))
+        manifest["package_closure_digest"] = package_closure_digest
+        if package_closure_digest:
+            model_configuration_digest = hashlib.sha256(
+                canonical_json(
+                    {
+                        "model_versions": manifest.get("model_versions", {}),
+                        "resolved_profiles": manifest.get("resolved_profiles", {}),
+                    }
+                ).encode()
+            ).hexdigest()
+            execution = resolve_execution_manifest(
+                condition_id=str(manifest["condition_id"]),
+                factors=manifest.get("condition", {}).get("factors", {}),
+                replication=int(manifest["replication"]),
+                build_manifest=build_manifest,
+                protocol=protocol,
+                package_closure_digest=package_closure_digest,
+                protocol_digest=str(manifest.get("protocol_hash", "")),
+                model_configuration_digest=model_configuration_digest,
+                outcome_plan_digest=str(manifest.get("outcome_plan_digest", "")),
+                origin_experiment_id=run.get("experiment_id"),
+            )
+            manifest["execution"] = execution
+            manifest["scientific_config_digest"] = scientific_config_digest(execution)
+        else:
+            # Legacy/unverified build without a pinned closure.
+            manifest["legacy_unverified"] = True
         return manifest
 
     @staticmethod
@@ -1874,6 +2006,12 @@ class GenesisService:
         """Construct the executor registry for one run (shared by run and replay)."""
         executors: dict[str, Any] = {}
         override_map = dict(overrides or {})
+        try:
+            schema_catalog_validator = PackageSchemaCatalog(schema_catalog)
+        except SchemaValidationError:
+            # Fall back to no per-process catalog binding; validate_schema still
+            # enforces the declared dialect for a standalone schema.
+            schema_catalog_validator = None
         for process in processes:
             binding = process.get("executor", {})
             if process["id"] in override_map:
@@ -1962,6 +2100,7 @@ class GenesisService:
                 **dict(profile.get("parameters", {})),
             }
             output_schema = None
+            output_schema_validator = None
             output_key = "response"
             # Outputs are properties of the compiled process, not the executor binding.
             compiled_outputs = process.get("outputs")
@@ -1972,6 +2111,16 @@ class GenesisService:
                     output_key = artifact_type
                 if isinstance(schema_ref, str) and schema_ref in schema_catalog:
                     output_schema = schema_catalog[schema_ref]
+                    if schema_catalog_validator is not None:
+                        bound_schema_id = schema_ref
+                        catalog_validator = schema_catalog_validator
+
+                        def output_schema_validator(
+                            value: Any,
+                            _validator: PackageSchemaCatalog = catalog_validator,
+                            _schema_id: str = bound_schema_id,
+                        ) -> list[SchemaDiagnostic]:
+                            return _validator.validate(_schema_id, value)
             if mode == "semantic-evaluator" and output_schema is None:
                 raise ValueError(
                     "SEMANTIC_EVALUATOR_SCHEMA: semantic-evaluator requires "
@@ -1983,6 +2132,7 @@ class GenesisService:
                 prompt_template=str(prompt_template),
                 parameters=parameters,
                 output_schema=output_schema,
+                output_schema_validator=output_schema_validator,
                 output_key=output_key,
                 mode=mode,
                 max_repairs=int(profile.get("max_repairs", 1)),
@@ -2117,6 +2267,37 @@ class GenesisService:
         registry = ExecutorRegistry(executors)
         state_store = StateStore(state_schema, initial_state) if build_ref else None
         artifact_store = ArtifactStore(artifact_catalog) if build_ref else None
+        # F3/SCH-002: schema enforcement at the common output-commit boundary.
+        # Every declared artifact output is validated against its declared
+        # schema before any state or artifact commit, regardless of executor
+        # kind (generative, rule, computational, fallback, ...).
+        output_schema_validator: Callable[[str, Any], list[str]] | None = None
+        commit_catalog = None
+        artifact_schema_ref: dict[str, str] = {}
+        if build_ref and schema_catalog:
+            try:
+                commit_catalog = PackageSchemaCatalog(schema_catalog)
+                artifact_schema_ref = {
+                    str(artifact_id): str(entry.get("schema_ref", ""))
+                    for artifact_id, entry in artifact_catalog.items()
+                    if isinstance(entry, Mapping) and entry.get("schema_ref")
+                }
+            except SchemaValidationError:
+                # An unusable schema catalog fails validation per request
+                # through the per-executor validator; leave the boundary
+                # validator unbound for such malformed builds.
+                commit_catalog = None
+        if commit_catalog is not None:
+
+            def output_schema_validator(artifact_id: str, value: Any) -> list[str]:
+                schema_ref = artifact_schema_ref.get(artifact_id)
+                if schema_ref is None or schema_ref not in schema_catalog:
+                    return []
+                assert commit_catalog is not None
+                return [
+                    f"{diagnostic.instance_pointer or 'root'}: {diagnostic.message}"
+                    for diagnostic in commit_catalog.validate(schema_ref, value)
+                ]
         controller = RunController(
             Scheduler(processes),
             registry,
@@ -2125,6 +2306,7 @@ class GenesisService:
             state_store=state_store,
             artifact_store=artifact_store,
             status_provider=_status_provider,
+            output_schema_validator=output_schema_validator,
         )
         try:
             controller.run(
@@ -2132,6 +2314,7 @@ class GenesisService:
                 experiment_id=str(run.get("experiment_id", "")),
                 condition_id=str(run.get("condition_id", "base")),
                 replication=int(run.get("replication", 1)),
+                seed_identity=self._root_source_run_id(run),
                 phase_start=int(protocol.get("time_model", {}).get("start") or 0)
                 if build_ref
                 else 0,
@@ -2345,7 +2528,44 @@ class GenesisService:
             },
         )
 
-    def replay_run(
+    def _branch_factors(
+        self,
+        protocol: Mapping[str, Any],
+        source_condition: Mapping[str, Any],
+        overrides: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve effective factors after applying only branchable overrides.
+
+        For one clean line: branchable overrides are the only changes allowed.
+        """
+        source_factors = dict(source_condition.get("factors") or {})
+        if not overrides:
+            return source_factors
+        declared: dict[str, Mapping[str, Any]] = {}
+        for factor in protocol.get("factors", []):
+            if isinstance(factor, Mapping):
+                declared[str(factor.get("id", ""))] = factor
+        for key, value in overrides.items():
+            factor = declared.get(str(key))
+            if factor is None:
+                raise ValueError(
+                    f"REPLAY_CONFIGURATION_INVALID: override '{key}' is not a "
+                    "declared protocol factor"
+                )
+            if not factor.get("branchable"):
+                raise ValueError(
+                    f"REPLAY_CONFIGURATION_INVALID: factor '{key}' is not declared branchable"
+                )
+            levels = factor.get("levels")
+            if isinstance(levels, list) and value not in levels:
+                raise ValueError(
+                    f"REPLAY_CONFIGURATION_INVALID: value '{value}' is not a declared level "
+                    f"of branchable factor '{key}'"
+                )
+            source_factors[str(key)] = value
+        return source_factors
+
+    def replay_preview(
         self,
         run_id: str,
         *,
@@ -2355,19 +2575,106 @@ class GenesisService:
         overrides: dict[str, Any] | None = None,
         justification: str | None = None,
     ) -> dict[str, Any]:
-        """Execute a replay as a new run (Section 12.3, REP-003).
+        """Read-only replay preview (spec §5.4): no provider calls, no child run.
 
-        FULL re-executes every executor. ARTIFACT substitutes recorded outputs
-        for the source run's generative processes, invoking no provider.
-        PARTIAL/BRANCH freeze the process IDs listed in ``boundary`` and
-        re-execute the rest; BRANCH additionally requires a justification.
+        Returns the normalized boundary, inherited manifest facts, the applied
+        factor diff for branch, evidence requirements, warnings, and a
+        digest-bound execution token the execution operation must confirm.
         """
-        import uuid
-
         source = self.get_run(run_id)
         build_ref = source.get("build") or source.get("build_path")
         if not build_ref:
             raise ValueError("REPLAY_SOURCE_MISSING: source run has no compiled build")
+        self._validate_replay_request(mode, artifact_ids, boundary, justification)
+        build_path = self.resolve_path(build_ref)
+        StudyCompiler.verify_build(build_path)
+        protocol = json.loads((build_path / "protocol.json").read_text())
+        processes = json.loads((build_path / "processes.json").read_text())
+        process_ids = {str(process["id"]) for process in processes}
+        dependency_map = {
+            str(process["id"]): list(process.get("dependencies", {}).get("after", []))
+            for process in processes
+        }
+        if mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH} and boundary and boundary.startswith(
+            "event:"
+        ):
+            target_event = boundary.split(":", 1)[1]
+            if not any(
+                str(event.get("event_id", "")) == target_event for event in self.trace_run(run_id)
+            ):
+                raise ValueError(f"REPLAY_BOUNDARY: unknown source event '{target_event}'")
+        normalized_boundary, phase_boundary, event_boundary, frozen_processes = (
+            self._normalize_boundary(mode, boundary, process_ids, dependency_map)
+        )
+        source_condition = {
+            "id": str(source.get("condition_id", "base")),
+            "factors": dict((source.get("condition") or {}).get("factors", {})),
+        }
+        effective_factors = self._branch_factors(protocol, source_condition, overrides or {})
+        effective_condition = dict(source_condition)
+        derived = False
+        if mode == ReplayMode.BRANCH:
+            source_factor_map = dict(source_condition.get("factors") or {})
+            diff = {
+                key: value
+                for key, value in effective_factors.items()
+                if source_factor_map.get(key) != value
+            }
+            if not diff:
+                raise ValueError(
+                    "REPLAY_NO_EFFECTIVE_CHANGE: branch overrides produce no effective "
+                    "factor change; use partial replay instead"
+                )
+            derived = True
+            effective_condition = {
+                "id": f"derived-{source_condition['id']}-branch",
+                "factors": dict(effective_factors),
+            }
+        token_input = {
+            "source_run_id": run_id,
+            "mode": mode.value,
+            "boundary": normalized_boundary,
+            "overrides": dict(overrides or {}),
+            "justification": justification or "",
+            "effective_condition": effective_condition,
+            "replication": int(source.get("replication", 1)),
+        }
+        import hashlib as _hashlib
+        import json as _json
+
+        preview_token = _hashlib.sha256(
+            _json.dumps(token_input, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        warnings = []
+        if derived:
+            warnings.append("branch suffix regenerates with the source RNG stream identity")
+        if event_boundary is not None:
+            warnings.append("event boundary freezes every invocation committed before the event")
+        return {
+            "source_run_id": run_id,
+            "mode": mode.value,
+            "boundary": normalized_boundary,
+            "inherited_condition": source_condition,
+            "effective_condition": effective_condition,
+            "effective_factors": dict(effective_factors),
+            "inherited_replication": int(source.get("replication", 1)),
+            "evidence_requirements": {
+                "recorded_outputs": bool(self._recorded_process_outputs(run_id, artifact_ids)),
+                "checkpoint_available": bool(
+                    phase_boundary is not None and phase_boundary >= 0
+                ),
+            },
+            "warnings": warnings,
+            "preview_token": preview_token,
+        }
+
+    @staticmethod
+    def _validate_replay_request(
+        mode: ReplayMode,
+        artifact_ids: tuple[str, ...],
+        boundary: str | None,
+        justification: str | None,
+    ) -> None:
         if mode == ReplayMode.PARTIAL and not boundary:
             raise ValueError("partial replay requires a boundary")
         if mode == ReplayMode.BRANCH:
@@ -2381,42 +2688,258 @@ class GenesisService:
             raise ValueError(
                 f"artifact_ids are only accepted for artifact replay, not {mode.value}"
             )
-        build_path = self.resolve_path(build_ref)
-        StudyCompiler.verify_build(build_path)
-        processes = json.loads((build_path / "processes.json").read_text())
-        generative_ids = {
-            str(process["id"])
-            for process in processes
-            if process.get("executor", {}).get("mode") == "generative"
-        }
-        recorded = self._recorded_process_outputs(run_id, artifact_ids)
+
+    @staticmethod
+    def _normalize_boundary(
+        mode: ReplayMode,
+        boundary: str | None,
+        process_ids: set[str],
+        dependency_map: Mapping[str, list[str]] | None = None,
+    ) -> tuple[str | None, int | None, str | None, set[str]]:
+        """Parse a boundary into a normalized description and its parts.
+
+        First release accepts only ``phase:N`` and ``event:ID`` boundaries
+        plus a dependency-closed comma-separated process selection; any other
+        form fails as unsupported (spec §5.3). A negative phase boundary or a
+        selection with an unsatisfied dependency is rejected rather than
+        silently treated as a valid checkpoint.
+        """
         phase_boundary: int | None = None
         event_boundary: str | None = None
+        frozen_processes: set[str] = set()
         if mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH} and boundary:
             if boundary.startswith("phase:"):
                 try:
                     phase_boundary = int(boundary.split(":", 1)[1])
                 except ValueError as exc:
                     raise ValueError("REPLAY_BOUNDARY: phase boundary must be an integer") from exc
+                if phase_boundary < 0:
+                    raise ValueError(
+                        "REPLAY_BOUNDARY_UNSUPPORTED: phase boundary must be non-negative"
+                    )
             elif boundary.startswith("event:"):
                 event_boundary = boundary.split(":", 1)[1]
             else:
-                frozen_processes = {name.strip() for name in boundary.split(",") if name.strip()}
+                names = {name.strip() for name in boundary.split(",") if name.strip()}
+                unknown = names - process_ids
+                if unknown:
+                    raise ValueError(
+                        "REPLAY_BOUNDARY_UNSUPPORTED: unknown process selection: "
+                        + ", ".join(sorted(unknown))
+                    )
+                # F9: a process selection is only a valid prefix boundary when
+                # it is dependency-closed — every dependency of a frozen
+                # process must also be frozen.
+                for process_id, deps in (dependency_map or {}).items():
+                    if process_id not in names:
+                        continue
+                    missing_deps = [dep for dep in deps if dep not in names]
+                    if missing_deps:
+                        raise ValueError(
+                            "REPLAY_BOUNDARY_UNSUPPORTED: process selection '"
+                            + process_id
+                            + "' freezes a process whose dependencies are not frozen: "
+                            + ", ".join(sorted(missing_deps))
+                        )
+                frozen_processes = names
         else:
             frozen_processes = set()
+        return boundary, phase_boundary, event_boundary, frozen_processes
+
+    def _root_source_run_id(self, run: Mapping[str, Any]) -> str:
+        """The original source run id for a replay lineage (F8/§2.2 fix).
+
+        Randomness must derive from the root source identity, never from an
+        intermediate replay child or a derived branch identity.
+        """
+        source_id = str(run.get("replay_of") or run.get("id", ""))
+        try:
+            source = self.get_run(source_id)
+            while source.get("replay_of"):
+                source = self.get_run(str(source["replay_of"]))
+            return str(source["id"])
+        except KeyError:
+            return source_id
+
+    @staticmethod
+    def _generative_process_ids(build_ref: str | Path) -> set[str]:
+        build_path = Path(build_ref) if isinstance(build_ref, Path) else Path(str(build_ref))
+        processes = json.loads((build_path / "processes.json").read_text())
+        return {
+            str(process["id"])
+            for process in processes
+            if process.get("executor", {}).get("mode") == "generative"
+        }
+
+    def replay_run(
+        self,
+        run_id: str,
+        *,
+        mode: ReplayMode = ReplayMode.FULL,
+        artifact_ids: tuple[str, ...] = (),
+        boundary: str | None = None,
+        overrides: dict[str, Any] | None = None,
+        justification: str | None = None,
+        preview_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute a replay (Section 12.3, REP-003) under spec §5.1 semantics.
+
+        FULL reuses the recorded invocations for the complete trajectory and
+        fails if any required record is unavailable; it rejects overrides.
+        ARTIFACT retrieves the selected retained artifacts only: no child run
+        is created and no provider is invoked, so it is never described as a
+        new simulation. PARTIAL/BRANCH freeze the recorded prefix at
+        ``boundary`` and re-execute the suffix; BRANCH additionally requires a
+        justification and a digest-bound preview confirmation. PARTIAL and
+        BRANCH inherit the source condition, factors and replication, and only
+        declared branchable protocol factors may change in BRANCH (RPL-001..004).
+        """
+        source = self.get_run(run_id)
+        if mode == ReplayMode.FULL and overrides:
+            raise ValueError(
+                "REPLAY_CONFIGURATION_INVALID: full replay reuses the recorded "
+                "trajectory and does not accept overrides"
+            )
+        build_ref = source.get("build") or source.get("build_path")
+        if not build_ref:
+            raise ValueError("REPLAY_SOURCE_MISSING: source run has no compiled build")
         if mode == ReplayMode.ARTIFACT:
-            frozen_processes = set(recorded) & generative_ids
+            # Spec §5.1: artifact replay is retrieval of retained artifacts,
+            # not a new simulation. No child run, no provider, no preview.
+            retained = []
+            if artifact_ids:
+                retained = [
+                    artifact
+                    for artifact in self.artifacts_for_run(run_id)
+                    if artifact.get("artifact_id") in artifact_ids
+                ]
+            else:
+                recorded = self._recorded_process_outputs(run_id, ())
+                generative_ids = self._generative_process_ids(build_ref)
+                retained_processes = sorted(set(recorded) & generative_ids)
+                if not retained_processes:
+                    raise ValueError(
+                        "REPLAY_EVIDENCE_INCOMPLETE: artifact replay has no retained "
+                        "generative outputs to retrieve"
+                    )
+                retained = [
+                    artifact
+                    for artifact in self.artifacts_for_run(run_id)
+                    if isinstance(artifact.get("payload"), dict)
+                    and artifact["payload"].get("process_id") in retained_processes
+                ]
+            return {
+                "run_id": run_id,
+                "source_run_id": run_id,
+                "mode": mode.value,
+                "artifacts": retained,
+                "overrides": {},
+                "lineage": {
+                    "source_run_id": run_id,
+                    "mode": mode.value,
+                    "retrieval": True,
+                },
+            }
+        self._validate_replay_request(mode, artifact_ids, boundary, justification)
+        build_path = self.resolve_path(build_ref)
+        StudyCompiler.verify_build(build_path)
+        processes = json.loads((build_path / "processes.json").read_text())
+        process_ids = {str(process["id"]) for process in processes}
+        dependency_map = {
+            str(process["id"]): list(process.get("dependencies", {}).get("after", []))
+            for process in processes
+        }
+        normalized_boundary, phase_boundary, event_boundary, frozen_processes = (
+            self._normalize_boundary(mode, boundary, process_ids, dependency_map)
+        )
+        source_condition = {
+            "id": str(source.get("condition_id", "base")),
+            "factors": dict((source.get("condition") or {}).get("factors", {})),
+        }
+        protocol = json.loads((build_path / "protocol.json").read_text())
+        effective_factors = self._branch_factors(protocol, source_condition, overrides or {})
+        effective_condition = dict(source_condition)
+        if mode == ReplayMode.BRANCH:
+            source_factor_map = dict(source_condition.get("factors") or {})
+            diff = {
+                key: value
+                for key, value in effective_factors.items()
+                if source_factor_map.get(key) != value
+            }
+            if not diff:
+                raise ValueError(
+                    "REPLAY_NO_EFFECTIVE_CHANGE: branch overrides produce no effective "
+                    "factor change; use partial replay instead"
+                )
+            effective_condition = {
+                "id": f"derived-{source_condition['id']}-branch",
+                "factors": dict(effective_factors),
+            }
+            if not preview_token:
+                raise ValueError(
+                    "REPLAY_PREVIEW_STALE: branch replay requires a confirmed preview "
+                    "token from replay_preview"
+                )
+        if mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH} and not preview_token:
+            raise ValueError(
+                "REPLAY_PREVIEW_STALE: partial/branch replay requires the confirmed "
+                "preview token from replay_preview"
+            )
+        if preview_token is not None:
+            expected = self.replay_preview(
+                run_id,
+                mode=mode,
+                artifact_ids=artifact_ids,
+                boundary=normalized_boundary,
+                overrides=overrides,
+                justification=justification,
+            )["preview_token"]
+            if preview_token != expected:
+                raise ValueError(
+                    "REPLAY_PREVIEW_STALE: preview token does not match the requested "
+                    "configuration; re-run replay_preview and confirm"
+                )
+        inherited_replication = int(source.get("replication", 1))
+        generative_ids = {
+            str(process["id"])
+            for process in processes
+            if process.get("executor", {}).get("mode") == "generative"
+        }
+        recorded = self._recorded_process_outputs(run_id, artifact_ids)
         frozen_keys = self._frozen_invocation_keys(
             run_id, recorded, phase_boundary=phase_boundary, event_boundary=event_boundary
         )
         executor_overrides: dict[str, Any] = {}
+        if mode == ReplayMode.FULL:
+            # Spec §5.1: FULL reuses recorded invocations for the complete
+            # trajectory and fails if required records are unavailable.
+            missing = sorted(generative_ids - set(recorded))
+            if missing:
+                raise ValueError(
+                    "REPLAY_EVIDENCE_INCOMPLETE: full replay requires recorded "
+                    "invocations for: " + ", ".join(missing)
+                )
+            for process_id in sorted(generative_ids):
+                executor_overrides[process_id] = _RecordedExecutor(
+                    recorded[process_id]
+                    if isinstance(recorded[process_id], list)
+                    else [
+                        {
+                            "outputs": recorded[process_id],
+                            "phase": 0,
+                            "attempt": 1,
+                            "actors": (),
+                            "order": 0,
+                        }
+                    ],
+                    source_run_id=run_id,
+                    process_id=process_id,
+                )
         for process in processes:
             process_id = str(process["id"])
             if mode == ReplayMode.FULL:
                 continue
             if process_id not in recorded:
-                continue
-            if mode == ReplayMode.ARTIFACT and process_id not in frozen_processes:
                 continue
             if mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH}:
                 if phase_boundary is not None or event_boundary is not None:
@@ -2459,19 +2982,70 @@ class GenesisService:
                     process_id=process_id,
                 )
             )
-        replay_run_id = f"{run_id}-replay-{uuid.uuid4().hex[:8]}"
-        self.create_run(
-            {
-                "id": replay_run_id,
-                "study_id": source.get("study_id"),
-                "build": build_ref,
-                "replay_of": run_id,
-                "replay_mode": mode.value,
-                "replay_boundary": boundary,
-                "replay_justification": justification,
-                "replay_overrides": dict(overrides or {}),
-            }
-        )
+        # RPL-T06: the child id is derived from the confirmed configuration, so a
+        # duplicate confirmed submission returns the same child instead of a
+        # fresh realization (idempotent retries).
+        import hashlib as _replay_hash
+        import json as _replay_json
+
+        child_key = _replay_hash.sha256(
+            _replay_json.dumps(
+                {
+                    "source_run_id": run_id,
+                    "mode": mode.value,
+                    "boundary": boundary,
+                    "overrides": dict(overrides or {}),
+                    "justification": justification or "",
+                    "effective_condition": dict(effective_condition),
+                    "replication": inherited_replication,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:12]
+        replay_run_id = f"{run_id}-replay-{child_key}"
+        try:
+            self.create_run(
+                {
+                    "id": replay_run_id,
+                    "study_id": source.get("study_id"),
+                    "build": build_ref,
+                    "replay_of": run_id,
+                    "replay_mode": mode.value,
+                    "replay_boundary": boundary,
+                    "replay_justification": justification,
+                    "replay_overrides": {
+                        "requested": dict(overrides or {}),
+                        "applied": dict(effective_factors),
+                    },
+                    # Effective-configuration inheritance (RPL-001): the branch keeps
+                    # the source condition/factors/replication unless a branchable
+                    # factor override produced a derived condition.
+                    "condition_id": effective_condition["id"],
+                    "condition": dict(effective_condition),
+                    "replication": inherited_replication,
+                }
+            )
+        except Exception as exc:
+            if "ALREADY_EXISTS" in str(exc):
+                # Duplicate confirmed request: return the existing child run.
+                existing = self.get_run(replay_run_id)
+                return {
+                    "run_id": replay_run_id,
+                    "source_run_id": run_id,
+                    "mode": mode.value,
+                    "artifacts": self.artifacts_for_run(replay_run_id),
+                    "overrides": dict(overrides or {}),
+                    "lineage": {
+                        "source_run_id": run_id,
+                        "mode": mode.value,
+                        "boundary": boundary,
+                        "justification": justification,
+                        "effective_condition": dict(existing.get("condition", {})),
+                        "replication": int(existing.get("replication", 1)),
+                    },
+                }
+            raise
         self.execute_run(replay_run_id, executor_overrides=executor_overrides)
         return {
             "run_id": replay_run_id,
@@ -2484,6 +3058,8 @@ class GenesisService:
                 "mode": mode.value,
                 "boundary": boundary,
                 "justification": justification,
+                "effective_condition": dict(effective_condition),
+                "replication": inherited_replication,
             },
         }
 
@@ -2551,6 +3127,8 @@ class GenesisService:
 
     def evaluate_outcomes(self, run_id: str) -> list[dict[str, Any]]:
         run = self.get_run(run_id)
+        if "imported_outcomes" in run:
+            return cast(list[dict[str, Any]], run["imported_outcomes"])
         build_ref = run.get("build") or run.get("build_path")
         if not build_ref:
             # Imported runs may carry only the build identity (build_hash), not
@@ -2570,8 +3148,12 @@ class GenesisService:
         if not build_ref:
             return []
         build_path = self.resolve_path(build_ref)
-        definitions = json.loads((build_path / "outcome_plan.json").read_text())
+        outcome_plan = compile_outcome_plan(build_path)
+        definitions = outcome_plan["outcomes"]
         schema_catalog = self._build_schema_catalog(build_path)
+        outcome_catalog = (
+            PackageSchemaCatalog(schema_catalog) if schema_catalog else None
+        )
         event_rows = []
         for event in self.trace_run(run_id):
             row = dict(event)
@@ -2623,54 +3205,23 @@ class GenesisService:
             row = dict(snapshot)
             row["state_version"] = version
             state_rows.append(row)
-        # Derived rows: the outcome plan aggregates flat fields (clicked, exposed,
-        # article_count, detected, ...). Executed evidence for those fields lives in
-        # state deltas (analytics), publication effects (titles), and measurement
-        # artifacts (detection). Synthesize flat rows so the plan's semantics match
-        # the driver-side aggregation over the same sources.
-        derived_rows: list[dict[str, Any]] = []
-        seen_analytic: set[tuple[Any, Any]] = set()
-        seen_articles: set[str] = set()
-        for event in event_rows:
-            delta = event.get("state_delta") or {}
-            if not isinstance(delta, dict):
-                continue
-            for record in delta.get("analytics") or []:
-                if not isinstance(record, dict):
-                    continue
-                key = (record.get("user"), record.get("phase"))
-                if key in seen_analytic:
-                    continue
-                seen_analytic.add(key)
-                flat = dict(event)
-                flat.update(record)
-                flat["kind"] = "analytics"
-                flat["time"] = event.get("phase", 0)
-                derived_rows.append(flat)
-            for record in delta.get("titles") or []:
-                if isinstance(record, dict) and record.get("article_id"):
-                    if record["article_id"] in seen_articles:
-                        continue
-                    seen_articles.add(record["article_id"])
-                    flat = dict(event)
-                    flat["article_count"] = 1
-                    flat["kind"] = "publication"
-                    derived_rows.append(flat)
-        seen_detections: set[str] = set()
-        for row in artifact_rows:
-            if row.get("process_id") != "evaluate-clickbait":
-                continue
-            artifact_id = str(row.get("artifact_id") or "")
-            if artifact_id in seen_detections:
-                continue
-            seen_detections.add(artifact_id)
-            value = row.get("value") or {}
-            if isinstance(value, dict) and "detected" in value:
-                flat = dict(row)
-                flat["detected"] = 1 if value.get("detected") else 0
-                flat["kind"] = "measurement"
-                derived_rows.append(flat)
-        event_rows = derived_rows + event_rows
+        # OUT-005: generic outcome derivation. When the outcome plan declares
+        # datasets, rows are materialized ONCE by the fixed operation registry
+        # and exposed under the dataset ids; raw event rows are never enlarged
+        # by derived rows, so an outcome counting events counts exactly the
+        # raw evidence (F4 fix: no double-counting). The legacy flat-row
+        # synthesis remains for packages that predate the datasets contract.
+        raw_event_rows = event_rows
+        dataset_rows: dict[str, list[dict[str, Any]]] = {}
+        if outcome_plan.get("datasets"):
+            dataset_rows = materialize_datasets(
+                outcome_plan,
+                {
+                    "events": raw_event_rows,
+                    "artifacts": artifacts,
+                    "state": state_rows,
+                },
+            )
         lineage_rows = [
             {
                 "event_id": event.get("event_id"),
@@ -2679,8 +3230,9 @@ class GenesisService:
                 "phase": event.get("phase", 0),
                 "parent_events": event.get("parent_events", []),
             }
-            for event in event_rows
+            for event in raw_event_rows
         ]
+        event_rows = raw_event_rows
         sources: dict[str, list[dict[str, Any]]] = {
             "events": event_rows,
             "artifacts": artifact_rows,
@@ -2688,6 +3240,13 @@ class GenesisService:
             "lineage": lineage_rows,
             **artifact_sources,
         }
+        if outcome_plan.get("datasets"):
+            sources.update(dataset_rows)
+        elif self._legacy_derived_rows(event_rows, artifact_rows):
+            # Legacy flat-row packages aggregate over a synthesized event
+            # view; keep that behaviour only for pre-dataset packages.
+            event_rows = self._legacy_derived_rows(event_rows, artifact_rows) + event_rows
+            sources["events"] = event_rows
         results: list[dict[str, Any]] = []
         for definition in definitions:
             join = definition.get("join")
@@ -2755,8 +3314,13 @@ class GenesisService:
                 self.last_outcome_engine = "python"
             output_schema_ref = definition.get("output_schema")
             if isinstance(output_schema_ref, str) and output_schema_ref in schema_catalog:
+                assert outcome_catalog is not None
                 for row in evaluated:
-                    errors = validate_schema(schema_catalog[output_schema_ref], row)
+                    diagnostics = outcome_catalog.validate(output_schema_ref, row)
+                    errors = [
+                        f"{diagnostic.instance_pointer or 'root'}: {diagnostic.message}"
+                        for diagnostic in diagnostics
+                    ]
                     if errors:
                         raise ValueError(
                             "OUTPUT_SCHEMA_VIOLATION: outcome "
@@ -2766,6 +3330,59 @@ class GenesisService:
             for row in evaluated:
                 results.append({"outcome_id": plan.id, **row})
         return results
+
+    @staticmethod
+    def _legacy_derived_rows(
+        event_rows: list[dict[str, Any]], artifact_rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Legacy flat-row synthesis for packages predating declared datasets.
+
+        Retained for backward compatibility only: new packages use the generic
+        dataset engine, and the core must not special-case study identifiers.
+        """
+        derived_rows: list[dict[str, Any]] = []
+        seen_analytic: set[tuple[Any, Any]] = set()
+        seen_articles: set[str] = set()
+        for event in event_rows:
+            delta = event.get("state_delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            for record in delta.get("analytics") or []:
+                if not isinstance(record, dict):
+                    continue
+                key = (record.get("user"), record.get("phase"))
+                if key in seen_analytic:
+                    continue
+                seen_analytic.add(key)
+                flat = dict(event)
+                flat.update(record)
+                flat["kind"] = "analytics"
+                flat["time"] = event.get("phase", 0)
+                derived_rows.append(flat)
+            for record in delta.get("titles") or []:
+                if isinstance(record, dict) and record.get("article_id"):
+                    if record["article_id"] in seen_articles:
+                        continue
+                    seen_articles.add(record["article_id"])
+                    flat = dict(event)
+                    flat["article_count"] = 1
+                    flat["kind"] = "publication"
+                    derived_rows.append(flat)
+        seen_detections: set[str] = set()
+        for row in artifact_rows:
+            if row.get("process_id") != "evaluate-clickbait":
+                continue
+            artifact_id = str(row.get("artifact_id") or "")
+            if artifact_id in seen_detections:
+                continue
+            seen_detections.add(artifact_id)
+            value = row.get("value") or {}
+            if isinstance(value, dict) and "detected" in value:
+                flat = dict(row)
+                flat["detected"] = 1 if value.get("detected") else 0
+                flat["kind"] = "measurement"
+                derived_rows.append(flat)
+        return derived_rows
 
     @staticmethod
     def _retention_purges_raw(processes: list[Mapping[str, Any]]) -> bool:
@@ -2782,7 +3399,7 @@ class GenesisService:
         if isinstance(value, dict):
             redacted: dict[str, Any] = {}
             for key, item in value.items():
-                if key == "response":
+                if key in {"response", "raw_response", "parsed_response"}:
                     redacted[key] = "<purged-by-retention>"
                 else:
                     redacted[key] = GenesisService._redact_raw_responses(item)
@@ -4017,25 +4634,87 @@ class GenesisService:
             },
         }
 
-    def export_run(self, run_id: str, output: str | Path) -> list[Path]:
-        destination = self.resolve_path(output)
-        destination.mkdir(parents=True, exist_ok=True)
+    def export_run(
+        self,
+        run_id: str,
+        output: str | Path,
+        *,
+        mode: str = ExportMode.EXPLORATION,
+    ) -> list[Path]:
+        """Export run evidence as a capability-labelled bundle (EVD-001/002).
+
+        ``exploration`` (default) exports retained evidence and stored outcome
+        snapshots. ``reproducibility`` requires the run-pinned package closure,
+        build and execution manifest, and fails with a completeness report if
+        any required input is absent; it never silently downgrades to explore.
+        Package files come exclusively from the run-pinned closure, not the
+        editable package. The bundle is written to a fresh staging directory,
+        verify the manifest, then atomically published, refusing to overwrite
+        an existing destination (spec §4.3).
+        """
+        destination = self.resolve_path(output).resolve()
+        if destination.exists():
+            raise ValueError(
+                f"EXPORT_DESTINATION: refuses to overwrite existing destination {destination}"
+            )
+        staging = stage_bundle(destination)
+        try:
+            paths = self._write_bundle(run_id, staging, mode=mode)
+            publish_bundle(staging, destination)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        # F14 fix: the staging directory was atomically renamed to the final
+        # destination; remap the returned paths so they point at real files.
+        return [
+            destination / path.relative_to(staging)
+            for path in paths
+            if path.is_relative_to(staging)
+        ]
+
+    def _write_bundle(
+        self, run_id: str, destination: Path, *, mode: str
+    ) -> list[Path]:
+        """Write all bundle members for one run into a prepared directory."""
+        run = self.get_run(run_id)
         outcomes = self.evaluate_outcomes(run_id)
-        paths = AnalysisExporter().export_bundle(
+        result_paths = AnalysisExporter().export_bundle(
             outcomes,
             destination,
             methods={"run_id": run_id, "engine": "genesis-local"},
             replay_lineage={"source_run_id": run_id},
         )
-        run = self.get_run(run_id)
+        output_paths = list(result_paths)
         extras: dict[str, str] = {
             "run_manifest.json": json.dumps(run.get("manifest") or {}, indent=2, sort_keys=True)
         }
         build_ref = run.get("build") or run.get("build_path")
         processes: list[Mapping[str, Any]] = []
+        package_closure_digest = ""
+        build_digest = ""
+        has_closure = False
+        has_build = False
         if build_ref:
             build_path = self.resolve_path(build_ref)
+            has_build = True
             processes = json.loads((build_path / "processes.json").read_text())
+            if mode == ExportMode.REPRODUCIBILITY:
+                # F6: a reproducibility bundle must carry the verified
+                # execution prerequisites, not just metadata. Capabilities
+                # that claim reexecution/replay are only true when these
+                # files are actually present in the bundle.
+                for name in (
+                    "processes.json",
+                    "process_graph.json",
+                    "context_policies.json",
+                    "state_model.json",
+                    "artifact_catalog.json",
+                    "outcome_plan.json",
+                    "theory_execution_plan.json",
+                ):
+                    source_file = build_path / name
+                    if source_file.is_file():
+                        extras[name] = source_file.read_text()
             for name in (
                 "build_manifest.json",
                 "validation_report.json",
@@ -4045,17 +4724,38 @@ class GenesisService:
                 source_file = build_path / name
                 if source_file.is_file():
                     extras[name] = source_file.read_text()
+            build_manifest = json.loads((build_path / "build_manifest.json").read_text())
+            build_digest = str(build_manifest.get("build_hash", ""))
+            package_closure_digest = str(build_manifest.get("package_closure_digest", ""))
+            # Run-pinned package closure (EVD-002): copy original bytes from the
+            # build's immutable closure directory, never from the editable package.
+            closure_path = build_path / "package_closure.json"
+            closure_dir = build_path / "closure"
+            if closure_path.is_file() and closure_dir.is_dir():
+                has_closure = True
+                extras["package_closure.json"] = closure_path.read_text()
+                closure_manifest = json.loads(closure_path.read_text())
+                for asset in closure_manifest["assets"]:
+                    relative = Path(str(asset["path"]))
+                    source_asset = closure_dir / relative
+                    if not source_asset.is_file():
+                        raise ValueError(
+                            f"EXPORT_CLOSURE: run-pinned closure asset missing: {relative}"
+                        )
+                    target = destination / "package" / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source_asset, target)
             event_rows = self.trace_run(run_id)
             artifact_rows = self.artifacts_for_run(run_id)
             if self._retention_purges_raw(processes):
                 event_rows = GenesisService._redact_raw_responses(event_rows)
                 artifact_rows = GenesisService._redact_raw_responses(artifact_rows)
             extras["events.json"] = json.dumps(event_rows, indent=2, default=str)
-            AnalysisExporter.rows_to_parquet(
+            output_paths.append(AnalysisExporter.rows_to_parquet(
                 _parquet_safe(event_rows), destination / "events.parquet"
-            )
+            ))
             extras["artifacts.json"] = json.dumps(artifact_rows, indent=2, default=str)
-            AnalysisExporter.rows_to_parquet(
+            output_paths.append(AnalysisExporter.rows_to_parquet(
                 _parquet_safe(
                     [
                         {key: value for key, value in row.items() if key != "payload"}
@@ -4063,38 +4763,106 @@ class GenesisService:
                     ]
                 ),
                 destination / "artifacts.parquet",
-            )
+            ))
             # NOTE: raw cumulative state snapshots are intentionally NOT exported
             # as JSON (hundreds of MB); the compact parquet projection is kept.
-            # Exploration (trace, artifacts, outcomes) reads events and artifacts.
             state_history = self.persistence.list_state_history(run_id)
             state_rows_for_export = [
                 {**snapshot, "state_version": version} for version, snapshot in state_history
             ]
-            AnalysisExporter.rows_to_parquet(
+            output_paths.append(AnalysisExporter.rows_to_parquet(
                 _parquet_safe(state_rows_for_export), destination / "states.parquet"
+            ))
+        else:
+            # Exploration imports have retained traces but no executable build.
+            extras["events.json"] = json.dumps(self.trace_run(run_id), indent=2, default=str)
+            extras["artifacts.json"] = json.dumps(
+                self.artifacts_for_run(run_id), indent=2, default=str
             )
-            spec_dir = self.workspace / ".genesis/specifications" / str(run.get("study_id", ""))
-            if (spec_dir / "metadata.json").is_file():
-                for yaml_file in sorted(spec_dir.glob("*.yaml")):
-                    extras[f"package/{yaml_file.name}"] = yaml_file.read_text()
+        # Reproducibility requires the full pinned inputs (EVD-T04); never
+        # silently downgrade a requested full export.
+        if mode == ExportMode.REPRODUCIBILITY:
+            missing = []
+            if not has_build:
+                missing.append("build")
+            if not has_closure:
+                missing.append("package_closure")
+            run_manifest = run.get("manifest") or {}
+            if not (run_manifest.get("execution") or {}).get("package_digest"):
+                missing.append("execution_manifest")
+            if missing:
+                raise ValueError(
+                    "REPRODUCIBILITY_EXPORT_INCOMPLETE: missing required inputs: "
+                    + ", ".join(missing)
+                    + "; choose exploration export instead"
+                )
         for name, content in extras.items():
             target = destination / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
+            output_paths.append(target)
+        # Legacy integrity manifest preserved for backward-compatible importers.
         files = [
             path
             for path in destination.rglob("*")
-            if path.is_file() and path.name != "integrity.json"
+            if path.is_file() and path.name not in {"integrity.json", "bundle_manifest.json"}
         ]
         integrity = {
             path.relative_to(destination).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in files
         }
-        (destination / "integrity.json").write_text(
-            json.dumps(integrity, indent=2, sort_keys=True) + "\n"
+        integrity_path = destination / "integrity.json"
+        integrity_path.write_text(json.dumps(integrity, indent=2, sort_keys=True) + "\n")
+        output_paths.append(integrity_path)
+        # Machine-readable capability evaluation + bundle manifest (EVD-001).
+        manifest = run.get("manifest") or {}
+        execution = manifest.get("execution") or {}
+        scientific_digest = str(manifest.get("scientific_config_digest", ""))
+        # F6: capabilities must reflect what this *bundle actually contains*.
+        # Executable build files are only bundled in reproducibility mode;
+        # recorded-output availability depends on retained artifacts, not on
+        # whether processes were declared.
+        has_executable_build = bool(
+            extras.get("processes.json")
+            and extras.get("context_policies.json")
+            and extras.get("state_model.json")
+            and extras.get("artifact_catalog.json")
         )
-        return [*paths, *(destination / name for name in extras), destination / "integrity.json"]
+        retained_records = bool(
+            self._recorded_process_outputs(run_id, ())
+            if build_ref
+            else False
+        )
+        capabilities = evaluate_capabilities(
+            has_build=has_executable_build,
+            has_closure=has_closure,
+            has_recorded_outputs=retained_records,
+            has_checkpoint_evidence=False,
+            has_outcomes=bool(outcomes),
+        )
+        source_run_id = str(manifest.get("run_id", run_id))
+        bundle_manifest_path = write_bundle_manifest(
+            destination,
+            export_mode=mode,
+            run_id=run_id,
+            source_run_id=source_run_id,
+            local_import_id=None if run_id == source_run_id else run_id,
+            package_digest=str(execution.get("package_digest", package_closure_digest)),
+            build_digest=str(execution.get("build_digest", build_digest)),
+            scientific_config_digest=scientific_digest,
+            capabilities=capabilities,
+            omissions=[
+                "raw cumulative state snapshots",
+                "provider response bodies when retention purges them",
+            ],
+            retention_policy=(
+                "purge_raw_responses"
+                if self._retention_purges_raw(processes)
+                else "retain_raw_responses"
+            ),
+        )
+        output_paths.append(bundle_manifest_path)
+        return output_paths
 
     def list_builds(self) -> list[dict[str, Any]]:
         recorded = self.persistence.list_study_builds()
@@ -4341,6 +5109,26 @@ class GenesisService:
         *,
         size_limit_bytes: int = 2 * 1024 * 1024 * 1024,
     ) -> dict[str, Any]:
+        # All registry rows commit together; a rejected bundle leaves no run.
+        with self.persistence._lock:
+            connection = self.persistence.connection
+            connection.execute("SAVEPOINT import_run")
+            try:
+                result = self._import_run(source, run_id, size_limit_bytes=size_limit_bytes)
+                connection.execute("RELEASE SAVEPOINT import_run")
+                return result
+            except Exception:
+                connection.execute("ROLLBACK TO SAVEPOINT import_run")
+                connection.execute("RELEASE SAVEPOINT import_run")
+                raise
+
+    def _import_run(
+        self,
+        source: str | Path,
+        run_id: str | None = None,
+        *,
+        size_limit_bytes: int = 2 * 1024 * 1024 * 1024,
+    ) -> dict[str, Any]:
         """Import an exported run bundle (see export_run) for exploration.
 
         Restores the run row, events, and artifacts from the bundle's
@@ -4358,8 +5146,13 @@ class GenesisService:
         for required in ("run_manifest.json", "events.json", "artifacts.json"):
             if not (source_path / required).is_file():
                 raise ValueError(f"IMPORT_RUN: bundle missing {required}")
+        # EVD preflight: verify the bundle manifest member digests and reject
+        # unsafe/duplicate normalized paths before publishing anything.
+        bundle_manifest = verify_bundle_manifest_and_size(
+            source_path, size_limit_bytes=size_limit_bytes
+        )
         integrity_path = source_path / "integrity.json"
-        if integrity_path.is_file():
+        if integrity_path.is_file() and bundle_manifest is None:
             try:
                 manifest = json.loads(integrity_path.read_text())
             except json.JSONDecodeError as exc:
@@ -4388,10 +5181,25 @@ class GenesisService:
             pass
         events = json.loads((source_path / "events.json").read_text())
         artifacts = json.loads((source_path / "artifacts.json").read_text())
+        outcomes_path = source_path / "outcomes.json"
+        outcomes = json.loads(outcomes_path.read_text()) if outcomes_path.exists() else []
+        if not isinstance(outcomes, list) or any(not isinstance(row, dict) for row in outcomes):
+            raise ValueError("IMPORT_RUN: outcomes must be a list of records")
+        # EVD-003: preserve the original run identity separately from the local
+        # import identity; imported outcomes are visibly labelled as snapshots.
+        origin = {}
+        if bundle_manifest is not None:
+            source_run_id = str(bundle_manifest.get("source_run_id", ""))
+            if source_run_id:
+                origin["source_run_id"] = source_run_id
+        imported_manifest = dict(run_manifest)
+        imported_manifest.setdefault("origin", {}).update(origin)
+        imported_manifest["imported_outcomes"] = "snapshot"
         run_payload = {
             "id": target_id,
-            "manifest": run_manifest,
-            "build": run_manifest.get("build") or run_manifest.get("build_path") or "",
+            "manifest": imported_manifest,
+            "build": "",
+            "imported_outcomes": outcomes,
             "study_id": run_manifest.get("study_id", ""),
             "status": str(run_manifest.get("status", "completed")),
         }
@@ -4408,12 +5216,12 @@ class GenesisService:
             raise ValueError(f"ALREADY_EXISTS: run '{target_id}' already imported") from exc
         object_root = self.workspace / ".genesis" / "objects"
 
-        def _store(payload_json: str) -> str:
+        def _store(payload_json: str, media_type: str = "application/json") -> str:
             digest = hashlib.sha256(payload_json.encode()).hexdigest()
             (object_root / digest[:2]).mkdir(parents=True, exist_ok=True)
             (object_root / digest[:2] / digest[2:]).write_bytes(payload_json.encode())
             self.persistence._record_object(
-                ObjectRef(digest=digest, media_type="application/json", size=len(payload_json))
+                ObjectRef(digest=digest, media_type=media_type, size=len(payload_json.encode()))
             )
             return digest
 
@@ -4453,8 +5261,8 @@ class GenesisService:
                 ),
             )
         for artifact in artifacts:
-            payload_json = json.dumps(artifact, sort_keys=True, default=str)
-            digest = _store(payload_json)
+            payload_json = json.dumps(artifact["payload"], sort_keys=True, default=str)
+            digest = _store(payload_json, str(artifact.get("media_type", "application/json")))
             self.persistence.connection.execute(
                 """INSERT INTO artifacts(artifact_id, run_id, payload_ref)
                    VALUES (?, ?, ?)""",
@@ -4572,7 +5380,9 @@ class GenesisService:
             "schemas": GenesisService._read_schema_files(source_path),
         }
         return {
-            key: value for key, value in form.items() if key == "schemas" or value not in ({}, [])
+            key: value
+            for key, value in form.items()
+            if key in {"schemas", "prompts"} or value not in ({}, [])
         }
 
     @staticmethod

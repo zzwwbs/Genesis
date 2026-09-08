@@ -96,6 +96,17 @@ def test_run_bundle_roundtrip_import_for_exploration(tmp_path: Path) -> None:
             assert all(e.get("event_id") for e in events)
             artifacts = importer.artifacts_for_run("imported-xrun")
             assert isinstance(artifacts, list)
+            assert artifacts == service.artifacts_for_run("xrun")
+            assert importer.evaluate_outcomes("imported-xrun") == service.evaluate_outcomes("xrun")
+            importer.export_run("imported-xrun", "exports/again")
+            import json
+
+            again = other / "exports/again"
+            assert json.loads((again / "events.json").read_text()) == events
+            assert json.loads((again / "artifacts.json").read_text()) == artifacts
+            assert json.loads((again / "outcomes.json").read_text()) == service.evaluate_outcomes(
+                "xrun"
+            )
             client = TestClient(create_app(other))
             assert client.get("/runs/imported-xrun/events").status_code == 200
             assert client.get("/runs/imported-xrun/outcomes").status_code == 200
@@ -148,6 +159,10 @@ def test_import_row_is_isolated_from_source_workspace(tmp_path: Path) -> None:
         except ValueError as exc:
             assert "ALREADY_EXISTS" in str(exc)
         # the source run stays intact
+        import pytest
+
+        with pytest.raises(KeyError):
+            service.get_run("xrun-imported")
         assert service.trace_run("xrun")
     finally:
         service.close()
