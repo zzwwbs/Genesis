@@ -560,9 +560,7 @@ class StudyCompiler:
         for process in openness.processes:
             dependencies = process.dependencies
             after = (
-                dependencies.get("after", [])
-                if isinstance(dependencies, dict)
-                else dependencies
+                dependencies.get("after", []) if isinstance(dependencies, dict) else dependencies
             )
             if isinstance(after, list):
                 existing_dependencies[str(process.id)] = [str(dep) for dep in after]
@@ -599,8 +597,7 @@ class StudyCompiler:
                     {
                         "code": issue.code,
                         "severity": "error",
-                        "path": f"/theory/{issue.declaration_type}/"
-                        f"{issue.declaration_id or ''}",
+                        "path": f"/theory/{issue.declaration_type}/{issue.declaration_id or ''}",
                         "message": issue.message,
                     }
                 )
@@ -726,9 +723,7 @@ class StudyCompiler:
                 a.model_dump(mode="json") for a in loaded["domain"].artifacts
             ],
             "outcome_plan.json": {
-                "datasets": [
-                    d.model_dump(mode="json") for d in loaded["outcomes"].datasets
-                ],
+                "datasets": [d.model_dump(mode="json") for d in loaded["outcomes"].datasets],
                 "outcomes": [o.model_dump(mode="json") for o in loaded["outcomes"].outcomes],
             },
             "protocol.json": loaded["protocol"].model_dump(mode="json"),
@@ -847,8 +842,7 @@ class StudyCompiler:
                 closure_unknown = [
                     name
                     for name in unknown
-                    if str(name).startswith("closure/")
-                    or str(name).startswith("data/")
+                    if str(name).startswith("closure/") or str(name).startswith("data/")
                 ]
                 if len(closure_unknown) != len(unknown):
                     raise ValueError("BUILD_INTEGRITY: unexpected expected-file set")

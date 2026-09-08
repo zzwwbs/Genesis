@@ -132,8 +132,7 @@ def _non_finite_numbers(value: Any, segments: tuple[int | str, ...] = ()) -> lis
                 schema_pointer="",
                 keyword="non-finite",
                 message=(
-                    f"non-finite number at {_json_pointer(segments) or 'root'} "
-                    "is not valid JSON"
+                    f"non-finite number at {_json_pointer(segments) or 'root'} is not valid JSON"
                 ),
             )
         )

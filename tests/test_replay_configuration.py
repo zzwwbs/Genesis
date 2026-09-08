@@ -19,9 +19,7 @@ from genesis.service import GenesisService
 PAYLOAD = {
     "id": "replay-config-study",
     "title": "replay config study",
-    "models": [
-        {"id": "mp", "provider": "openai-compatible", "model": "m1", "parameters": {}}
-    ],
+    "models": [{"id": "mp", "provider": "openai-compatible", "model": "m1", "parameters": {}}],
     "processes": [
         {
             "id": "compose",
@@ -255,9 +253,7 @@ def test_partial_and_branch_require_preview_confirmation(tmp_path, monkeypatch) 
         service.close()
 
 
-def test_replay_child_excluded_from_primary_experiment_aggregation(
-    tmp_path, monkeypatch
-) -> None:
+def test_replay_child_excluded_from_primary_experiment_aggregation(tmp_path, monkeypatch) -> None:
     """RPL-001: replay children do not enter primary experiment aggregates."""
     service = _source_run(tmp_path, monkeypatch)
     try:
@@ -339,6 +335,7 @@ def test_duplicate_confirmed_request_creates_one_child(tmp_path, monkeypatch) ->
     finally:
         service.close()
 
+
 # ---------------------------------------------------------------------------
 # F8 (effect): replay-of-replay and replay-of-source share the root seed
 # ---------------------------------------------------------------------------
@@ -351,13 +348,21 @@ def test_replay_of_replay_inherits_root_source_seed(tmp_path, monkeypatch) -> No
     try:
         source_seed = service.get_run("source-strict-3")["manifest"]["seeds"]["conventional"]
         p1 = service.replay_preview("source-strict-3", mode=ReplayMode.PARTIAL, boundary="phase:1")
-        r1 = service.replay_run("source-strict-3", mode=ReplayMode.PARTIAL,
-                                boundary="phase:1", preview_token=p1["preview_token"])
+        r1 = service.replay_run(
+            "source-strict-3",
+            mode=ReplayMode.PARTIAL,
+            boundary="phase:1",
+            preview_token=p1["preview_token"],
+        )
         r1_seed = service.get_run(r1["run_id"])["manifest"]["seeds"]["conventional"]
         assert r1_seed == source_seed
         p2 = service.replay_preview(r1["run_id"], mode=ReplayMode.PARTIAL, boundary="phase:1")
-        r2 = service.replay_run(r1["run_id"], mode=ReplayMode.PARTIAL,
-                                boundary="phase:1", preview_token=p2["preview_token"])
+        r2 = service.replay_run(
+            r1["run_id"],
+            mode=ReplayMode.PARTIAL,
+            boundary="phase:1",
+            preview_token=p2["preview_token"],
+        )
         r2_seed = service.get_run(r2["run_id"])["manifest"]["seeds"]["conventional"]
         assert r2_seed == source_seed, "replay-of-replay must keep the root seed"
     finally:

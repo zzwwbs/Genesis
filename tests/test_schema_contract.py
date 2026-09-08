@@ -395,6 +395,7 @@ def test_invalid_output_through_execution_does_not_mutate_state(
     finally:
         service.close()
 
+
 # ---------------------------------------------------------------------------
 # F11 (effect): depth limits measure true nesting, not sibling count
 # ---------------------------------------------------------------------------
@@ -428,12 +429,14 @@ def test_boolean_schema_compiles_into_build(tmp_path: Path) -> None:
         "study": {"schema_version": "1.0", "study_id": "bool-schema", "title": "x"},
         "openness": {"schema_version": "1.0", "study_id": "bool-schema", "processes": []},
         "theory": {
-            "schema_version": "1.0", "study_id": "bool-schema",
+            "schema_version": "1.0",
+            "study_id": "bool-schema",
             "theory_family": "institutional",
         },
         "domain": {"schema_version": "1.0", "study_id": "bool-schema"},
         "protocol": {
-            "schema_version": "1.0", "study_id": "bool-schema",
+            "schema_version": "1.0",
+            "study_id": "bool-schema",
             "time_model": {"type": "rounds"},
         },
         "outcomes": {"schema_version": "1.0", "study_id": "bool-schema", "outcomes": []},

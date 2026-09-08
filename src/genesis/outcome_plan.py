@@ -70,9 +70,7 @@ def _apply_fields(row: dict[str, Any], fields: list[Mapping[str, Any]]) -> dict[
             handler = ARITHMETIC_OPS.get(str(step.get("operator", "add")))
             if handler is None:
                 operator = step.get("operator")
-                raise ValueError(
-                    f"OUTCOME_PLAN: unknown arithmetic operator '{operator}'"
-                )
+                raise ValueError(f"OUTCOME_PLAN: unknown arithmetic operator '{operator}'")
             row[name] = handler(left, right)
         elif op == "comparison":
             left = _resolve_path(row, str(step.get("field") or ""))
@@ -82,9 +80,7 @@ def _apply_fields(row: dict[str, Any], fields: list[Mapping[str, Any]]) -> dict[
             handler = COMPARISON_OPS.get(str(step.get("operator", "eq")))
             if handler is None:
                 operator = step.get("operator")
-                raise ValueError(
-                    f"OUTCOME_PLAN: unknown comparison operator '{operator}'"
-                )
+                raise ValueError(f"OUTCOME_PLAN: unknown comparison operator '{operator}'")
             row[name] = bool(handler(left, right))
         elif op == "conditional":
             condition = step.get("condition") or {}
@@ -137,16 +133,11 @@ def materialize_datasets(
                     else None
                 )
                 declared_id = (
-                    str(payload.get("declared_artifact_id", ""))
-                    if payload is not None
-                    else ""
+                    str(payload.get("declared_artifact_id", "")) if payload is not None else ""
                 )
                 if artifact_type and declared_id != artifact_type:
                     continue
-                if process and (
-                    payload is None
-                    or str(payload.get("process_id", "")) != process
-                ):
+                if process and (payload is None or str(payload.get("process_id", "")) != process):
                     continue
                 row = {key: value for key, value in artifact.items() if key != "payload"}
                 if payload is not None:
@@ -159,6 +150,7 @@ def materialize_datasets(
         elif kind == "state":
             snapshot = str(source.get("snapshot", "final"))
             state_rows = list(sources.get("state", []))
+
             # The service supplies state history as dict-shaped snapshots
             # (with a state_version key); tolerate legacy (version, snapshot)
             # tuple entries as well. Unpacking a dict as a tuple is a

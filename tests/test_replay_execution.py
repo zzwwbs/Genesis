@@ -160,9 +160,7 @@ def test_full_replay_rejects_overrides(tmp_path: Path, monkeypatch) -> None:
     service = _source_run(tmp_path, monkeypatch)
     try:
         with pytest.raises(ValueError, match="REPLAY_CONFIGURATION_INVALID"):
-            service.replay_run(
-                "source-1", mode=ReplayMode.FULL, overrides={"policy": "lenient"}
-            )
+            service.replay_run("source-1", mode=ReplayMode.FULL, overrides={"policy": "lenient"})
     finally:
         service.close()
 

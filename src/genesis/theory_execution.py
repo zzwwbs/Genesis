@@ -72,8 +72,12 @@ class TheoryExecutionPlan:
             ],
             "resolved": dict(self.resolved),
             "issues": [
-                {"code": issue.code, "declaration_type": issue.declaration_type,
-                 "declaration_id": issue.declaration_id, "message": issue.message}
+                {
+                    "code": issue.code,
+                    "declaration_type": issue.declaration_type,
+                    "declaration_id": issue.declaration_id,
+                    "message": issue.message,
+                }
                 for issue in self.issues
             ],
         }
@@ -138,9 +142,7 @@ def compile_theory_execution(
             )
     for index, delay in enumerate(theory.get("delays", []) or []):
         if isinstance(delay, Mapping):
-            declarations.append(
-                ("delay", _declaration_id("delay", index, delay.get("id")), delay)
-            )
+            declarations.append(("delay", _declaration_id("delay", index, delay.get("id")), delay))
 
     for decl_type, decl_id, declaration in declarations:
         binding = declaration.get("execution")
@@ -241,8 +243,7 @@ def compile_theory_execution(
                 (decl_id, source_id, str(consumer), str(context_slot), int(lag), dict(initial))
             )
             plan.resolved[decl_id] = (
-                f"feedback_context {source_id} -> {consumer} slot "
-                f"{context_slot} (lag {lag})"
+                f"feedback_context {source_id} -> {consumer} slot {context_slot} (lag {lag})"
             )
             continue
         if kind == "mechanism_binding":
@@ -261,9 +262,7 @@ def compile_theory_execution(
                 continue
             if process is not None and not require_process(decl_type, decl_id, str(process)):
                 continue
-            plan.mechanism_bindings.append(
-                (decl_id, mechanism_id, str(process) if process else "")
-            )
+            plan.mechanism_bindings.append((decl_id, mechanism_id, str(process) if process else ""))
             plan.resolved[decl_id] = (
                 f"mechanism_binding verified -> '{mechanism_id}' (no new transition)"
             )

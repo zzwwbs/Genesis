@@ -307,6 +307,7 @@ def test_plan_is_versioned_and_serializable() -> None:
     assert serialized["feedback_bindings"][0]["lag_rounds"] == 1
     assert serialized["feedback_bindings"][0]["initial"]["policy"] == "skip_consumer"
 
+
 # ---------------------------------------------------------------------------
 # F2 (effect level): theory precedence must control actual scheduling order
 # ---------------------------------------------------------------------------
@@ -367,11 +368,15 @@ def test_theory_precedence_edge_controls_runtime_schedule(
             ],
         },
         "domain": {
-            "schema_version": "1.0", "study_id": "sched",
+            "schema_version": "1.0",
+            "study_id": "sched",
             "artifacts": [{"id": "result", "artifact_type": "object"}],
         },
-        "protocol": {"schema_version": "1.0", "study_id": "sched",
-                     "time_model": {"type": "rounds", "end": 1}},
+        "protocol": {
+            "schema_version": "1.0",
+            "study_id": "sched",
+            "time_model": {"type": "rounds", "end": 1},
+        },
         "outcomes": {"schema_version": "1.0", "study_id": "sched", "outcomes": []},
         "models": {"schema_version": "1.0", "study_id": "sched", "models": []},
     }

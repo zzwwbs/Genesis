@@ -22,9 +22,7 @@ from genesis.service import GenesisService
 PAYLOAD = {
     "id": "conformance-study",
     "title": "conformance study",
-    "models": [
-        {"id": "mp", "provider": "openai-compatible", "model": "m1", "parameters": {}}
-    ],
+    "models": [{"id": "mp", "provider": "openai-compatible", "model": "m1", "parameters": {}}],
     "processes": [
         {
             "id": "compose",
@@ -141,17 +139,18 @@ def test_approved_package_run_branch_export_import_identity_chain(
         )
         # G5: the build carries the fixed-dialect schema contract and the
         # theory execution plan.
-        build_plan = json.loads(
-            (Path(compiled["path"]) / "theory_execution_plan.json").read_text()
-        )
+        build_plan = json.loads((Path(compiled["path"]) / "theory_execution_plan.json").read_text())
         assert build_plan["version"] == 1
 
         # G2: execute two conditions under the compiled build.
         template = {**PAYLOAD, "id": "conformance-study"}
         _ = template
         service.create_run(
-            {"id": "conformance-experiment", "study_id": "conformance-study",
-             "build": compiled["path"]}
+            {
+                "id": "conformance-experiment",
+                "study_id": "conformance-study",
+                "build": compiled["path"],
+            }
         )
         result = service.execute_protocol("conformance-experiment")
         assert result["status"] == "completed"
@@ -192,9 +191,7 @@ def test_approved_package_run_branch_export_import_identity_chain(
         assert branch_record["condition"]["factors"]["policy"] == "lenient"
 
         # G4: export the run-pinned package and import into an empty workspace.
-        service.export_run(
-            trial_ids[0], "exports/conformance", mode=ExportMode.REPRODUCIBILITY
-        )
+        service.export_run(trial_ids[0], "exports/conformance", mode=ExportMode.REPRODUCIBILITY)
         bundle = tmp_path / "workspace" / "exports" / "conformance"
         other = tmp_path / "other-workspace"
         (other / "imports").mkdir(parents=True)
@@ -209,9 +206,7 @@ def test_approved_package_run_branch_export_import_identity_chain(
             closure = json.loads(
                 (other / "imports" / "bundle" / "package_closure.json").read_text()
             )
-            assert any(
-                asset["path"] == "schemas/compose-out.yaml" for asset in closure["assets"]
-            )
+            assert any(asset["path"] == "schemas/compose-out.yaml" for asset in closure["assets"])
             # Capabilities label the bundle without over-claiming replay.
             manifest = json.loads(
                 (other / "imports" / "bundle" / "bundle_manifest.json").read_text()
@@ -279,9 +274,7 @@ def test_schema_invalid_fake_response_fails_run_without_state_mutation(
             max_repairs=0,
         )
         with pytest.raises(Exception, match="process measure failed"):
-            service.execute_run(
-                "invalid-run", executor_overrides={"measure": executor}
-            )
+            service.execute_run("invalid-run", executor_overrides={"measure": executor})
         history = service.persistence.list_state_history("invalid-run")
         states = [snapshot for _version, snapshot in history]
         assert len(states) == 1
@@ -318,8 +311,6 @@ def test_incomplete_evidence_bundle_cannot_claim_reproducibility(
         service.approve_specification("no-closure-study", draft["version"], "researcher")
         service.create_run({"id": "no-closure-run", "study_id": "no-closure-study", "build": ""})
         with pytest.raises(ValueError, match="REPRODUCIBILITY"):
-            service.export_run(
-                "no-closure-run", "exports/full", mode=ExportMode.REPRODUCIBILITY
-            )
+            service.export_run("no-closure-run", "exports/full", mode=ExportMode.REPRODUCIBILITY)
     finally:
         service.close()

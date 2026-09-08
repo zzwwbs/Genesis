@@ -84,16 +84,12 @@ class PackageClosure:
 
     @property
     def assets(self) -> dict[str, dict[str, Any]]:
-        return {
-            str(asset["path"]): asset for asset in self.manifest.get("assets", [])
-        }
+        return {str(asset["path"]): asset for asset in self.manifest.get("assets", [])}
 
 
 def canonical_json(value: Any) -> str:
     """Deterministic UTF-8 JSON with sorted keys and compact separators."""
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def build_package_closure(source: str | Path) -> PackageClosure:
@@ -215,11 +211,7 @@ def resolve_execution_manifest(
     execution-affecting parameter. Returns the dict form stored in a run
     manifest so callers treat one authoritative serialization as the source.
     """
-    build_digest = str(
-        build_manifest.get("build_hash")
-        or build_manifest.get("build_digest")
-        or ""
-    )
+    build_digest = str(build_manifest.get("build_hash") or build_manifest.get("build_digest") or "")
     if not package_closure_digest:
         raise ValueError("EXECUTION_MANIFEST: package closure digest is required")
     if not protocol_digest:

@@ -124,16 +124,16 @@ def test_export_pins_run_package_after_live_edit(tmp_path: Path) -> None:
     try:
         spec_dir = workspace / ".genesis" / "specifications" / "evidence-study"
         (spec_dir / "study.yaml").write_text("schema_version: '1.0'\nstudy_id: DIFFERENT\n")
-        (spec_dir / "schemas" / "compose-out.yaml").write_text(
-            "type: string\n"
-        )
+        (spec_dir / "schemas" / "compose-out.yaml").write_text("type: string\n")
         service.export_run("evidence-run", "exports/pinned", mode=ExportMode.REPRODUCIBILITY)
         bundle = workspace / "exports" / "pinned"
         closure = json.loads((bundle / "package_closure.json").read_text())
         by_path = {asset["path"]: asset for asset in closure["assets"]}
         assert by_path["schemas/compose-out.yaml"]["media_type"] == "text/yaml"
-        assert (bundle / "package" / "schemas" / "compose-out.yaml").read_text().startswith(
-            "type: object"
+        assert (
+            (bundle / "package" / "schemas" / "compose-out.yaml")
+            .read_text()
+            .startswith("type: object")
         ), "export must use the executed package bytes, not the edited live schema"
         # bundle manifest pins digest + capabilities
         manifest = json.loads((bundle / "bundle_manifest.json").read_text())
@@ -171,9 +171,7 @@ def test_reproducibility_export_requires_pinned_closure(tmp_path: Path) -> None:
         service.approve_specification("no-build-study", draft["version"], "researcher")
         service.create_run({"id": "no-build-run", "study_id": "no-build-study", "build": ""})
         with pytest.raises(ValueError, match="REPRODUCIBILITY"):
-            service.export_run(
-                "no-build-run", "exports/full", mode=ExportMode.REPRODUCIBILITY
-            )
+            service.export_run("no-build-run", "exports/full", mode=ExportMode.REPRODUCIBILITY)
         # Exploration works without a reproducibility claim.
         service.export_run("no-build-run", "exports/explore", mode=ExportMode.EXPLORATION)
         manifest = json.loads(
@@ -232,9 +230,7 @@ def test_exploration_import_preserves_snapshot_and_origin(tmp_path: Path) -> Non
         shutil.copytree(workspace / "exports" / "origin", other / "imports" / "bundle")
         importer = GenesisService(other)
         try:
-            result = importer.import_run(
-                other / "imports" / "bundle", run_id="imported-evidence"
-            )
+            result = importer.import_run(other / "imports" / "bundle", run_id="imported-evidence")
             assert result["status"] == "imported"
             # Re-export labels the snapshot and keeps the origin identity.
             importer.export_run("imported-evidence", "exports/again", mode=ExportMode.EXPLORATION)
@@ -281,6 +277,7 @@ def test_capability_evaluation_reexecute_requires_build_and_closure() -> None:
     assert by_id["replay_recorded"]["available"] is True
     assert by_id["branch_at_checkpoint"]["available"] is False
 
+
 # ---------------------------------------------------------------------------
 # F1: evidence import integrity and size enforcement
 # ---------------------------------------------------------------------------
@@ -296,17 +293,19 @@ def test_import_rejects_incomplete_member_coverage(tmp_path: Path) -> None:
     (bundle / "events.json").write_text("[]")
     # members lists only one of the two real files -> incomplete coverage.
     (bundle / "bundle_manifest.json").write_text(
-        json.dumps({
-            "bundle_version": 1,
-            "export_mode": "exploration",
-            "members": [
-                {
-                    "path": "run_manifest.json",
-                    "digest": hashlib.sha256(b'{"run_id": "r"}').hexdigest(),
-                    "size": 15,
-                }
-            ],
-        })
+        json.dumps(
+            {
+                "bundle_version": 1,
+                "export_mode": "exploration",
+                "members": [
+                    {
+                        "path": "run_manifest.json",
+                        "digest": hashlib.sha256(b'{"run_id": "r"}').hexdigest(),
+                        "size": 15,
+                    }
+                ],
+            }
+        )
     )
     with pytest.raises(ValueError, match="incomplete member coverage"):
         verify_bundle_manifest(bundle)
@@ -320,17 +319,19 @@ def test_import_verifies_actual_member_size(tmp_path: Path) -> None:
     bundle.mkdir()
     (bundle / "events.json").write_text("[1,2,3]")
     (bundle / "bundle_manifest.json").write_text(
-        json.dumps({
-            "bundle_version": 1,
-            "export_mode": "exploration",
-            "members": [
-                {
-                    "path": "events.json",
-                    "digest": hashlib.sha256(b"[1,2,3]").hexdigest(),
-                    "size": 999,  # declared size does not match the real file
-                }
-            ],
-        })
+        json.dumps(
+            {
+                "bundle_version": 1,
+                "export_mode": "exploration",
+                "members": [
+                    {
+                        "path": "events.json",
+                        "digest": hashlib.sha256(b"[1,2,3]").hexdigest(),
+                        "size": 999,  # declared size does not match the real file
+                    }
+                ],
+            }
+        )
     )
     with pytest.raises(ValueError, match="size differs"):
         verify_bundle_manifest(bundle)
@@ -345,17 +346,19 @@ def test_import_rejects_absolute_member_path(tmp_path: Path) -> None:
     outside = tmp_path / "outside.txt"
     outside.write_text("data")
     (bundle / "bundle_manifest.json").write_text(
-        json.dumps({
-            "bundle_version": 1,
-            "export_mode": "exploration",
-            "members": [
-                {
-                    "path": str(outside),
-                    "digest": hashlib.sha256(b"data").hexdigest(),
-                    "size": 4,
-                }
-            ],
-        })
+        json.dumps(
+            {
+                "bundle_version": 1,
+                "export_mode": "exploration",
+                "members": [
+                    {
+                        "path": str(outside),
+                        "digest": hashlib.sha256(b"data").hexdigest(),
+                        "size": 4,
+                    }
+                ],
+            }
+        )
     )
     with pytest.raises(ValueError, match="unsafe member path"):
         verify_bundle_manifest(bundle)
@@ -395,8 +398,13 @@ def test_reproducibility_bundle_includes_executable_build_files(tmp_path: Path) 
     try:
         service.export_run("evidence-run", "exports/full", mode=ExportMode.REPRODUCIBILITY)
         bundle = workspace / "exports" / "full"
-        for name in ("processes.json", "context_policies.json", "state_model.json",
-                     "artifact_catalog.json", "outcome_plan.json"):
+        for name in (
+            "processes.json",
+            "context_policies.json",
+            "state_model.json",
+            "artifact_catalog.json",
+            "outcome_plan.json",
+        ):
             assert (bundle / name).is_file(), f"missing executable build file {name}"
         manifest = json.loads((bundle / "bundle_manifest.json").read_text())
         caps = {cap["capability"]: cap for cap in manifest["capabilities"]}
@@ -411,8 +419,11 @@ def test_exploration_bundle_without_build_does_not_claim_reexecute(tmp_path: Pat
     from genesis.evidence import evaluate_capabilities
 
     caps = evaluate_capabilities(
-        has_build=False, has_closure=False, has_recorded_outputs=False,
-        has_checkpoint_evidence=False, has_outcomes=True,
+        has_build=False,
+        has_closure=False,
+        has_recorded_outputs=False,
+        has_checkpoint_evidence=False,
+        has_outcomes=True,
     )
     by_id = {cap["capability"]: cap for cap in caps}
     assert by_id["reexecute"]["available"] is False

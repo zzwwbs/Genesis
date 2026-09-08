@@ -53,9 +53,7 @@ def _write_package(root: Path, study_id: str = "closure-study") -> dict[str, str
         "schema_version: '1.0'\nstudy_id: '" + study_id + "'\nmodels: []\n"
     )
     (spec / "processes.yaml").write_text(
-        "schema_version: '1.0'\nstudy_id: '"
-        + study_id
-        + "'\nprocesses:\n  - id: tick\n"
+        "schema_version: '1.0'\nstudy_id: '" + study_id + "'\nprocesses:\n  - id: tick\n"
         "    executor: {mode: deterministic}\n    context_policy: public\n"
     )
     (spec / "metadata.json").write_text(json.dumps({"version": 1, "study_id": study_id}))
@@ -111,9 +109,10 @@ def test_package_closure_pins_nested_assets() -> None:
         # Digests are sha256 of the original bytes, recorded per member.
         import hashlib
 
-        assert by_path["data/population.csv"]["digest"] == hashlib.sha256(
-            b"id,value\n1,42\n"
-        ).hexdigest()
+        assert (
+            by_path["data/population.csv"]["digest"]
+            == hashlib.sha256(b"id,value\n1,42\n").hexdigest()
+        )
 
 
 def test_closure_digest_is_stable_across_relocation(tmp_path: Path) -> None:
@@ -181,12 +180,7 @@ def test_run_identity_pins_nested_package_assets(tmp_path: Path) -> None:
             }
         )
         schema_dir = (
-            tmp_path
-            / "workspace"
-            / ".genesis"
-            / "specifications"
-            / "closure-approve"
-            / "schemas"
+            tmp_path / "workspace" / ".genesis" / "specifications" / "closure-approve" / "schemas"
         )
         schema_dir.mkdir(parents=True, exist_ok=True)
         (schema_dir / "nested-schema.yaml").write_text(
@@ -210,9 +204,10 @@ def test_run_identity_pins_nested_package_assets(tmp_path: Path) -> None:
         service.update_specification(
             "closure-approve", {"description": "edited later"}, current["version"]
         )
-        assert service.get_run("closure-run")["manifest"]["package_closure_digest"] == manifest[
-            "package_closure_digest"
-        ]
+        assert (
+            service.get_run("closure-run")["manifest"]["package_closure_digest"]
+            == manifest["package_closure_digest"]
+        )
     finally:
         service.close()
 

@@ -100,13 +100,27 @@ def test_derived_field_operation_registry() -> None:
                 "id": "enriched",
                 "source": {"kind": "events", "path": "state_delta.analytics"},
                 "fields": [
-                    {"name": "double", "op": "arithmetic", "field": "exposed",
-                     "operator": "multiply", "value": 2},
-                    {"name": "is_high", "op": "comparison", "field": "exposed",
-                     "operator": "gt", "value": 2},
-                    {"name": "label", "op": "conditional",
-                     "condition": {"field": "is_high", "value": True},
-                     "value": "high", "else_value": "low"},
+                    {
+                        "name": "double",
+                        "op": "arithmetic",
+                        "field": "exposed",
+                        "operator": "multiply",
+                        "value": 2,
+                    },
+                    {
+                        "name": "is_high",
+                        "op": "comparison",
+                        "field": "exposed",
+                        "operator": "gt",
+                        "value": 2,
+                    },
+                    {
+                        "name": "label",
+                        "op": "conditional",
+                        "condition": {"field": "is_high", "value": True},
+                        "value": "high",
+                        "else_value": "low",
+                    },
                 ],
             }
         ]
@@ -127,8 +141,13 @@ def test_divide_by_zero_yields_explicit_missing() -> None:
                 "id": "ratio",
                 "source": {"kind": "events"},
                 "fields": [
-                    {"name": "ratio", "op": "arithmetic", "field": "phase",
-                     "operator": "divide", "value": 0},
+                    {
+                        "name": "ratio",
+                        "op": "arithmetic",
+                        "field": "phase",
+                        "operator": "divide",
+                        "value": 0,
+                    },
                 ],
             }
         ]
@@ -257,6 +276,7 @@ def test_service_evaluates_outcomes_over_declared_datasets(tmp_path: Path) -> No
     finally:
         service.close()
 
+
 # ---------------------------------------------------------------------------
 # F4 (effect): events counted exactly once, no derived-row double counting
 # ---------------------------------------------------------------------------
@@ -268,28 +288,47 @@ def test_outcome_counts_raw_events_exactly_once(tmp_path: Path) -> None:
 
     service = GenesisService(tmp_path / "workspace")
     try:
-        draft = service.create_specification({
-            "id": "count-once", "title": "co",
-            "processes": [{"id": "measure", "executor": {"mode": "deterministic"},
-                           "context_policy": "public",
-                           "outputs": [{"artifact_type": "out", "schema_ref": "out"}]}],
-            "theory": {"theory_family": "exploratory"},
-            "domain": {"artifacts": [{"id": "out", "artifact_type": "out"}],
-                       "states": [{"id": "counter", "value_type": "integer", "initial": 0}]},
-            "protocol": {"time_model": {"type": "rounds", "end": 1}},
-            "outcomes": [{"id": "phase-count", "source": "events", "grouping": [],
-                          "aggregation": {"type": "count", "field": "phase"},
-                          "output_schema": "outcome-schema"}],
-            "datasets": [{"id": "outs", "source": {"kind": "artifacts", "artifact_type": "out"}}],
-            "models": [],
-        })
+        draft = service.create_specification(
+            {
+                "id": "count-once",
+                "title": "co",
+                "processes": [
+                    {
+                        "id": "measure",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "public",
+                        "outputs": [{"artifact_type": "out", "schema_ref": "out"}],
+                    }
+                ],
+                "theory": {"theory_family": "exploratory"},
+                "domain": {
+                    "artifacts": [{"id": "out", "artifact_type": "out"}],
+                    "states": [{"id": "counter", "value_type": "integer", "initial": 0}],
+                },
+                "protocol": {"time_model": {"type": "rounds", "end": 1}},
+                "outcomes": [
+                    {
+                        "id": "phase-count",
+                        "source": "events",
+                        "grouping": [],
+                        "aggregation": {"type": "count", "field": "phase"},
+                        "output_schema": "outcome-schema",
+                    }
+                ],
+                "datasets": [
+                    {"id": "outs", "source": {"kind": "artifacts", "artifact_type": "out"}}
+                ],
+                "models": [],
+            }
+        )
         schema_dir = (
             tmp_path / "workspace" / ".genesis" / "specifications" / "count-once" / "schemas"
         )
         schema_dir.mkdir(parents=True)
         (schema_dir / "out.yaml").write_text("type: object\nproperties:\n  text: {type: string}\n")
         (schema_dir / "outcome-schema.yaml").write_text(
-            "type: object\nrequired: [phase_count]\nproperties:\n  phase_count: {type: integer}\n")
+            "type: object\nrequired: [phase_count]\nproperties:\n  phase_count: {type: integer}\n"
+        )
         rev = service.update_specification("count-once", {"description": "x"}, draft["version"])
         service.approve_specification("count-once", rev["version"], "researcher")
         compiled = service.compile_study(None, "builds/count-once", specification_id="count-once")
@@ -316,35 +355,61 @@ def test_state_dataset_reads_final_snapshot_value(tmp_path: Path) -> None:
 
     service = GenesisService(tmp_path / "workspace")
     try:
-        draft = service.create_specification({
-            "id": "state-agg", "title": "sa",
-            "processes": [{"id": "tick", "executor": {"mode": "deterministic"},
-                           "context_policy": "public",
-                           "state_effects": [{"field": "counter", "op": "set"}]}],
-            "theory": {"theory_family": "exploratory"},
-            "domain": {"states": [{"id": "counter", "value_type": "integer", "initial": 0}]},
-            "protocol": {"time_model": {"type": "rounds", "end": 2}},
-            "outcomes": [{"id": "final-counter", "source": "final-count", "grouping": [],
-                          "aggregation": {"type": "sum", "field": "counter"},
-                          "output_schema": "outcome-schema"}],
-            "datasets": [{"id": "final-count",
-                          "source": {"kind": "state", "state": "counter", "snapshot": "final"}}],
-            "models": [],
-        })
+        draft = service.create_specification(
+            {
+                "id": "state-agg",
+                "title": "sa",
+                "processes": [
+                    {
+                        "id": "tick",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "public",
+                        "state_effects": [{"field": "counter", "op": "set"}],
+                    }
+                ],
+                "theory": {"theory_family": "exploratory"},
+                "domain": {"states": [{"id": "counter", "value_type": "integer", "initial": 0}]},
+                "protocol": {"time_model": {"type": "rounds", "end": 2}},
+                "outcomes": [
+                    {
+                        "id": "final-counter",
+                        "source": "final-count",
+                        "grouping": [],
+                        "aggregation": {"type": "sum", "field": "counter"},
+                        "output_schema": "outcome-schema",
+                    }
+                ],
+                "datasets": [
+                    {
+                        "id": "final-count",
+                        "source": {"kind": "state", "state": "counter", "snapshot": "final"},
+                    }
+                ],
+                "models": [],
+            }
+        )
         from genesis.runtime import ProcessResult
+
         schema_dir = (
             tmp_path / "workspace" / ".genesis" / "specifications" / "state-agg" / "schemas"
         )
         schema_dir.mkdir(parents=True)
         (schema_dir / "outcome-schema.yaml").write_text(
-            "type: object\nrequired: [counter_sum]\nproperties:\n  counter_sum: {type: number}\n")
+            "type: object\nrequired: [counter_sum]\nproperties:\n  counter_sum: {type: number}\n"
+        )
         rev = service.update_specification("state-agg", {"description": "x"}, draft["version"])
         service.approve_specification("state-agg", rev["version"], "researcher")
         compiled = service.compile_study(None, "builds/state-agg", specification_id="state-agg")
         service.create_run({"id": "sa-run", "study_id": "state-agg", "build": compiled["path"]})
         state = {"counter": 0}
-        service.execute_run("sa-run", executor_overrides={"tick": lambda inv: (
-            state.update(counter=99) or ProcessResult(state_effects={"counter": 99}))})
+        service.execute_run(
+            "sa-run",
+            executor_overrides={
+                "tick": lambda inv: (
+                    state.update(counter=99) or ProcessResult(state_effects={"counter": 99})
+                )
+            },
+        )
         outcomes = service.evaluate_outcomes("sa-run")
         by_id = {row["outcome_id"]: row for row in outcomes}
         assert by_id["final-counter"]["counter_sum"] == 99.0
@@ -361,14 +426,23 @@ def test_conditional_and_with_field_pass_the_model() -> None:
     """F12: OutcomeDatasetField must accept the engine's condition/with_field."""
     from genesis.specification.models import OutcomeDatasetField
 
-    conditional = OutcomeDatasetField.model_validate({
-        "name": "label", "op": "conditional",
-        "condition": {"field": "is_high", "value": True},
-        "value": "high", "else_value": "low",
-    })
+    conditional = OutcomeDatasetField.model_validate(
+        {
+            "name": "label",
+            "op": "conditional",
+            "condition": {"field": "is_high", "value": True},
+            "value": "high",
+            "else_value": "low",
+        }
+    )
     assert conditional.op == "conditional"
-    arithmetic = OutcomeDatasetField.model_validate({
-        "name": "ratio", "op": "arithmetic",
-        "field": "a", "operator": "divide", "with_field": "b",
-    })
+    arithmetic = OutcomeDatasetField.model_validate(
+        {
+            "name": "ratio",
+            "op": "arithmetic",
+            "field": "a",
+            "operator": "divide",
+            "with_field": "b",
+        }
+    )
     assert arithmetic.with_field == "b"

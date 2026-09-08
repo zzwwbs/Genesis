@@ -72,7 +72,8 @@ def evaluate_capabilities(
         "read_outcome_snapshot",
         has_outcomes,
         [] if has_outcomes else ["outcomes"],
-        "stored outcome rows are available for reading" if has_outcomes
+        "stored outcome rows are available for reading"
+        if has_outcomes
         else "no stored outcome snapshot was retained",
     )
     missing_recompute: list[str] = []
@@ -84,8 +85,7 @@ def evaluate_capabilities(
         "recompute_outcomes",
         has_build and has_outcomes,
         missing_recompute,
-        "outcome rows can be recomputed from the pinned outcome plan and "
-        "retained evidence"
+        "outcome rows can be recomputed from the pinned outcome plan and retained evidence"
         if has_build and has_outcomes
         else "the build (outcome plan) or stored outcomes are missing",
     )
@@ -245,8 +245,7 @@ def verify_bundle_manifest(destination: Path) -> dict[str, Any]:
     unlisted = sorted(present - seen)
     if unlisted:
         raise ValueError(
-            "IMPORT_BUNDLE: incomplete member coverage; unlisted files: "
-            + ", ".join(unlisted[:10])
+            "IMPORT_BUNDLE: incomplete member coverage; unlisted files: " + ", ".join(unlisted[:10])
         )
     return dict(manifest)
 
@@ -307,7 +306,5 @@ def stage_bundle(destination: Path) -> Path:
     """Return a fresh staging directory beside the final destination."""
     destination = destination.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
-    )
+    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     return staging

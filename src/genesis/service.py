@@ -1147,18 +1147,17 @@ class GenesisService:
         try:
             PackageSchemaCatalog(schemas)
         except SchemaValidationError as exc:
-            raise ValueError(
-                f"SCHEMA_INVALID: {exc.code}: {exc}"
-            ) from exc
+            raise ValueError(f"SCHEMA_INVALID: {exc.code}: {exc}") from exc
 
     @contextmanager
     def _package_transaction(self, specification_id: str) -> Iterator[None]:
         """Restore files and registry rows if a package edit fails."""
         directory = self._specification_dir(specification_id)
         directory.parent.mkdir(parents=True, exist_ok=True)
-        with self.persistence._lock, tempfile.TemporaryDirectory(
-            prefix=".package-edit-", dir=directory.parent
-        ) as temporary:
+        with (
+            self.persistence._lock,
+            tempfile.TemporaryDirectory(prefix=".package-edit-", dir=directory.parent) as temporary,
+        ):
             backup = Path(temporary) / "before"
             if directory.exists():
                 shutil.copytree(directory, backup, symlinks=True)
@@ -2121,6 +2120,7 @@ class GenesisService:
                             _schema_id: str = bound_schema_id,
                         ) -> list[SchemaDiagnostic]:
                             return _validator.validate(_schema_id, value)
+
             if mode == "semantic-evaluator" and output_schema is None:
                 raise ValueError(
                     "SEMANTIC_EVALUATOR_SCHEMA: semantic-evaluator requires "
@@ -2298,6 +2298,7 @@ class GenesisService:
                     f"{diagnostic.instance_pointer or 'root'}: {diagnostic.message}"
                     for diagnostic in commit_catalog.validate(schema_ref, value)
                 ]
+
         controller = RunController(
             Scheduler(processes),
             registry,
@@ -2595,8 +2596,10 @@ class GenesisService:
             str(process["id"]): list(process.get("dependencies", {}).get("after", []))
             for process in processes
         }
-        if mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH} and boundary and boundary.startswith(
-            "event:"
+        if (
+            mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH}
+            and boundary
+            and boundary.startswith("event:")
         ):
             target_event = boundary.split(":", 1)[1]
             if not any(
@@ -2660,9 +2663,7 @@ class GenesisService:
             "inherited_replication": int(source.get("replication", 1)),
             "evidence_requirements": {
                 "recorded_outputs": bool(self._recorded_process_outputs(run_id, artifact_ids)),
-                "checkpoint_available": bool(
-                    phase_boundary is not None and phase_boundary >= 0
-                ),
+                "checkpoint_available": bool(phase_boundary is not None and phase_boundary >= 0),
             },
             "warnings": warnings,
             "preview_token": preview_token,
@@ -3151,9 +3152,7 @@ class GenesisService:
         outcome_plan = compile_outcome_plan(build_path)
         definitions = outcome_plan["outcomes"]
         schema_catalog = self._build_schema_catalog(build_path)
-        outcome_catalog = (
-            PackageSchemaCatalog(schema_catalog) if schema_catalog else None
-        )
+        outcome_catalog = PackageSchemaCatalog(schema_catalog) if schema_catalog else None
         event_rows = []
         for event in self.trace_run(run_id):
             row = dict(event)
@@ -4672,9 +4671,7 @@ class GenesisService:
             if path.is_relative_to(staging)
         ]
 
-    def _write_bundle(
-        self, run_id: str, destination: Path, *, mode: str
-    ) -> list[Path]:
+    def _write_bundle(self, run_id: str, destination: Path, *, mode: str) -> list[Path]:
         """Write all bundle members for one run into a prepared directory."""
         run = self.get_run(run_id)
         outcomes = self.evaluate_outcomes(run_id)
@@ -4751,28 +4748,34 @@ class GenesisService:
                 event_rows = GenesisService._redact_raw_responses(event_rows)
                 artifact_rows = GenesisService._redact_raw_responses(artifact_rows)
             extras["events.json"] = json.dumps(event_rows, indent=2, default=str)
-            output_paths.append(AnalysisExporter.rows_to_parquet(
-                _parquet_safe(event_rows), destination / "events.parquet"
-            ))
+            output_paths.append(
+                AnalysisExporter.rows_to_parquet(
+                    _parquet_safe(event_rows), destination / "events.parquet"
+                )
+            )
             extras["artifacts.json"] = json.dumps(artifact_rows, indent=2, default=str)
-            output_paths.append(AnalysisExporter.rows_to_parquet(
-                _parquet_safe(
-                    [
-                        {key: value for key, value in row.items() if key != "payload"}
-                        for row in artifact_rows
-                    ]
-                ),
-                destination / "artifacts.parquet",
-            ))
+            output_paths.append(
+                AnalysisExporter.rows_to_parquet(
+                    _parquet_safe(
+                        [
+                            {key: value for key, value in row.items() if key != "payload"}
+                            for row in artifact_rows
+                        ]
+                    ),
+                    destination / "artifacts.parquet",
+                )
+            )
             # NOTE: raw cumulative state snapshots are intentionally NOT exported
             # as JSON (hundreds of MB); the compact parquet projection is kept.
             state_history = self.persistence.list_state_history(run_id)
             state_rows_for_export = [
                 {**snapshot, "state_version": version} for version, snapshot in state_history
             ]
-            output_paths.append(AnalysisExporter.rows_to_parquet(
-                _parquet_safe(state_rows_for_export), destination / "states.parquet"
-            ))
+            output_paths.append(
+                AnalysisExporter.rows_to_parquet(
+                    _parquet_safe(state_rows_for_export), destination / "states.parquet"
+                )
+            )
         else:
             # Exploration imports have retained traces but no executable build.
             extras["events.json"] = json.dumps(self.trace_run(run_id), indent=2, default=str)
@@ -4828,11 +4831,7 @@ class GenesisService:
             and extras.get("state_model.json")
             and extras.get("artifact_catalog.json")
         )
-        retained_records = bool(
-            self._recorded_process_outputs(run_id, ())
-            if build_ref
-            else False
-        )
+        retained_records = bool(self._recorded_process_outputs(run_id, ()) if build_ref else False)
         capabilities = evaluate_capabilities(
             has_build=has_executable_build,
             has_closure=has_closure,
