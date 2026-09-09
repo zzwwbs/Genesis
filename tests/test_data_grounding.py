@@ -142,3 +142,51 @@ def test_export_includes_data_manifest(tmp_path: Path) -> None:
         assert manifest["population.csv"]
     finally:
         service.close()
+
+
+def test_reproducibility_bundle_preserves_empirical_population(tmp_path: Path) -> None:
+    """F2: a reproducibility (full) run bundle must carry the empirical
+    initialization data so an imported replay of an empirically grounded run
+    still initializes the population rows (regression: initialization.json /
+    schemas.json / data assets were omitted from the bundle)."""
+    import shutil
+
+    from genesis.evidence import ExportMode
+    from genesis.replay import ReplayMode
+
+    service = _service_with_grounded_run(tmp_path)
+    try:
+        service.execute_run("grounded-run")
+        _version, state = service.persistence.latest_json_state("grounded-run")
+        assert len(state["population"]["rows"]) == 2
+
+        service.export_run("grounded-run", "exports/repro", mode=ExportMode.REPRODUCIBILITY)
+        bundle = service.workspace / "exports" / "repro"
+        assert (bundle / "initialization.json").is_file()
+        assert (bundle / "schemas.json").is_file()
+
+        other = tmp_path / "other-workspace"
+        (other / "imports").mkdir(parents=True)
+        shutil.copytree(bundle, other / "imports" / "repro-bundle")
+        importer = GenesisService(other)
+        try:
+            imported = importer.import_run(other / "imports" / "repro-bundle", run_id="imp-ground")
+            assert imported["status"] == "imported"
+            build_path = importer.resolve_path(importer.get_run("imp-ground").get("build"))
+            assert (build_path / "initialization.json").is_file()
+            assert (build_path / "data" / "population.csv").is_file()
+            preview = importer.replay_preview(
+                "imp-ground", mode=ReplayMode.PARTIAL, boundary="phase:0"
+            )
+            replayed = importer.replay_run(
+                "imp-ground",
+                mode=ReplayMode.PARTIAL,
+                boundary="phase:0",
+                preview_token=preview["preview_token"],
+            )
+            _version, replayed_state = importer.persistence.latest_json_state(replayed["run_id"])
+            assert len(replayed_state.get("population", {}).get("rows", [])) == 2
+        finally:
+            importer.close()
+    finally:
+        service.close()

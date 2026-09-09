@@ -474,3 +474,216 @@ def test_each_completed_round_selects_final_snapshot_per_round() -> None:
     observed = rows["rounds"]
     assert len(observed) == 2, "two rounds, not three commits"
     assert [row["counter"] for row in observed] == [3, 7]
+
+
+def test_each_completed_round_collapses_service_state_commits(tmp_path: Path) -> None:
+    """F8 (production wiring): two processes committing state in one phase must
+    yield ONE round observation through the service, without injecting _round
+    manually (regression: events must carry state_version)."""
+    from genesis.runtime import ProcessResult
+    from genesis.service import GenesisService
+
+    service = GenesisService(tmp_path / "workspace")
+    try:
+        draft = service.create_specification(
+            {
+                "id": "f8-wiring",
+                "title": "f8",
+                "processes": [
+                    {
+                        "id": "a",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "public",
+                        "state_effects": [{"field": "x", "op": "set"}],
+                    },
+                    {
+                        "id": "b",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "public",
+                        "state_effects": [{"field": "x", "op": "set"}],
+                    },
+                ],
+                "theory": {"theory_family": "exploratory"},
+                "domain": {"states": [{"id": "x", "value_type": "integer", "initial": 0}]},
+                "protocol": {"time_model": {"type": "rounds", "end": 1}},
+                "outcomes": [],
+                "datasets": [
+                    {
+                        "id": "rounds-ds",
+                        "source": {"kind": "state", "snapshot": "each_completed_round"},
+                        "fields": [{"name": "n", "op": "copy", "field": "x"}],
+                    }
+                ],
+                "models": [],
+            }
+        )
+        rev = service.update_specification("f8-wiring", {"description": "x"}, draft["version"])
+        service.approve_specification("f8-wiring", rev["version"], "researcher")
+        compiled = service.compile_study(None, "builds/f8-wiring", specification_id="f8-wiring")
+        service.create_run({"id": "f8w", "study_id": "f8-wiring", "build": compiled["path"]})
+        ctr = {"v": 0}
+
+        def mk(delta):
+            def exe(inv):
+                ctr["v"] += delta
+                return ProcessResult(state_effects={"x": ctr["v"]})
+
+            return exe
+
+        service.execute_run("f8w", executor_overrides={"a": mk(1), "b": mk(10)})
+        # Events must expose state_version for the collapse to work.
+        events = [e for e in service.trace_run("f8w") if e.get("kind") == "process_completed"]
+        assert {e.get("state_version") for e in events} == {1, 2}
+        # Directly materialize the dataset via the same path evaluate_outcomes
+        # uses: build phase map from events, tag state rows, materialize.
+        from genesis.outcome_plan import compile_outcome_plan, materialize_datasets
+
+        build_path = service.resolve_path(compiled["path"])
+        plan = compile_outcome_plan(build_path)
+        version_phase = {
+            e.get("state_version"): e.get("phase")
+            for e in events
+            if e.get("state_version") is not None
+        }
+        assert version_phase == {1: 0, 2: 0}
+        state_rows = []
+        for version, snapshot in service.persistence.list_state_history("f8w"):
+            row = dict(snapshot)
+            row["state_version"] = version
+            row["_round"] = version_phase.get(version)
+            state_rows.append(row)
+        rows = materialize_datasets(plan, {"events": [], "artifacts": [], "state": state_rows})
+        observed = rows["rounds-ds"]
+        assert len(observed) == 1, "one round observation, not two commits"
+        assert observed[0]["n"] == 11, "final snapshot of the round wins"
+        assert "_round" not in observed[0] and "state_version" not in observed[0]
+    finally:
+        service.close()
+
+
+# F4 (effect): a phase with a failed/active/skipped process is not a
+# completed round and must not yield an observation.
+# ---------------------------------------------------------------------------
+
+
+def test_each_completed_round_drops_failed_phase_rows() -> None:
+    """F4: state snapshots tagged with the incomplete-round sentinel are
+    excluded from each_completed_round, so a failed/active phase contributes
+    no observation (spec: completed rounds only)."""
+    from genesis.outcome_plan import _INCOMPLETE_ROUND, materialize_datasets
+
+    state_rows = [
+        # phase 0 completed normally
+        {"counter": 1, "state_version": 1, "_round": 0},
+        {"counter": 3, "state_version": 2, "_round": 0},
+        # phase 1 failed: engine flagged the row with the sentinel
+        {"counter": 9, "state_version": 3, "_round": _INCOMPLETE_ROUND},
+    ]
+    plan = {
+        "datasets": [
+            {
+                "id": "rounds",
+                "source": {"kind": "state", "snapshot": "each_completed_round"},
+            }
+        ]
+    }
+    rows = materialize_datasets(plan, {"events": [], "artifacts": [], "state": state_rows})
+    observed = rows["rounds"]
+    assert len(observed) == 1, "failed phase must not contribute an observation"
+    assert observed[0]["counter"] == 3, "final snapshot of the completed round survives"
+
+
+def test_each_completed_round_excludes_failed_phase_through_service(tmp_path: Path) -> None:
+    """F4 (production wiring): when a process fails in a phase, evaluate_outcomes
+    must not count that phase as a completed round."""
+    from genesis.runtime import ProcessResult
+    from genesis.service import GenesisService
+
+    service = GenesisService(tmp_path / "workspace")
+    try:
+        draft = service.create_specification(
+            {
+                "id": "f4-fail",
+                "title": "f4",
+                "processes": [
+                    {
+                        "id": "ok",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "public",
+                        "state_effects": [{"field": "x", "op": "set"}],
+                    },
+                    {
+                        "id": "bad",
+                        "executor": {
+                            "mode": "rule",
+                            "parameters": {
+                                "rules": [
+                                    {
+                                        "when": {"path": "inputs.v", "op": "eq", "value": 1},
+                                        "outputs": {"score": 99},
+                                    }
+                                ]
+                            },
+                        },
+                        "context_policy": "public",
+                        "outputs": [{"artifact_type": "score", "schema_ref": "score"}],
+                        "state_effects": [{"field": "x", "op": "set"}],
+                    },
+                ],
+                "theory": {"theory_family": "exploratory"},
+                "domain": {
+                    "artifacts": [{"id": "score", "artifact_type": "obj", "schema_ref": "score"}],
+                    "states": [{"id": "x", "value_type": "integer", "initial": 0}],
+                },
+                "protocol": {"time_model": {"type": "rounds", "end": 1}},
+                "outcomes": [],
+                "datasets": [
+                    {
+                        "id": "rounds-ds",
+                        "source": {"kind": "state", "snapshot": "each_completed_round"},
+                        "fields": [{"name": "n", "op": "copy", "field": "x"}],
+                    }
+                ],
+                "models": [],
+            }
+        )
+        schema_dir = tmp_path / "workspace" / ".genesis" / "specifications" / "f4-fail" / "schemas"
+        schema_dir.mkdir(parents=True)
+        (schema_dir / "score.yaml").write_text(
+            "type: object\nrequired: [score]\nproperties:\n  score: {type: integer, maximum: 10}\n"
+        )
+        rev = service.update_specification("f4-fail", {"description": "x"}, draft["version"])
+        service.approve_specification("f4-fail", rev["version"], "researcher")
+        compiled = service.compile_study(None, "builds/f4-fail", specification_id="f4-fail")
+        service.create_run({"id": "f4r", "study_id": "f4-fail", "build": compiled["path"]})
+        try:
+            service.execute_run(
+                "f4r",
+                executor_overrides={
+                    "ok": lambda _inv: ProcessResult(state_effects={"x": 5}),
+                    "bad": lambda _inv: {"score": 99},  # violates max 10 -> fails
+                },
+            )
+            raise AssertionError("run must fail on schema rejection")
+        except Exception:
+            pass
+        events = service.trace_run("f4r")
+        assert any(e.get("kind") == "process_failed" for e in events)
+        results = service.evaluate_outcomes("f4r")
+        assert results == [], "a failed phase must not yield a round observation"
+    finally:
+        service.close()
+
+
+def test_events_dataset_preserves_state_version_field() -> None:
+    """Review: the internal-key strip must only affect state datasets; an
+    events dataset row that legitimately carries state_version keeps it."""
+    from genesis.outcome_plan import materialize_datasets
+
+    event_rows = [
+        {"event_id": "e1", "phase": 0, "state_version": 3, "value": 10},
+        {"event_id": "e2", "phase": 1, "state_version": 4, "value": 20},
+    ]
+    plan = {"datasets": [{"id": "from-events", "source": {"kind": "events"}}]}
+    rows = materialize_datasets(plan, {"events": event_rows, "artifacts": [], "state": []})
+    assert rows["from-events"] == event_rows

@@ -69,12 +69,24 @@ class AnalysisEngine:
 
     @staticmethod
     def _group_result(plan: OutcomePlan, key: Any) -> dict[str, Any]:
+        """Label one aggregated group with its declared grouping keys.
+
+        Multi-key groupings also carry the declared field names, not only
+        positional ``group_N`` labels: without them a downstream consumer (the
+        protocol summary, an exported outcome row) cannot tell which condition
+        or phase a value belongs to, and pooling across them is undetectable.
+        The positional labels are retained for compatibility.
+        """
         keys = (plan.group_by,) if isinstance(plan.group_by, str) else (plan.group_by or ())
         if not keys:
             return {}
         if len(keys) == 1:
             return {keys[0]: key if not isinstance(key, tuple) else key[0]}
-        return {f"group_{i}": item for i, item in enumerate(key)}
+        values = key if isinstance(key, tuple) else (key,)
+        result: dict[str, Any] = {f"group_{i}": item for i, item in enumerate(values)}
+        for name, item in zip(keys, values, strict=False):
+            result.setdefault(str(name), item)
+        return result
 
     def _aggregate(
         self, plan: OutcomePlan, groups: dict[Any, list[dict[str, Any]]]
@@ -213,6 +225,16 @@ def duckdb_aggregate(
     except ImportError:
         return fallback()
     connection = duckdb.connect()
+
+    def _normalize(value: Any) -> Any:
+        """Match the in-process engine's empty-aggregate value.
+
+        SQL ``sum`` over an all-NULL group is NULL; Python's ``sum([])`` is 0.
+        Left as-is, enabling DuckDB changed a reported outcome from 0 to None.
+        ``avg`` and Python's mean both yield None for an empty group.
+        """
+        return 0 if op == "sum" and value is None else value
+
     try:
         connection.register("_genesis_rows", pa.Table.from_pylist(rows))
         expression = {"count": "count", "sum": "sum", "mean": "avg"}[op]
@@ -225,7 +247,11 @@ def duckdb_aggregate(
             ).fetchall()
             rows = []
             for key, value, total, non_null in result:
-                row: dict[str, Any] = {group_by: str(key), f"{select}_{op}": value}
+                # Keep the grouping key's native type. Stringifying it made the
+                # same declared plan produce `phase: "1"` under DuckDB and
+                # `phase: 1` in-process, so the recorded evidence depended on
+                # which engine happened to run.
+                row: dict[str, Any] = {group_by: key, f"{select}_{op}": _normalize(value)}
                 row[f"{select}_missing"] = int(total) - int(non_null)
                 rows.append(row)
             return rows
@@ -235,7 +261,12 @@ def duckdb_aggregate(
         ).fetchone()
         if value is None:
             return [{f"{select}_{op}": None, f"{select}_missing": 0}]
-        return [{f"{select}_{op}": value[0], f"{select}_missing": int(value[1]) - int(value[2])}]
+        return [
+            {
+                f"{select}_{op}": _normalize(value[0]),
+                f"{select}_missing": int(value[1]) - int(value[2]),
+            }
+        ]
     finally:
         connection.close()
 

@@ -16,6 +16,13 @@ from typing import Any
 
 OUTCOME_PLAN_VERSION = 1
 
+# Sentinel ``_round`` annotation attached by the service to state snapshots
+# committed in a phase where no round completed (a process failed, was left
+# active, or was skipped). ``each_completed_round`` must never emit an
+# observation for such a phase, so materialize_datasets drops these rows.
+# A string is used so it can never collide with a real phase index (int).
+_INCOMPLETE_ROUND = "__incomplete_round__"
+
 ARITHMETIC_OPS: dict[str, Any] = {
     "add": lambda a, b: _number(a) + _number(b),
     "subtract": lambda a, b: _number(a) - _number(b),
@@ -88,6 +95,27 @@ def _apply_fields(row: dict[str, Any], fields: list[Mapping[str, Any]]) -> dict[
             expected = condition.get("value")
             row[name] = step.get("value") if value == expected else step.get("else_value")
     return row
+
+
+def _matches(row: Mapping[str, Any], predicate: Mapping[str, Any]) -> bool:
+    """Whether one row satisfies a declared dataset filter."""
+    actual = _resolve_path(row, str(predicate.get("field") or ""))
+    op = str(predicate.get("op", "eq"))
+    if op == "truthy":
+        return bool(actual)
+    if op == "falsy":
+        return not bool(actual)
+    expected = predicate.get("value")
+    if op == "eq":
+        return bool(actual == expected)
+    if op == "ne":
+        return bool(actual != expected)
+    if actual is None or expected is None:
+        return False
+    handler = COMPARISON_OPS.get(op)
+    if handler is None:
+        raise ValueError(f"OUTCOME_PLAN: unknown dataset filter operator '{op}'")
+    return bool(handler(actual, expected))
 
 
 def materialize_datasets(
@@ -180,6 +208,9 @@ def materialize_datasets(
                 # several process invocations). Rows annotated with a
                 # ``_round`` phase collapse to the last snapshot of that
                 # phase; unannotated rows are each treated as their own round.
+                # Rows marked with the ``_INCOMPLETE_ROUND`` sentinel come
+                # from a phase in which no round completed (a process failed,
+                # was left active, or was skipped) and are dropped (F4).
                 round_rows: dict[Any, dict[str, Any]] = {}
                 for entry in state_rows:
                     record = _snapshot(entry)
@@ -187,15 +218,32 @@ def materialize_datasets(
                         continue
                     row = dict(record)
                     round_key = row.get("_round")
+                    if round_key == _INCOMPLETE_ROUND:
+                        continue
                     if round_key is None:
                         round_rows.setdefault(id(row), row)
                     else:
                         round_rows[round_key] = row
                 for row in round_rows.values():
                     rows.append(row)
+            # The state branch is the only source where the engine injects the
+            # ``_round`` annotation; drop it from the materialized rows. The
+            # service's ``state_version`` annotation is likewise internal —
+            # strip it here rather than letting it leak, but ONLY for state
+            # datasets (event/artifact rows may legitimately carry their own
+            # fields).
+            rows = [
+                {key: value for key, value in row.items() if key not in ("_round", "state_version")}
+                for row in rows
+            ]
         for step in dataset.get("fields") or []:
             if isinstance(step, Mapping):
                 rows = [_apply_fields(dict(row), [step]) for row in rows]
+        # Narrowing belongs to the relation: a trace seed selects rows without
+        # defining an outcome over them.
+        for predicate in dataset.get("where") or []:
+            if isinstance(predicate, Mapping):
+                rows = [row for row in rows if _matches(row, predicate)]
         deduplicate_on = dataset.get("deduplicate_on") or []
         if deduplicate_on:
             seen: set[tuple[Any, ...]] = set()
@@ -229,6 +277,7 @@ def compile_outcome_plan(build_path: Any) -> dict[str, Any]:
     plan.setdefault("version", OUTCOME_PLAN_VERSION)
     plan.setdefault("datasets", [])
     plan.setdefault("outcomes", [])
+    plan.setdefault("traces", [])
     return plan
 
 

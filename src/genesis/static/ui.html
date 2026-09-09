@@ -446,10 +446,14 @@
         <button onclick="traceExplorer()">Trace explorer</button>
         <button onclick="processMap()">Process map</button>
         <button onclick="exportBundle()">Export evidence bundle</button>
-        <button onclick="naturalTrace()">Natural trace (frozen rule)</button>
-        <input id="trace-user" placeholder="user id (e.g. u17)" size="12">
+        <button onclick="listTraces()">Declared traces</button>
+        <input id="trace-id" placeholder="trace id (opt)" size="12">
+        <button onclick="naturalTrace()">Declared trace</button>
+        <input id="trace-user" placeholder="actor id (e.g. u17)" size="12">
         <input id="trace-phase" placeholder="phase (opt)" size="6">
-        <button onclick="userTrace()">Trace by user…</button>
+        <button onclick="userTrace()">Trace by actor…</button>
+        <label for="trace-max-steps" title="Chains keep the steps nearest the seed; raise this to widen a truncated chain.">max steps</label>
+        <input id="trace-max-steps" type="number" min="1" max="1000" value="40" size="5">
         <button onclick="processMap('builds/' + id())">Process map (current build)</button>
       </div>
     </fieldset>
@@ -1086,40 +1090,60 @@
     }
     function renderTraceView(result) {
         const illustration = result.illustration || {};
-        const lines = [`selection_rule: ${result.selection_rule}`,
-                       `illustration: user ${illustration.user}, phase ${illustration.phase}`];
-        for (const step of illustration.steps || []) {
-          lines.push(`-- ${step.step} --`);
-          if (step.event) lines.push(`event: ${step.event}`);
-          if (step.input_artifact) lines.push(`input_artifact: ${step.input_artifact}`);
-          if (step.value !== undefined) lines.push(`value: ${JSON.stringify(step.value)}`);
-          if (step.state_delta) lines.push(`state_delta: ${JSON.stringify(step.state_delta)}`);
-        }
-        show('analysis-output', {run_id: result.run_id, selection_rule: result.selection_rule,
-                                 illustration: {user: illustration.user, phase: illustration.phase,
-                                                steps: (illustration.steps || []).map(step => ({
-                                                  step: step.step,
-                                                  event: step.event || null,
-                                                  input_artifact: step.input_artifact || null,
-                                                  value: step.value,
-                                                  state_delta: step.state_delta || null,
-                                                }))}});
+        show('analysis-output', {
+          run_id: result.run_id,
+          selection_rule: result.selection_rule,
+          seed_event: result.seed_event,
+          coverage: result.coverage,
+          illustration: {
+            actors: illustration.actors,
+            phase: illustration.phase,
+            steps: (illustration.steps || []).map(step => ({
+              step: step.step,
+              relation: step.relation,
+              distance: step.distance,
+              process: step.process,
+              phase: step.phase,
+              actors: step.actors,
+              event: step.event || null,
+              consumed_artifacts: step.consumed_artifacts || [],
+              produced_artifacts: step.produced_artifacts || [],
+              state_delta: step.state_delta || null,
+            })),
+          },
+        });
+    }
+    function traceLimit() {
+      const raw = (document.getElementById('trace-max-steps') || {}).value;
+      const value = parseInt(raw, 10);
+      // Blank or nonsense falls back to the server default rather than erroring.
+      return Number.isFinite(value) && value > 0 ? `max_steps=${value}` : '';
+    }
+    async function listTraces() {
+      try {
+        show('analysis-output', await request(`/runs/${encodeURIComponent(selectedRun())}/traces`));
+      } catch (e) { show('analysis-output', e.message); }
     }
     async function naturalTrace() {
+      const trace = document.getElementById('trace-id').value.trim();
       try {
-        const result = await request(`/runs/${encodeURIComponent(selectedRun())}/natural-trace`);
-        renderTraceView(result);
+        const query = [trace ? `trace=${encodeURIComponent(trace)}` : '', traceLimit()]
+                        .filter(Boolean).join('&');
+        const suffix = `/runs/${encodeURIComponent(selectedRun())}/natural-trace`
+                      + (query ? `?${query}` : '');
+        renderTraceView(await request(suffix));
       } catch (e) { show('analysis-output', e.message); }
     }
     async function userTrace() {
-      const user = document.getElementById('trace-user').value.trim();
-      if (!user) { show('analysis-output', {error: 'enter a user id, e.g. u17'}); return; }
+      const actor = document.getElementById('trace-user').value.trim();
+      if (!actor) { show('analysis-output', {error: 'enter an actor id, e.g. u17'}); return; }
       const phase = document.getElementById('trace-phase').value.trim();
       try {
-        const suffix = `/runs/${encodeURIComponent(selectedRun())}/natural-trace?user=${encodeURIComponent(user)}`
-                      + (phase ? `&phase=${encodeURIComponent(phase)}` : '');
-        const result = await request(suffix);
-        renderTraceView(result);
+        const query = [`actor=${encodeURIComponent(actor)}`,
+                       phase ? `phase=${encodeURIComponent(phase)}` : '',
+                       traceLimit()].filter(Boolean).join('&');
+        renderTraceView(await request(
+          `/runs/${encodeURIComponent(selectedRun())}/natural-trace?${query}`));
       } catch (e) { show('analysis-output', e.message); }
     }
     async function processMap(overrideRef) {

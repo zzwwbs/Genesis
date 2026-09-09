@@ -469,16 +469,21 @@ def test_replay_preserves_source_experiment_seed(tmp_path, monkeypatch) -> None:
                 "protocol_hash": "h",
             }
         )
-        import json as _json
-
-        payload = service.get_run("source-strict-3")
-        payload = dict(payload)
-        payload["experiment_id"] = "experiment-1"
-        service.persistence.connection.execute(
-            "UPDATE runs SET experiment_id = ?, payload_json = ? WHERE run_id = ?",
-            ("experiment-1", _json.dumps(payload), "source-strict-3"),
+        # Set scientific inputs BEFORE execution; changing a completed run's
+        # row must not retroactively change its frozen randomness contract.
+        service.create_run(
+            {
+                "id": "experiment-source",
+                "study_id": "replay-config-study",
+                "build": build_ref,
+                "experiment_id": "experiment-1",
+                "condition_id": "strict",
+                "replication": 3,
+                "condition": {"id": "strict", "factors": {"policy": "strict", "peer": "low"}},
+            }
         )
-        source = service.get_run("source-strict-3")
+        service.execute_run("experiment-source")
+        source = service.get_run("experiment-source")
         assert source.get("experiment_id") == "experiment-1"
         # The child derives randomness from the ROOT identity: source run id,
         # its experiment, condition and replication.
@@ -486,17 +491,17 @@ def test_replay_preserves_source_experiment_seed(tmp_path, monkeypatch) -> None:
 
         expected_root_seed = derive_seed(
             0,
-            "source-strict-3",
+            "experiment-source",
             "run-manifest",
             experiment_id="experiment-1",
             condition_id="strict",
             replication=3,
         )
         preview = service.replay_preview(
-            "source-strict-3", mode=ReplayMode.PARTIAL, boundary="phase:1"
+            "experiment-source", mode=ReplayMode.PARTIAL, boundary="phase:1"
         )
         replay = service.replay_run(
-            "source-strict-3",
+            "experiment-source",
             mode=ReplayMode.PARTIAL,
             boundary="phase:1",
             preview_token=preview["preview_token"],
@@ -507,5 +512,44 @@ def test_replay_preserves_source_experiment_seed(tmp_path, monkeypatch) -> None:
         # the source experiment id), not a derivation with the child's own
         # (empty) experiment identity.
         assert child["manifest"]["seeds"]["conventional"] == expected_root_seed
+    finally:
+        service.close()
+
+
+def test_artifact_replay_rejects_intervention_arguments(tmp_path, monkeypatch) -> None:
+    """F10: artifact replay is retrieval-only; overrides/justification/boundary
+    are rejected on the execution path, matching the preview."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(ValueError, match="REPLAY_CONFIGURATION_INVALID"):
+            service.replay_run(
+                "source-strict-3", mode=ReplayMode.ARTIFACT, overrides={"policy": "lenient"}
+            )
+        with pytest.raises(ValueError, match="REPLAY_CONFIGURATION_INVALID"):
+            service.replay_run("source-strict-3", mode=ReplayMode.ARTIFACT, justification="why")
+        with pytest.raises(ValueError, match="REPLAY_CONFIGURATION_INVALID"):
+            service.replay_run("source-strict-3", mode=ReplayMode.ARTIFACT, boundary="phase:1")
+    finally:
+        service.close()
+
+
+def test_phase_boundary_on_unexecuted_run_is_rejected(tmp_path, monkeypatch) -> None:
+    """F9: a run with no executed phases has no checkpoint at any boundary."""
+    service = _source_run(tmp_path, monkeypatch)
+    try:
+        # create a second run in the same study that never executes
+        compiled = service.get_run("source-strict-3").get("build")
+        service.persistence.create_run(
+            {
+                "id": "never-ran",
+                "study_id": "replay-config-study",
+                "build": compiled,
+                "condition_id": "strict",
+                "condition": {"id": "strict", "factors": {"policy": "strict", "peer": "low"}},
+                "replication": 1,
+            }
+        )
+        with pytest.raises(ValueError, match="no executed phases"):
+            service.replay_preview("never-ran", mode=ReplayMode.PARTIAL, boundary="phase:0")
     finally:
         service.close()

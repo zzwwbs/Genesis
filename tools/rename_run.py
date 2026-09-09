@@ -1,12 +1,18 @@
 """Re-keyed run copy: duplicate a run under a new id (all associated names).
 
 For presentation/illustration: the run row, every event payload, artifact
-payload, input reference, parent link, and the manifest are rewritten so the
-old run id no longer appears anywhere; the original run is untouched.
+payload, input reference and parent link are rewritten so the old run id no
+longer appears in the evidence; the original run is untouched.
 
     python tools/rename_run.py --run pilot-large-gate-3 --new-id baseline-realization-1
 
-The copy is an exploration-grade duplicate (same evidence, new identity);
+The manifest is the one exception. The run id is the seed identity, so the
+copy keeps the ORIGINAL identity in ``randomness_inputs`` (and records it as
+``renamed_from``) and re-derives its seeds from it. A manifest whose seeds do
+not follow from the identity it states cannot reconstruct the run it names,
+and ``import_run`` now rejects one.
+
+The copy is an exploration-grade duplicate (same evidence, new label);
 replay-grade provenance belongs to the original run row.
 """
 
@@ -52,18 +58,6 @@ def main() -> int:
             return 1
         run_payload = json.loads(row[0])
         manifest = run_payload.get("manifest") or {}
-        event_ids = [
-            r[0]
-            for r in con.execute(
-                "SELECT event_id FROM events WHERE run_id=?", (args.run,)
-            ).fetchall()
-        ]
-        artifact_ids = [
-            r[0]
-            for r in con.execute(
-                "SELECT artifact_id FROM artifacts WHERE run_id=?", (args.run,)
-            ).fetchall()
-        ]
     finally:
         con.close()
 
@@ -101,6 +95,32 @@ def main() -> int:
     source_build = run_payload.get("build") or run_payload.get("build_path") or ""
     if source_build:
         manifest["build"] = source_build
+
+    # The run id is the seed identity. Rewriting it by string replacement
+    # leaves the recorded seeds derivable only from the OLD id, producing a
+    # manifest that cannot reconstruct the run it names. Keep the original
+    # identity as the randomness contract (the copy is the same realization
+    # under a new label) and re-derive the seeds from it so the manifest stays
+    # self-consistent and passes import verification.
+    from genesis.service import GenesisService as _Service
+
+    randomness = manifest.get("randomness_inputs")
+    if not isinstance(randomness, dict):
+        randomness = {
+            "run_id": old,
+            "experiment_id": str(run_payload.get("experiment_id", "") or ""),
+            "condition_id": str(run_payload.get("condition_id", "base") or "base"),
+            "replication": int(run_payload.get("replication", 1) or 1),
+        }
+    else:
+        # rekey() rewrote the frozen identity too; restore the real one.
+        randomness = {**randomness, "run_id": old}
+    manifest["randomness_inputs"] = randomness
+    manifest["seeds"] = _Service.derive_manifest_seeds(
+        randomness, manifest.get("random_streams"), manifest.get("matching")
+    )
+    manifest["renamed_from"] = old
+
     run_payload["manifest"] = manifest
     run_payload["id"] = new
 
@@ -125,12 +145,14 @@ def main() -> int:
     service = GenesisService(WORKSPACE)
     try:
         result = service.import_run(bundle, run_id=new)
-        leftovers = (
-            sum(str(e).count(old) for e in events)
-            + sum(str(e).count(old) for e in artifacts)
-            + sum(str(e).count(old) for e in manifest)
+        # The manifest deliberately retains the original identity in
+        # randomness_inputs/renamed_from, so only events and artifacts are
+        # checked for leftover references to the old id.
+        leftovers = sum(str(e).count(old) for e in events) + sum(
+            str(e).count(old) for e in artifacts
         )
         result["old_id_occurrences_remaining"] = leftovers
+        result["randomness_identity"] = old
         print(json.dumps(result, default=str))
     finally:
         service.close()

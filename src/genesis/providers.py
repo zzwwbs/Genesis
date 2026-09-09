@@ -13,7 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -102,7 +102,7 @@ class ProviderExecutor:
             ]
         return validate_schema(self.output_schema or {}, value)
 
-    def _estimated_cost(self, usage: dict[str, int]) -> float | None:
+    def _estimated_cost(self, usage: Mapping[str, int]) -> float | None:
         """Estimate cost from usage and configured per-1k-token prices (AW-18)."""
         price_in = self.parameters.get("price_per_1k_input")
         price_out = self.parameters.get("price_per_1k_output")
@@ -111,6 +111,21 @@ class ProviderExecutor:
         return int(usage.get("prompt_tokens", 0)) / 1000 * float(price_in) + int(
             usage.get("completion_tokens", 0)
         ) / 1000 * float(price_out)
+
+    @staticmethod
+    def _total_usage(attempts: list[dict[str, Any]]) -> dict[str, int]:
+        """Token usage across every attempt, including discarded repairs.
+
+        A repaired invocation really did spend the failed attempts' tokens;
+        reporting only the accepted response understates usage and cost by a
+        factor of the attempt count.
+        """
+        total: dict[str, int] = {}
+        for attempt in attempts:
+            for key, value in (attempt.get("usage") or {}).items():
+                if isinstance(value, int) and not isinstance(value, bool):
+                    total[key] = total.get(key, 0) + value
+        return total
 
     def _outputs(self, value: Any) -> dict[str, Any]:
         outputs = {self.output_key: value}
@@ -134,15 +149,21 @@ class ProviderExecutor:
         self._raise_if_cancelled()
         started = time.perf_counter()
         response = self.provider.generate(request)
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        # Each attempt records the prompt that produced it and what it cost. A
+        # repair sends a DIFFERENT prompt, so one prompt hash and the last
+        # response's usage describe neither what was actually sent nor what was
+        # actually spent.
         provider_attempts = [
             {
                 "request_id": response.request_id,
+                "prompt_hash": prompt_hash,
+                "usage": dict(response.usage),
                 "raw_response": response.text,
                 "parsed_response": response.parsed,
             }
         ]
         latency_ms = (time.perf_counter() - started) * 1000
-        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
         value = response.parsed if response.parsed is not None else response.text
         if self.output_schema is not None:
             errors = self._schema_messages(value)
@@ -150,12 +171,15 @@ class ProviderExecutor:
             while errors and repairs < self.max_repairs:
                 self._raise_if_cancelled()
                 repairs += 1
-                request = ProviderRequest(
-                    model=self.model,
-                    prompt=prompt
+                repair_prompt = (
+                    prompt
                     + "\n\nValidation errors in your previous response: "
                     + "; ".join(errors)
-                    + "\nRespond again with a corrected JSON object.",
+                    + "\nRespond again with a corrected JSON object."
+                )
+                request = ProviderRequest(
+                    model=self.model,
+                    prompt=repair_prompt,
                     parameters=self.parameters,
                     context_hash=getattr(invocation.context, "content_hash", None),
                 )
@@ -163,12 +187,15 @@ class ProviderExecutor:
                 provider_attempts.append(
                     {
                         "request_id": response.request_id,
+                        "prompt_hash": hashlib.sha256(repair_prompt.encode()).hexdigest(),
+                        "usage": dict(response.usage),
                         "raw_response": response.text,
                         "parsed_response": response.parsed,
                     }
                 )
                 value = response.parsed if response.parsed is not None else response.text
                 errors = self._schema_messages(value)
+            latency_ms = (time.perf_counter() - started) * 1000
             metadata: dict[str, Any] = {
                 "mode": self.mode,
                 "provider": response.provider,
@@ -177,7 +204,8 @@ class ProviderExecutor:
                 "prompt_hash": prompt_hash,
                 "context_hash": request.context_hash,
                 "parameters": dict(request.parameters),
-                "usage": dict(response.usage),
+                "usage": self._total_usage(provider_attempts),
+                "final_usage": dict(response.usage),
                 "provider_metadata": dict(response.metadata),
                 "latency_ms": latency_ms,
                 "repair_count": repairs,
@@ -186,7 +214,7 @@ class ProviderExecutor:
                 "parsed_response": response.parsed,
                 "provider_attempts": provider_attempts,
             }
-            estimated = self._estimated_cost(response.usage)
+            estimated = self._estimated_cost(metadata["usage"])
             if estimated is not None:
                 metadata["estimated_cost"] = estimated
             if errors:
@@ -210,7 +238,8 @@ class ProviderExecutor:
                 "prompt_hash": prompt_hash,
                 "context_hash": request.context_hash,
                 "parameters": dict(request.parameters),
-                "usage": dict(response.usage),
+                "usage": self._total_usage(provider_attempts),
+                "final_usage": dict(response.usage),
                 "provider_metadata": dict(response.metadata),
                 "latency_ms": latency_ms,
                 "raw_response": response.text,
@@ -372,7 +401,7 @@ class OpenAICompatibleProvider:
             try:
                 raw, status = self._open_cancellable(http_request)
             except urllib.error.HTTPError as exc:
-                detail = exc.read().decode(errors="replace")[:2000]
+                detail = exc.read().decode(errors="replace")[:2000]  # for parameter repair
                 if attempts == 0:
                     fixed = self._unsupported_parameter_fix(payload, detail)
                     if fixed is not None:
@@ -384,8 +413,14 @@ class OpenAICompatibleProvider:
                         ]
                         attempts += 1
                         continue
+                # The provider's body routinely echoes the offending request —
+                # i.e. the prompt, which carries the authorized context. Keep a
+                # short, bounded excerpt out of the message that reaches event
+                # records and API callers, where the trace policy does not
+                # govern it; the full body stays on the chained exception.
+                summary = " ".join(detail.split())[:200]
                 raise ValueError(
-                    f"PROVIDER_HTTP: provider returned HTTP {exc.code}: {detail}"
+                    f"PROVIDER_HTTP: provider returned HTTP {exc.code}: {summary}"
                 ) from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 raise ValueError(f"PROVIDER_UNAVAILABLE: provider request failed: {exc}") from exc

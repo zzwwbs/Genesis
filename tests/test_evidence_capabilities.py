@@ -404,6 +404,10 @@ def test_reproducibility_bundle_includes_executable_build_files(tmp_path: Path) 
             "state_model.json",
             "artifact_catalog.json",
             "outcome_plan.json",
+            # F3-regression: without these the restored build cannot rebuild
+            # live executors for partial/branch re-execution.
+            "model_profiles.json",
+            "prompt_templates.json",
         ):
             assert (bundle / name).is_file(), f"missing executable build file {name}"
         manifest = json.loads((bundle / "bundle_manifest.json").read_text())
@@ -477,6 +481,10 @@ def test_reproducibility_import_restores_build_and_replays(tmp_path: Path) -> No
             # Replay works against the verified build.
             replay = importer.replay_run("imported-full", mode=ReplayMode.FULL)
             assert replay["run_id"].startswith("imported-full-replay-")
+            # ARTIFACT retrieval must also resolve the workspace-relative build
+            # ref of the restored import (F3/F4 regression: _generative_process_ids).
+            artifact = importer.replay_run("imported-full", mode=ReplayMode.ARTIFACT)
+            assert artifact["run_id"] == "imported-full"
         finally:
             importer.close()
     finally:

@@ -6,6 +6,7 @@ import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, cast
 
 from genesis import __version__
 
@@ -54,7 +55,82 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("path", nargs="?", default=".")
         command.add_argument("--output", "-o", default=None)
         command.add_argument("--run-id", default=None)
+        if name == "replay":
+            # Parity with the API: the CLI can reach partial and branch replay,
+            # not only whole-trajectory reuse.
+            command.add_argument(
+                "--mode",
+                default="full",
+                choices=["full", "artifact", "partial", "branch"],
+                help="Replay mode",
+            )
+            command.add_argument(
+                "--boundary", default=None, help="Freeze boundary, e.g. 'phase:3' or 'event:<id>'"
+            )
+            command.add_argument(
+                "--artifact-id",
+                action="append",
+                default=None,
+                dest="artifact_ids",
+                help="Recorded artifact to retrieve (artifact mode; repeatable)",
+            )
+            command.add_argument(
+                "--justification", default=None, help="Required rationale for a branch"
+            )
+            command.add_argument(
+                "--override",
+                action="append",
+                default=None,
+                dest="overrides",
+                metavar="FACTOR=VALUE",
+                help="Branchable factor override (branch mode; repeatable)",
+            )
+        if name == "export":
+            command.add_argument(
+                "--mode",
+                default="exploration",
+                choices=["exploration", "reproducibility"],
+                help="Bundle capability level",
+            )
     return parser
+
+
+def _replay(service: Any, run_id: str, args: Any) -> dict[str, Any]:
+    """Run one replay, confirming the digest-bound preview where required."""
+    from genesis.replay import ReplayMode
+
+    mode = ReplayMode(str(getattr(args, "mode", "full")))
+    overrides: dict[str, Any] = {}
+    for item in getattr(args, "overrides", None) or []:
+        if "=" not in item:
+            raise SystemExit(f"replay override must be FACTOR=VALUE: {item}")
+        factor, value = item.split("=", 1)
+        overrides[factor] = value
+    boundary = getattr(args, "boundary", None)
+    artifact_ids = tuple(getattr(args, "artifact_ids", None) or ())
+    justification = getattr(args, "justification", None)
+    preview_token = None
+    if mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH}:
+        preview = service.replay_preview(
+            run_id,
+            mode=mode,
+            boundary=boundary,
+            overrides=overrides or None,
+            justification=justification,
+        )
+        preview_token = preview["preview_token"]
+    return cast(
+        "dict[str, Any]",
+        service.replay_run(
+            run_id,
+            mode=mode,
+            artifact_ids=artifact_ids,
+            boundary=boundary,
+            overrides=overrides or None,
+            justification=justification,
+            preview_token=preview_token,
+        ),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -190,7 +266,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             elif args.command == "outcomes":
                 result = {"run_id": run_id, "outcomes": service.evaluate_outcomes(run_id)}
             else:
-                result = service.replay_run(run_id)
+                result = _replay(service, run_id, args)
             print(json.dumps(result))
         finally:
             service.close()
@@ -201,7 +277,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         service = GenesisService(args.path)
         try:
-            paths = service.export_run(args.run_id or "run-1", args.output)
+            paths = service.export_run(
+                args.run_id or "run-1", args.output, mode=str(getattr(args, "mode", "exploration"))
+            )
             print(json.dumps({"paths": [str(path) for path in paths], "status": "exported"}))
         finally:
             service.close()

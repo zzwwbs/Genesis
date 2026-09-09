@@ -212,6 +212,11 @@ class ProcessSpec(StrictModel):
     trace_policy: TracePolicy = Field(default_factory=TracePolicy)
     retry_policy: dict[str, Any] = Field(default_factory=dict)
     terminal_skip: bool = False
+    # A measurement process observes the simulated world to produce a research
+    # observable. Its outputs must not re-enter the behaviour being measured;
+    # declaring it here lets that isolation be checked for any package instead
+    # of by naming a particular study's processes.
+    measurement: bool = False
     origin: OriginMetadata | None = None
     approval: ApprovalMetadata | None = None
 
@@ -401,7 +406,14 @@ class ArtifactSpec(StrictModel):
     artifact_type: str | None = None
     schema_ref: StableId | None = None
     owner: StableId | None = None
+    # Study-defined vocabulary describing who the artifact is FOR (e.g.
+    # "private", "platform"). Access is decided by the context policy that
+    # admits it, not by this label; it documents intent and is what the
+    # measurement-isolation check reads. Do not read it as an enforced boundary.
     visibility: str | None = None
+    # How long an instance stays resolvable as an input. Round-equivalent
+    # scopes ("round", "phase", "event", "invocation") are enforced at input
+    # resolution; anything else persists for the run.
     lifecycle_scope: str | None = None
     origin: OriginMetadata | None = None
     approval: ApprovalMetadata | None = None
@@ -508,14 +520,51 @@ class OutcomeDatasetField(StrictModel):
     else_value: Any | None = None
 
 
+class OutcomeDatasetFilter(StrictModel):
+    """One equality/comparison predicate narrowing a dataset's rows."""
+
+    field: str
+    op: Literal["eq", "ne", "lt", "lte", "gt", "gte", "truthy", "falsy"] = "eq"
+    value: Any | None = None
+
+
 class OutcomeDataset(StrictModel):
     """A named, versioned row relation feeding one or more outcomes."""
 
     id: StableId
     source: OutcomeDatasetSource
     fields: list[OutcomeDatasetField] = Field(default_factory=list)
+    # Narrowing belongs to the relation, not only to the outcomes reading it:
+    # a trace seed selects rows without defining an outcome over them.
+    where: list[OutcomeDatasetFilter] = Field(default_factory=list)
     deduplicate_on: list[str] = Field(default_factory=list)
     missing: Literal["retain_null", "drop"] = "retain_null"
+
+
+class TraceSeed(StrictModel):
+    """Which recorded invocation a declared trace starts from."""
+
+    dataset: StableId
+    order_by: list[str] = Field(default_factory=lambda: ["phase", "commit_order"])
+    select: Literal["first", "last"] = "first"
+
+
+class TraceSpec(StrictModel):
+    """A declared trajectory trace (spec: inspectable traceability).
+
+    Traversal is generic — it follows the causal parents and artifact lineage
+    every run records — so a study declares only where a chain starts and what
+    to call its steps.
+    """
+
+    id: StableId
+    title: str | None = None
+    seed: TraceSeed
+    labels: dict[str, str] = Field(default_factory=dict)
+    depth: int = 12
+    # How many steps the chain returns before keeping only the nearest
+    # relations. A caller may override it per request.
+    max_steps: int = 40
 
 
 class OutcomeSpec(StrictModel):
@@ -535,6 +584,7 @@ class OutcomeSpec(StrictModel):
 class OutcomesSpec(CanonicalArtifact):
     outcomes: list[OutcomeSpec] = Field(default_factory=list)
     datasets: list[OutcomeDataset] = Field(default_factory=list)
+    traces: list[TraceSpec] = Field(default_factory=list)
 
 
 class ModelProfile(StrictModel):

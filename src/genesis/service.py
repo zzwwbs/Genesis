@@ -8,6 +8,8 @@ import json
 import os
 import re
 import shutil
+import stat
+import statistics
 import tempfile
 import threading
 from collections.abc import Callable, Iterator, Mapping
@@ -52,7 +54,12 @@ from genesis.execution_manifest import (
     scientific_config_digest,
 )
 from genesis.extensions import ExtensionManifest, ExtensionRegistry
-from genesis.outcome_plan import compile_outcome_plan, materialize_datasets
+from genesis.outcome_plan import (
+    _INCOMPLETE_ROUND,
+    compile_outcome_plan,
+    materialize_datasets,
+    outcome_plan_digest,
+)
 from genesis.persistence import ObjectRef, PersistenceCoordinator
 from genesis.providers import (
     OpenAICompatibleProvider,
@@ -61,6 +68,7 @@ from genesis.providers import (
 )
 from genesis.replay import ReplayMode
 from genesis.runtime import (
+    STATE_VALUE_TYPES,
     ArtifactStore,
     CallableExecutor,
     ContextEngine,
@@ -79,16 +87,10 @@ from genesis.runtime import (
 )
 from genesis.schema_validation import PackageSchemaCatalog, SchemaDiagnostic, SchemaValidationError
 from genesis.specification.models import StrictModel
+from genesis.tracing import DEFAULT_DEPTH, DEFAULT_MAX_STEPS, build_chain, resolve_seed
 
-_STATE_TYPES: dict[str, type] = {
-    "integer": int,
-    "number": float,
-    "string": str,
-    "boolean": bool,
-    "array": list,
-    "object": dict,
-    "json": dict,
-}
+# One declared vocabulary, shared with the compiler's validation.
+_STATE_TYPES = STATE_VALUE_TYPES
 
 
 class _ElicitationOutputFailure(ValueError):
@@ -340,17 +342,20 @@ def _diff_form_fields(current: dict[str, Any], proposal: dict[str, Any]) -> list
     return operations
 
 
-def _dispatch_bounded(pool: Any, worker: Any, trials: list[str], max_in_flight: int) -> list[bool]:
+def _dispatch_bounded(
+    pool: Any, worker: Any, trials: list[str], max_in_flight: int
+) -> list[tuple[bool, str]]:
     """Bounded result-queue dispatch (AW-13).
 
     At most ``max_in_flight`` futures are in flight at once; results arrive on
     the queue and are collected in submission order, giving both backpressure
-    and a deterministic result order.
+    and a deterministic result order. Each result is (ok, diagnostic) so a
+    failure is reported rather than reduced to a bare False.
     """
     from concurrent.futures import FIRST_COMPLETED, Future, wait
 
-    pending: dict[Future[bool], int] = {}
-    results: list[tuple[int, bool]] = []
+    pending: dict[Future[tuple[bool, str]], int] = {}
+    results: list[tuple[int, tuple[bool, str]]] = []
     next_index = 0
     while next_index < len(trials) or pending:
         while next_index < len(trials) and len(pending) < max(1, int(max_in_flight)):
@@ -358,14 +363,17 @@ def _dispatch_bounded(pool: Any, worker: Any, trials: list[str], max_in_flight: 
             next_index += 1
         done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
         for future in done:
-            results.append(
-                (
-                    pending.pop(future),
-                    bool(future.result()) if future.exception() is None else False,
+            index = pending.pop(future)
+            error = future.exception()
+            if error is not None:
+                results.append((index, (False, f"{type(error).__name__}: {error}")))
+            else:
+                outcome = future.result()
+                results.append(
+                    (index, outcome if isinstance(outcome, tuple) else (bool(outcome), ""))
                 )
-            )
     results.sort(key=lambda item: item[0])
-    return [ok for _, ok in results]
+    return [outcome for _, outcome in results]
 
 
 def _workflows_root() -> Path:
@@ -392,18 +400,21 @@ def _workflow_schema(name: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _run_trial_worker(workspace: str, trial_id: str) -> bool:
+def _run_trial_worker(workspace: str, trial_id: str) -> tuple[bool, str]:
     """Process-pool worker: opens its own coordinator and executes one trial.
 
     A fresh GenesisService per worker keeps SQLite connections process-local;
     the shared database is serialized by WAL plus busy timeout (AW-13).
+    Returns (ok, diagnostic) so a failed realization reports WHY rather than
+    disappearing into a bare "partial" protocol status.
     """
     service = GenesisService(workspace)
     try:
         service.execute_run(trial_id)
-        return bool(service.get_run(trial_id)["status"] == "completed")
-    except Exception:
-        return False
+        status = str(service.get_run(trial_id)["status"])
+        return (status == "completed", "" if status == "completed" else f"status={status}")
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
     finally:
         service.close()
 
@@ -481,9 +492,33 @@ def _check_profile_drift(
         )
 
 
+def _replayed_result(record: Mapping[str, Any], *, source_run_id: str, process_id: str) -> Any:
+    """Rebuild a recorded invocation's full committed result, not only outputs."""
+    from genesis.runtime import ProcessResult
+
+    return ProcessResult(
+        outputs=dict(record.get("outputs") or {}),
+        state_effects=dict(record.get("state_effects") or {}),
+        events=tuple(record.get("events") or ()),
+        scheduling_effects=tuple(record.get("scheduling_effects") or ()),
+        metadata={
+            "recorded": True,
+            "source_run_id": source_run_id,
+            "process_id": process_id,
+        },
+    )
+
+
 class _SelectiveExecutor:
     """Partial-replay dispatcher: frozen invocations replay recorded outputs,
-    everything else executes through the live fallback executor (finding 5)."""
+    everything else executes through the live fallback executor (finding 5).
+
+    The frozen prefix is a research guarantee, so a divergence inside it is an
+    error rather than a silent live invocation: an invocation inside the frozen
+    prefix with no matching recording means the replayed trajectory no longer
+    follows the recorded one, and continuing would generate new content where
+    the researcher expects fixed evidence.
+    """
 
     def __init__(
         self,
@@ -493,22 +528,51 @@ class _SelectiveExecutor:
         fallback: Any,
         source_run_id: str,
         process_id: str,
+        phase_boundary: int | float | None = None,
+        inclusive: bool = False,
+        known_keys: set[tuple[Any, ...]] | None = None,
     ):
         self._records = list(records)
         self._frozen_keys = frozen_keys
         self._fallback = fallback
         self.source_run_id = source_run_id
         self.process_id = process_id
+        self._phase_boundary = phase_boundary
+        # An event boundary sits INSIDE a phase, so the whole boundary phase
+        # counts as prefix for an invocation with no source counterpart.
+        self._inclusive = inclusive
+        # Every invocation of this process the SOURCE performed, frozen or not.
+        # An invocation the source made after the boundary is a legitimate
+        # suffix invocation and re-executes live; one the source never made is
+        # a divergence when it lands inside the prefix.
+        self._known_keys = set(known_keys or frozen_keys)
 
     @staticmethod
     def _key(invocation: ProcessInvocation) -> tuple[Any, ...]:
         actors = tuple(invocation.actor_ids) if invocation.actor_ids else ()
         return (invocation.phase, invocation.attempt, actors)
 
-    def execute(self, invocation: ProcessInvocation) -> Any:
-        from genesis.runtime import ProcessResult
+    def _diverged(self, invocation: ProcessInvocation, key: tuple[Any, ...]) -> ValueError:
+        return ValueError(
+            "REPLAY_PREFIX_DIVERGED: the frozen prefix of run "
+            f"'{self.source_run_id}' has no recorded invocation of "
+            f"'{self.process_id}' at phase={invocation.phase} "
+            f"attempt={invocation.attempt} actors={list(key[2])}; "
+            "the replayed trajectory diverged from the recorded one before the "
+            "boundary, so the prefix cannot be held fixed"
+        )
 
+    def execute(self, invocation: ProcessInvocation) -> Any:
         key = self._key(invocation)
+        # A phase boundary freezes every invocation at phase < N (see
+        # _frozen_invocation_keys); phase >= N is the re-executed suffix. An
+        # event boundary cannot order a never-recorded invocation within its own
+        # phase, so that phase is prefix too.
+        within_prefix = self._phase_boundary is not None and (
+            invocation.phase <= self._phase_boundary
+            if self._inclusive
+            else invocation.phase < self._phase_boundary
+        )
         if key in self._frozen_keys:
             # Actor-parity matching, equivalent to _RecordedExecutor: prefer the
             # record with identical actors, then any record for the phase.
@@ -518,27 +582,88 @@ class _SelectiveExecutor:
                     and record.get("attempt") == invocation.attempt
                     and (record.get("actors") == key[2] or not key[2])
                 ):
-                    return ProcessResult(
-                        outputs=dict(record["outputs"]),
-                        metadata={
-                            "recorded": True,
-                            "source_run_id": self.source_run_id,
-                            "process_id": self.process_id,
-                        },
+                    return _replayed_result(
+                        record,
+                        source_run_id=self.source_run_id,
+                        process_id=self.process_id,
                     )
+            # Only actor-less (legacy) recordings may match on phase alone.
             for record in self._records:
                 if (
                     record.get("phase") == invocation.phase
                     and record.get("attempt") == invocation.attempt
+                    and not record.get("actors")
                 ):
-                    return ProcessResult(
-                        outputs=dict(record["outputs"]),
-                        metadata={
-                            "recorded": True,
-                            "source_run_id": self.source_run_id,
-                            "process_id": self.process_id,
-                        },
+                    return _replayed_result(
+                        record,
+                        source_run_id=self.source_run_id,
+                        process_id=self.process_id,
                     )
+            # The key was declared frozen but carries no usable record.
+            raise self._diverged(invocation, key)
+        # An invocation the source also performed (after the boundary) is a
+        # legitimate suffix invocation even inside the boundary phase.
+        if within_prefix and key not in self._known_keys:
+            raise self._diverged(invocation, key)
+        if self._fallback is None:
+            raise RuntimeError(
+                f"REPLAY_EXECUTION: no live executor for unfrozen process '{self.process_id}'"
+            )
+        return self._fallback.execute(invocation)
+
+
+class _FrozenPrefixGuard:
+    """Reject generation inside the frozen prefix for an unrecorded process.
+
+    A process the source run never performed (or performed only after the
+    boundary) receives no recorded substitute, so nothing otherwise stopped its
+    live executor from being invoked inside the prefix — a branch that changes
+    a condition can make a previously idle generative process fire there. That
+    would produce new content in the stretch of trajectory the researcher
+    declared fixed, so it is an error; outside the prefix the live executor
+    runs normally.
+    """
+
+    def __init__(
+        self,
+        fallback: Any,
+        *,
+        source_run_id: str,
+        process_id: str,
+        phase_boundary: int | float,
+        inclusive: bool = False,
+    ):
+        self._fallback = fallback
+        self.source_run_id = source_run_id
+        self.process_id = process_id
+        self._phase_boundary = phase_boundary
+        # An event boundary sits INSIDE a phase. A never-recorded invocation
+        # cannot be ordered against that event, so the whole boundary phase is
+        # treated as prefix: refusing a suffix invocation is recoverable (pick a
+        # phase boundary), generating inside a frozen prefix is not.
+        self._inclusive = inclusive
+
+    def execute(self, invocation: ProcessInvocation) -> Any:
+        inside = (
+            invocation.phase <= self._phase_boundary
+            if self._inclusive
+            else invocation.phase < self._phase_boundary
+        )
+        if inside:
+            raise ValueError(
+                "REPLAY_PREFIX_DIVERGED: generative process "
+                f"'{self.process_id}' would run at phase={invocation.phase}, "
+                f"inside the frozen prefix of run '{self.source_run_id}', but the "
+                "source run recorded no invocation there; the prefix cannot be "
+                "held fixed"
+                + (
+                    ". An event boundary cannot order an unrecorded invocation "
+                    "within its own phase, so the whole phase is treated as "
+                    "prefix; use a phase boundary to re-execute inside it."
+                    if self._inclusive
+                    else ""
+                )
+            )
         if self._fallback is None:
             raise RuntimeError(
                 f"REPLAY_EXECUTION: no live executor for unfrozen process '{self.process_id}'"
@@ -550,7 +675,10 @@ class _RecordedExecutor:
     """Replay substitution: returns recorded outputs without a provider call.
 
     Selects the recorded output whose invocation coordinates match the current
-    invocation (phase, attempt, actors); the last occurrence is the fallback.
+    invocation (phase, attempt, actors). An invocation the source run never
+    performed has no faithful recording, so it raises rather than substituting
+    an unrelated record: replay must not present another actor's or round's
+    artifact as ``recorded``.
     """
 
     def __init__(
@@ -565,6 +693,7 @@ class _RecordedExecutor:
         self.process_id = process_id
 
     def _select(self, invocation: ProcessInvocation) -> Mapping[str, Any]:
+        """The recorded invocation matching these coordinates (whole record)."""
         actors = tuple(invocation.actor_ids) if invocation.actor_ids else ()
         for record in self._records:
             if (
@@ -572,22 +701,30 @@ class _RecordedExecutor:
                 and record["attempt"] == invocation.attempt
                 and (record["actors"] == actors or not actors)
             ):
-                return cast(Mapping[str, Any], record["outputs"])
+                return record
+        # Legacy recordings carry NO actor identity; only those may be matched
+        # on phase and attempt alone. A recording that names a different actor
+        # is another actor's evidence, not this invocation's.
         for record in self._records:
-            if record["phase"] == invocation.phase and record["attempt"] == invocation.attempt:
-                return cast(Mapping[str, Any], record["outputs"])
-        return cast(Mapping[str, Any], self._records[-1]["outputs"])
+            if (
+                record["phase"] == invocation.phase
+                and record["attempt"] == invocation.attempt
+                and not record["actors"]
+            ):
+                return record
+        raise ValueError(
+            "REPLAY_RECORD_MISSING: no recorded invocation of "
+            f"'{self.process_id}' in run '{self.source_run_id}' matches "
+            f"phase={invocation.phase} attempt={invocation.attempt} "
+            f"actors={list(actors)}; the replayed trajectory diverged from the "
+            "recorded one"
+        )
 
     def execute(self, invocation: ProcessInvocation) -> Any:
-        from genesis.runtime import ProcessResult
-
-        return ProcessResult(
-            outputs=dict(self._select(invocation)),
-            metadata={
-                "recorded": True,
-                "source_run_id": self.source_run_id,
-                "process_id": self.process_id,
-            },
+        return _replayed_result(
+            self._select(invocation),
+            source_run_id=self.source_run_id,
+            process_id=self.process_id,
         )
 
 
@@ -822,6 +959,9 @@ class GenesisService:
         path = self._model_profiles_path()
         temporary = path.with_name(f".{path.name}.tmp")
         temporary.write_text(json.dumps(dict(profiles), indent=2, sort_keys=True) + "\n")
+        # A profile may hold a pasted API key, so the file is owner-only rather
+        # than whatever the umask allows.
+        temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
         os.replace(temporary, path)
 
     @staticmethod
@@ -1711,6 +1851,13 @@ class GenesisService:
                     str(key): hashlib.sha256(str(value).encode()).hexdigest()[:16]
                     for key, value in prompts.items()
                 }
+            # Pin the predeclared observables alongside the rest of the
+            # configuration, so a run records which measurement plan produced
+            # its outcomes.
+            if (build_path / "outcome_plan.json").is_file():
+                manifest["outcome_plan_digest"] = outcome_plan_digest(
+                    compile_outcome_plan(build_path)
+                )
         # Resolved runtime profile parameters plus the endpoint identity.
         resolved: dict[str, Any] = {}
         for profile_id in manifest.get("model_versions", {}):
@@ -1745,57 +1892,19 @@ class GenesisService:
                     }
                     for extension in manifests
                 }
-        condition_id = str(manifest["condition_id"])
-        replication = int(manifest["replication"])
         matching = protocol.get("matching", {})
         matching = matching if isinstance(matching, dict) else {}
-        shared_streams = matching.get("shared_streams", [])
-        matched = matching.get("enabled") is True and isinstance(shared_streams, list)
         # RPL/§2.2: a replay child derives randomness from the ROOT source identity,
         # never from its own child run ID or from an intermediate replay in a
         # lineage, so recorded streams and runtime draws stay stable across
         # child IDs, replay-of-replay, imports and creation times.
-        seed_identity = self._root_source_run_id(run)
-        # The seed inputs are the root run's identity: experiment, condition
-        # and replication are inherited from the ROOT source, and a derived
-        # branch condition identity or an empty child experiment id must not
-        # change the RNG derivation (F5).
-        seed_condition_id = condition_id
-        seed_replication = replication
-        seed_experiment_id = str(run.get("experiment_id", ""))
-        if run.get("replay_of"):
-            try:
-                root = self.get_run(seed_identity)
-                seed_condition_id = str(root.get("condition_id", condition_id))
-                seed_replication = int(root.get("replication", replication))
-                seed_experiment_id = str(root.get("experiment_id", seed_experiment_id))
-            except KeyError:
-                pass
-        streams: dict[str, Any] = {
-            "conventional": derive_seed(
-                0,
-                seed_identity,
-                "run-manifest",
-                experiment_id=seed_experiment_id,
-                condition_id=seed_condition_id,
-                replication=seed_replication,
-                matching_key=(
-                    "conventional" if matched and "conventional" in shared_streams else None
-                ),
-            )
-        }
-        for stream in manifest.get("random_streams", []):
-            if isinstance(stream, dict) and stream.get("id"):
-                stream_id = str(stream["id"])
-                streams[stream_id] = derive_seed(
-                    int(stream.get("seed", 0)),
-                    seed_identity,
-                    stream_id,
-                    experiment_id=seed_experiment_id,
-                    condition_id=seed_condition_id,
-                    replication=seed_replication,
-                    matching_key=(stream_id if matched and stream_id in shared_streams else None),
-                )
+        randomness = self._randomness_inputs(run)
+        manifest["randomness_inputs"] = randomness
+        # Retain the matching block so the seeds stay independently derivable
+        # from the manifest alone (see verify_manifest_seeds).
+        if matching:
+            manifest["matching"] = dict(matching)
+        streams = self.derive_manifest_seeds(randomness, manifest.get("random_streams"), matching)
         manifest["seeds"] = streams
         # Effective execution identity (spec §2.2): one immutable manifest
         # resolved before execution, with the package closure digest pinned at
@@ -1962,16 +2071,25 @@ class GenesisService:
             if target_order is None:
                 raise ValueError(f"REPLAY_BOUNDARY: unknown source event '{event_boundary}'")
         # Earliest committed order of each invocation in the source trace.
+        # Only an event boundary needs it, so a phase boundary does not read
+        # the trace at all.
         invocation_order: dict[str, int] = {}
-        for order, event in enumerate(self.trace_run(run_id)):
-            invocation = str(event.get("invocation_id", ""))
-            if invocation and invocation not in invocation_order:
-                invocation_order[invocation] = order
+        if event_boundary is not None:
+            for order, event in enumerate(self.trace_run(run_id)):
+                invocation = str(event.get("invocation_id", ""))
+                if invocation and invocation not in invocation_order:
+                    invocation_order[invocation] = order
+        # Keys carry the process id: invocation coordinates alone are shared
+        # across processes that run in the same phase for the same actors, so a
+        # pooled key set froze recordings belonging to processes that were
+        # never inside the prefix.
         frozen: set[tuple[Any, ...]] = set()
-        for records in recorded.values():
+        for process_id, records in recorded.items():
             for record in records:
                 if phase_boundary is not None and record["phase"] < phase_boundary:
-                    frozen.add((record["phase"], record["attempt"], record["actors"]))
+                    frozen.add(
+                        (str(process_id), record["phase"], record["attempt"], record["actors"])
+                    )
         if event_boundary is not None:
             artifacts = self.artifacts_for_run(run_id)
             for artifact in artifacts:
@@ -1988,6 +2106,7 @@ class GenesisService:
                 ):
                     frozen.add(
                         (
+                            str(payload.get("process_id", "")),
                             int(payload.get("phase", 0)),
                             int(payload.get("attempt", 1)),
                             tuple(str(item) for item in payload.get("actors", [])),
@@ -2198,7 +2317,7 @@ class GenesisService:
             "public": {"allow": []},
             "none": {"allow": []},
         }
-        state_schema: dict[str, type] = {}
+        state_schema: dict[str, type | tuple[type, ...]] = {}
         initial_state: dict[str, Any] = {}
         artifact_catalog: dict[str, Any] = {}
         build_ref = run.get("build") or run.get("build_path")
@@ -2233,9 +2352,13 @@ class GenesisService:
                 if not isinstance(state, dict) or not state.get("id"):
                     continue
                 field = str(state["id"])
-                state_schema[field] = _STATE_TYPES.get(
-                    str(state.get("value_type", "object")), object
-                )
+                declared_type = str(state.get("value_type", "object"))
+                if declared_type not in _STATE_TYPES:
+                    raise ValueError(
+                        f"STATE_VALUE_TYPE: state '{field}' declares unknown value_type "
+                        f"'{declared_type}'; expected one of {sorted(_STATE_TYPES)}"
+                    )
+                state_schema[field] = _STATE_TYPES[declared_type]
                 if state.get("initial") is not None:
                     initial_state[field] = state["initial"]
             artifact_entries = json.loads((build_path / "artifact_catalog.json").read_text())
@@ -2315,24 +2438,13 @@ class GenesisService:
             # (possibly empty) experiment id or a derived branch condition id.
             # The intervention (effective) condition is still supplied as the
             # invocation input; only the seed inputs are root-inherited.
-            root_id = self._root_source_run_id(run)
-            seed_experiment_id = str(run.get("experiment_id", ""))
-            seed_condition_id = str(run.get("condition_id", "base"))
-            seed_replication = int(run.get("replication", 1))
-            if run.get("replay_of"):
-                try:
-                    root = self.get_run(root_id)
-                    seed_experiment_id = str(root.get("experiment_id", seed_experiment_id))
-                    seed_condition_id = str(root.get("condition_id", seed_condition_id))
-                    seed_replication = int(root.get("replication", seed_replication))
-                except KeyError:
-                    pass
+            randomness = self._randomness_inputs(run)
             controller.run(
                 run_id,
-                experiment_id=seed_experiment_id,
-                condition_id=seed_condition_id,
-                replication=seed_replication,
-                seed_identity=self._root_source_run_id(run),
+                experiment_id=randomness["experiment_id"],
+                condition_id=randomness["condition_id"],
+                replication=randomness["replication"],
+                seed_identity=randomness["run_id"],
                 phase_start=int(protocol.get("time_model", {}).get("start") or 0)
                 if build_ref
                 else 0,
@@ -2364,6 +2476,8 @@ class GenesisService:
         if controller.status == "cancelled":
             return self.persistence.transition_run(run_id, "cancelled", latest["version"])
         if controller.status == "paused":
+            if latest["status"] == "paused":
+                return latest
             return self.persistence.transition_run(run_id, "paused", latest["version"])
         return self.persistence.transition_run(run_id, "completed", latest["version"])
 
@@ -2454,12 +2568,13 @@ class GenesisService:
                         raise
                 trial_ids.append(trial_id)
 
-        def dispatch_one(trial_id: str) -> bool:
+        def dispatch_one(trial_id: str) -> tuple[bool, str]:
             try:
                 self.execute_run(trial_id, executor_overrides=executor_overrides)
-                return bool(self.get_run(trial_id)["status"] == "completed")
-            except Exception:
-                return False
+                status = str(self.get_run(trial_id)["status"])
+                return (status == "completed", "" if status == "completed" else f"status={status}")
+            except Exception as exc:
+                return False, f"{type(exc).__name__}: {exc}"
 
         worker_kind = str(worker_kind or ("thread" if executor_overrides else "process"))
         if parallel and max_workers > 1:
@@ -2482,34 +2597,102 @@ class GenesisService:
         else:
             outcomes = [dispatch_one(trial_id) for trial_id in trial_ids]
         run_ids = trial_ids
-        failed_ids = [trial_id for trial_id, ok in zip(trial_ids, outcomes, strict=True) if not ok]
-        aggregates: list[dict[str, Any]] = []
-        collected: dict[str, list[Any]] = {}
-        for trial_id in run_ids:
-            for row in self.evaluate_outcomes(trial_id):
-                for key, value in row.items():
-                    if key == "outcome_id" or value is None:
-                        continue
-                    collected.setdefault(f"{row['outcome_id']}:{key}", []).append(value)
-        for label, values in sorted(collected.items()):
-            numeric = [value for value in values if isinstance(value, (int, float))]
-            outcome_id, field = label.split(":", 1)
-            aggregates.append(
-                {
-                    "outcome_id": outcome_id,
-                    "field": field,
-                    "runs": len(values),
-                    "mean": float(sum(numeric) / len(numeric)) if numeric else None,
-                }
-            )
+        failures = {
+            trial_id: diagnostic
+            for trial_id, (ok, diagnostic) in zip(trial_ids, outcomes, strict=True)
+            if not ok
+        }
+        failed_ids = list(failures)
+        aggregates = self._cross_run_aggregates(run_ids)
         summary = {
             "experiment_id": run_id,
             "runs": run_ids,
             "failed_runs": failed_ids,
+            "failures": failures,
             "aggregates": aggregates,
         }
         self.append_run_collection(run_id, "outcomes", summary)
         return {**summary, "status": "completed" if not failed_ids else "partial"}
+
+    def _outcome_groupings(self, run_id: str) -> dict[str, tuple[str, ...]]:
+        """Declared grouping keys per outcome id, from the run's pinned plan."""
+        run = self.get_run(run_id)
+        build_ref = run.get("build") or run.get("build_path")
+        if not build_ref:
+            return {}
+        try:
+            plan = compile_outcome_plan(self.resolve_path(build_ref))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+        groupings: dict[str, tuple[str, ...]] = {}
+        for definition in plan.get("outcomes", []):
+            if not isinstance(definition, Mapping) or not definition.get("id"):
+                continue
+            declared = definition.get("grouping", [])
+            if isinstance(declared, str):
+                declared = [declared]
+            groupings[str(definition["id"])] = tuple(
+                str(name) for name in declared if isinstance(name, str)
+            )
+        return groupings
+
+    def _cross_run_aggregates(self, run_ids: list[str]) -> list[dict[str, Any]]:
+        """Summarize one measure across realizations OF THE SAME GROUP.
+
+        Outcome rows carry their declared grouping keys (condition, phase, ...).
+        Pooling every row of an outcome into one mean mixed distinct
+        experimental conditions and phases into a single number, which is
+        exactly the conflation cross-realization stability must avoid. Values
+        are therefore grouped by their declared keys, and each group reports
+        dispersion alongside the mean so within-configuration variation is
+        visible rather than averaged away.
+        """
+        # Reserved row keys are identity/annotation, not measures or groupings.
+        reserved = {"outcome_id", "run_id"}
+        collected: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for trial_id in run_ids:
+            declared_groupings = self._outcome_groupings(trial_id)
+            for row in self.evaluate_outcomes(trial_id):
+                outcome_id = str(row.get("outcome_id", ""))
+                group_names = declared_groupings.get(outcome_id, ())
+                grouping = {name: row.get(name) for name in group_names if name in row}
+                measures = {
+                    key: value
+                    for key, value in row.items()
+                    if key not in reserved
+                    and key not in grouping
+                    and not key.startswith("group_")
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                }
+                group_key = tuple(
+                    sorted((str(k), json.dumps(v, default=str)) for k, v in grouping.items())
+                )
+                for field, value in measures.items():
+                    entry = collected.setdefault(
+                        (outcome_id, field, group_key),
+                        {
+                            "outcome_id": outcome_id,
+                            "field": field,
+                            "group": dict(grouping),
+                            "values": [],
+                        },
+                    )
+                    entry["values"].append(float(value))
+        aggregates: list[dict[str, Any]] = []
+        for _key, entry in sorted(collected.items(), key=lambda item: str(item[0])):
+            values = entry.pop("values")
+            aggregates.append(
+                {
+                    **entry,
+                    "runs": len(values),
+                    "mean": float(sum(values) / len(values)) if values else None,
+                    "stdev": float(statistics.stdev(values)) if len(values) > 1 else 0.0,
+                    "min": min(values) if values else None,
+                    "max": max(values) if values else None,
+                }
+            )
+        return aggregates
 
     def trace_run(self, run_id: str) -> list[dict[str, Any]]:
         run = self.get_run(run_id)
@@ -2681,10 +2864,16 @@ class GenesisService:
             if phase_boundary < 0:
                 raise ValueError("REPLAY_BOUNDARY_UNSUPPORTED: phase boundary must be non-negative")
             executed_phases = {int(event.get("phase", 0)) for event in self.trace_run(run_id)}
-            # F9: a phase boundary is only valid up to one past the last
-            # executed phase (the terminal state after the run completed);
-            # anything beyond claims a checkpoint with no retained evidence.
-            if executed_phases and phase_boundary > (max(executed_phases) + 1):
+            # F9: a phase boundary requires actual source execution evidence.
+            # An empty trace (a run that never executed) has no checkpoint at
+            # any phase, and beyond the last executed phase there is nothing.
+            if not executed_phases:
+                raise ValueError(
+                    "REPLAY_BOUNDARY_UNSUPPORTED: source run has no executed "
+                    "phases; there is no checkpoint evidence for phase "
+                    f"boundary {phase_boundary}"
+                )
+            if phase_boundary > (max(executed_phases) + 1):
                 raise ValueError(
                     "REPLAY_BOUNDARY_UNSUPPORTED: phase boundary "
                     f"{phase_boundary} is beyond the source run's executed phases "
@@ -2798,29 +2987,191 @@ class GenesisService:
             frozen_processes = set()
         return boundary, phase_boundary, event_boundary, frozen_processes
 
+    @staticmethod
+    def derive_manifest_seeds(
+        randomness: Mapping[str, Any],
+        random_streams: Any,
+        matching: Mapping[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """Derive every named stream seed from a manifest's own recorded inputs.
+
+        One derivation shared by manifest construction and by import
+        verification, so a manifest's ``seeds`` can always be checked against
+        the identity it claims.
+        """
+        matching = matching if isinstance(matching, Mapping) else {}
+        shared_streams = matching.get("shared_streams", [])
+        matched = matching.get("enabled") is True and isinstance(shared_streams, list)
+        identity = str(randomness["run_id"])
+        experiment_id = str(randomness.get("experiment_id", ""))
+        condition_id = str(randomness.get("condition_id", "base"))
+        replication = int(randomness.get("replication", 1))
+        seeds: dict[str, int] = {
+            "conventional": derive_seed(
+                0,
+                identity,
+                "run-manifest",
+                experiment_id=experiment_id,
+                condition_id=condition_id,
+                replication=replication,
+                matching_key=(
+                    "conventional" if matched and "conventional" in shared_streams else None
+                ),
+            )
+        }
+        for stream in random_streams or []:
+            if isinstance(stream, Mapping) and stream.get("id"):
+                stream_id = str(stream["id"])
+                seeds[stream_id] = derive_seed(
+                    int(stream.get("seed", 0)),
+                    identity,
+                    stream_id,
+                    experiment_id=experiment_id,
+                    condition_id=condition_id,
+                    replication=replication,
+                    matching_key=(stream_id if matched and stream_id in shared_streams else None),
+                )
+        return seeds
+
+    @classmethod
+    def verify_manifest_seeds(cls, manifest: Mapping[str, Any]) -> None:
+        """Reject a manifest whose seeds cannot be derived from its own identity.
+
+        A manifest is the record of the configuration a realization arose from.
+        If its ``seeds`` do not follow from the identity it states, it cannot
+        reconstruct the run it names — the case a rekeyed or hand-edited copy
+        produces. Manifests predating ``randomness_inputs`` carry no recorded
+        identity and are left to the legacy path.
+        """
+        randomness = manifest.get("randomness_inputs")
+        recorded = manifest.get("seeds")
+        if not isinstance(randomness, Mapping) or not isinstance(recorded, Mapping):
+            return
+        streams = manifest.get("random_streams")
+        if isinstance(manifest.get("matching"), Mapping):
+            candidates = [cls.derive_manifest_seeds(randomness, streams, manifest["matching"])]
+        else:
+            # A manifest written before the matching block was retained cannot
+            # say whether its streams were matched, and matched streams derive
+            # differently. Accept either reading rather than rejecting evidence
+            # this check simply cannot reconstruct.
+            every_stream = [
+                str(stream["id"])
+                for stream in streams or []
+                if isinstance(stream, Mapping) and stream.get("id")
+            ]
+            candidates = [
+                cls.derive_manifest_seeds(randomness, streams, None),
+                cls.derive_manifest_seeds(
+                    randomness,
+                    streams,
+                    {"enabled": True, "shared_streams": [*every_stream, "conventional"]},
+                ),
+            ]
+        for expected in candidates:
+            mismatched = sorted(
+                stream
+                for stream, value in recorded.items()
+                if stream in expected and int(value) != int(expected[stream])
+            )
+            if not mismatched:
+                return
+        raise ValueError(
+            "MANIFEST_SEED_MISMATCH: seeds "
+            f"{mismatched} do not derive from the recorded identity "
+            f"'{randomness.get('run_id')}'; the manifest cannot reconstruct "
+            "the run it names"
+        )
+
+    def _randomness_inputs(self, run: Mapping[str, Any]) -> dict[str, Any]:
+        """Resolve and freeze seed inputs independently of mutable local lineage.
+
+        New bundles carry these inputs, so a foreign root need not exist in
+        the receiving workspace. Legacy local children can still resolve them
+        through their parent; imported legacy roots use their retained manifest.
+        """
+        current = run
+        seen: set[str] = set()
+        while True:
+            manifest = current.get("manifest") or {}
+            frozen = manifest.get("randomness_inputs")
+            if isinstance(frozen, Mapping):
+                return {
+                    "run_id": str(frozen["run_id"]),
+                    "experiment_id": str(frozen["experiment_id"]),
+                    "condition_id": str(frozen["condition_id"]),
+                    "replication": int(frozen["replication"]),
+                }
+            parent = current.get("replay_of")
+            if not parent:
+                return {
+                    "run_id": self._root_source_run_id(current),
+                    "experiment_id": str(
+                        current.get("experiment_id")
+                        or manifest.get("experiment_id")
+                        or (manifest.get("execution") or {}).get("origin_experiment_id")
+                        or ""
+                    ),
+                    "condition_id": str(
+                        current.get("condition_id", manifest.get("condition_id", "base"))
+                    ),
+                    "replication": int(current.get("replication", manifest.get("replication", 1))),
+                }
+            if str(parent) in seen:
+                raise ValueError("REPLAY_LINEAGE_INVALID: cyclic randomness lineage")
+            seen.add(str(parent))
+            current = self.get_run(str(parent))
+
     def _root_source_run_id(self, run: Mapping[str, Any]) -> str:
         """The original source run id for a replay lineage (F8/§2.2 fix).
 
         Randomness must derive from the root source identity, never from an
-        intermediate replay child or a derived branch identity.
+        intermediate replay child, a derived branch identity, or the LOCAL id
+        used when a run was imported. Imported runs preserve the original
+        source id in ``manifest.origin.source_run_id``; when that id does not
+        exist in this workspace (a foreign import), the preserved id itself is
+        the randomness identity.
         """
-        source_id = str(run.get("replay_of") or run.get("id", ""))
-        try:
-            source = self.get_run(source_id)
-            while source.get("replay_of"):
-                source = self.get_run(str(source["replay_of"]))
-            return str(source["id"])
-        except KeyError:
-            return source_id
+        source_id = str(run.get("replay_of") or "")
+        if not source_id:
+            source_id = str(
+                ((run.get("manifest") or {}).get("origin") or {}).get("source_run_id") or ""
+            )
+        if not source_id:
+            return str(run.get("id", ""))
+        seen: set[str] = set()
+        current = source_id
+        while current and current not in seen:
+            seen.add(current)
+            try:
+                source = self.get_run(current)
+            except KeyError:
+                # A preserved foreign source id: no local record to walk; it is
+                # the root identity.
+                return current
+            next_hop = str(source.get("replay_of") or "")
+            if not next_hop:
+                # An imported intermediate: continue through its preserved
+                # original id (which may itself be foreign or a local root).
+                next_hop = str(
+                    ((source.get("manifest") or {}).get("origin") or {}).get("source_run_id") or ""
+                )
+            if not next_hop or next_hop == current:
+                return current
+            current = next_hop
+        return current
 
-    @staticmethod
-    def _generative_process_ids(build_ref: str | Path) -> set[str]:
+    def _generative_process_ids(self, build_ref: str | Path) -> set[str]:
         """Process ids that invoke an LLM: generative AND semantic-evaluator.
 
         F4: recorded-output retrieval and full-replay substitution must cover
         every LLM-invoking executor, not only ``mode == generative``.
+        F3: build refs may be workspace-relative (e.g. restored imports), so
+        resolve against this workspace before reading the build files.
         """
-        build_path = Path(build_ref) if isinstance(build_ref, Path) else Path(str(build_ref))
+        build_path = self.resolve_path(
+            Path(build_ref) if isinstance(build_ref, Path) else str(build_ref)
+        )
         processes = json.loads((build_path / "processes.json").read_text())
         return {
             str(process["id"])
@@ -2873,6 +3224,38 @@ class GenesisService:
         ):
             if (source_path / name).is_file():
                 (build_dir / name).write_bytes((source_path / name).read_bytes())
+        # F3: restore the run-pinned package closure bytes from the bundle's
+        # ``package/`` tree into ``closure/`` so the reconstructed build can be
+        # re-exported in reproducibility mode (package_closure.json lists the
+        # package-relative asset paths used by _write_bundle).
+        closure_manifest_path = build_dir / "package_closure.json"
+        if closure_manifest_path.is_file():
+            try:
+                closure_manifest = json.loads(closure_manifest_path.read_text())
+                assets = closure_manifest.get("assets") or []
+            except json.JSONDecodeError:
+                assets = []
+            for asset in assets:
+                if not isinstance(asset, Mapping):
+                    continue
+                relative = str(asset.get("path", ""))
+                if not _is_contained_relative(relative):
+                    raise ValueError(f"IMPORT_BUILD: unsafe closure asset path '{relative}'")
+                source_asset = source_path / "package" / relative
+                if not source_asset.is_file() or source_asset.is_symlink():
+                    raise ValueError(f"IMPORT_BUILD: closure asset missing in bundle: {relative}")
+                target = build_dir / "closure" / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source_asset.read_bytes())
+                # F2: empirical data assets must also land in the build's
+                # ``data/`` directory — the runtime reads them there when
+                # initialization.mode is "empirical" (data_source is
+                # relative to the build root, e.g. data/population.csv), and
+                # the closure tree alone is not consulted at dispatch time.
+                if relative.startswith("data/"):
+                    data_target = build_dir / relative
+                    data_target.parent.mkdir(parents=True, exist_ok=True)
+                    data_target.write_bytes(source_asset.read_bytes())
         # Regenerate the integrity manifest for the reconstructed build and
         # verify it (mirrors the compiler's per-file digest table).
         integrity: dict[str, str] = {}
@@ -2934,7 +3317,19 @@ class GenesisService:
             raise ValueError("REPLAY_SOURCE_MISSING: source run has no compiled build")
         if mode == ReplayMode.ARTIFACT:
             # Spec §5.1: artifact replay is retrieval of retained artifacts,
-            # not a new simulation. No child run, no provider, no preview.
+            # not a new simulation. No child run, no provider, no preview, and
+            # no intervention configuration (F10: overrides/justification are
+            # rejected on the execution path just as the preview does).
+            if overrides:
+                raise ValueError(
+                    "REPLAY_CONFIGURATION_INVALID: overrides are only accepted for "
+                    "branch replay, not artifact"
+                )
+            if justification or boundary:
+                raise ValueError(
+                    "REPLAY_CONFIGURATION_INVALID: artifact replay is retrieval-only "
+                    "and does not accept a boundary or justification"
+                )
             retained = []
             if artifact_ids:
                 retained = [
@@ -2987,7 +3382,12 @@ class GenesisService:
         # valid boundary; anything further has no retained evidence.
         if phase_boundary is not None and mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH}:
             executed_phases = {int(e.get("phase", 0)) for e in self.trace_run(run_id)}
-            if executed_phases and phase_boundary > (max(executed_phases) + 1):
+            if not executed_phases:
+                raise ValueError(
+                    "REPLAY_BOUNDARY_UNSUPPORTED: source run has no executed "
+                    f"phases; there is no checkpoint evidence for phase boundary {phase_boundary}"
+                )
+            if phase_boundary > (max(executed_phases) + 1):
                 raise ValueError(
                     "REPLAY_BOUNDARY_UNSUPPORTED: phase boundary "
                     f"{phase_boundary} is beyond the source run's executed phases "
@@ -3053,13 +3453,25 @@ class GenesisService:
         frozen_keys = self._frozen_invocation_keys(
             run_id, recorded, phase_boundary=phase_boundary, event_boundary=event_boundary
         )
+        # The phase up to which an unrecorded generative invocation counts as
+        # inside the frozen prefix. A phase boundary states it directly; an
+        # event boundary resolves to the phase that event was committed in.
+        guard_phase: int | None = phase_boundary
+        if guard_phase is None and event_boundary is not None:
+            for event in self.trace_run(run_id):
+                if str(event.get("event_id", "")) == event_boundary:
+                    guard_phase = int(event.get("phase", 0))
+                    break
         executor_overrides: dict[str, Any] = {}
         if mode == ReplayMode.FULL:
             # Spec §5.1: FULL reuses recorded invocations for the complete
             # trajectory and fails if required records are unavailable.
             missing = sorted(llm_ids - set(recorded))
             if missing:
-                raise ValueError("REPLAY_EVIDENCE_INCOMPLETE: full replay requires recorded ")
+                raise ValueError(
+                    "REPLAY_EVIDENCE_INCOMPLETE: full replay requires recorded "
+                    "invocations for: " + ", ".join(missing)
+                )
             for process_id in sorted(llm_ids):
                 executor_overrides[process_id] = _RecordedExecutor(
                     recorded[process_id]
@@ -3076,30 +3488,78 @@ class GenesisService:
                     source_run_id=run_id,
                     process_id=process_id,
                 )
+        # Built lazily: the live executors a replay child would otherwise use.
+        live_executors: dict[str, Any] | None = None
+
+        def _live(process_id: str) -> Any:
+            nonlocal live_executors
+            if live_executors is None:
+                live_executors = self._build_executors(
+                    build_path,
+                    processes,
+                    self._build_schema_catalog(build_path),
+                    self._build_model_profiles(build_path),
+                    self._build_prompt_templates(build_path),
+                )
+            return live_executors.get(process_id)
+
         for process in processes:
             process_id = str(process["id"])
             if mode == ReplayMode.FULL:
                 continue
+            guard_boundary = (
+                guard_phase
+                if mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH}
+                and guard_phase is not None
+                and process_id in llm_ids
+                else None
+            )
             if process_id not in recorded:
+                # No recorded evidence at all. Its live executor would still be
+                # installed, so guard the frozen prefix explicitly.
+                if guard_boundary is not None:
+                    executor_overrides[process_id] = _FrozenPrefixGuard(
+                        _live(process_id),
+                        source_run_id=run_id,
+                        process_id=process_id,
+                        phase_boundary=guard_boundary,
+                        inclusive=phase_boundary is None,
+                    )
                 continue
             if mode in {ReplayMode.PARTIAL, ReplayMode.BRANCH}:
                 if phase_boundary is not None or event_boundary is not None:
                     records = [dict(r) for r in recorded[process_id]]
                     matching = [
-                        r for r in records if (r["phase"], r["attempt"], r["actors"]) in frozen_keys
+                        r
+                        for r in records
+                        if (process_id, r["phase"], r["attempt"], r["actors"]) in frozen_keys
                     ]
+                    # Every invocation the SOURCE performed, frozen or not. An
+                    # invocation the source made after the boundary re-executes
+                    # live; one it never made is a divergence if it lands inside
+                    # the prefix. Source position does not survive a branch, so
+                    # a recorded suffix process is still bound by the boundary.
+                    known = {(r["phase"], r["attempt"], r["actors"]) for r in records}
                     if not matching:
+                        if guard_boundary is not None:
+                            executor_overrides[process_id] = _SelectiveExecutor(
+                                [],
+                                frozen_keys=set(),
+                                fallback=_live(process_id),
+                                source_run_id=run_id,
+                                process_id=process_id,
+                                phase_boundary=guard_boundary,
+                                inclusive=phase_boundary is None,
+                                known_keys=known,
+                            )
                         continue
                     executor_overrides[process_id] = _SelectiveExecutor(
                         matching,
+                        known_keys=known,
+                        phase_boundary=guard_boundary,
+                        inclusive=phase_boundary is None,
                         frozen_keys={(r["phase"], r["attempt"], r["actors"]) for r in matching},
-                        fallback=self._build_executors(
-                            build_path,
-                            processes,
-                            self._build_schema_catalog(build_path),
-                            self._build_model_profiles(build_path),
-                            self._build_prompt_templates(build_path),
-                        ).get(process_id),
+                        fallback=_live(process_id),
                         source_run_id=run_id,
                         process_id=process_id,
                     )
@@ -3215,6 +3675,7 @@ class GenesisService:
         with its own recorded output instead of the last one.
         """
         recorded: dict[str, Any] = {}
+        effects = self._committed_effects(run_id)
         for artifact in self.artifacts_for_run(run_id):
             if artifact_ids and artifact["artifact_id"] not in artifact_ids:
                 continue
@@ -3231,8 +3692,51 @@ class GenesisService:
                 "actors": tuple(str(item) for item in payload.get("actors", [])),
                 "order": len(recorded.get(process_id, [])),
             }
+            committed = effects.get(
+                (str(payload.get("invocation_id", "")), int(payload.get("attempt", 1)))
+            )
+            if committed:
+                entry.update(committed)
             recorded.setdefault(process_id, []).append(entry)
         return recorded
+
+    def _committed_effects(self, run_id: str) -> dict[tuple[str, int], dict[str, Any]]:
+        """The consequences each recorded invocation actually committed.
+
+        Outputs alone do not describe an invocation: its state changes, emitted
+        events and scheduling effects are what the run carried forward. Replaying
+        outputs only made a frozen prefix drop those consequences — a state
+        transition that produced no artifact value replayed as a no-op, so a
+        partial replay silently ended in a different state than its source while
+        reporting success.
+        """
+        committed: dict[tuple[str, int], dict[str, Any]] = {}
+        for event in self.trace_run(run_id):
+            if event.get("kind") != "process_completed":
+                continue
+            invocation = str(event.get("invocation_id", ""))
+            if not invocation:
+                continue
+            delta = event.get("state_delta")
+            # A None value marks a removed key, which the state model cannot
+            # represent; only real assignments are replayable.
+            state_effects = (
+                {key: value for key, value in delta.items() if value is not None}
+                if isinstance(delta, Mapping)
+                else {}
+            )
+            committed[(invocation, int(event.get("attempt", 1)))] = {
+                "state_effects": state_effects,
+                "events": tuple(
+                    dict(item) for item in event.get("events", []) if isinstance(item, Mapping)
+                ),
+                "scheduling_effects": tuple(
+                    dict(item)
+                    for item in event.get("scheduling_effects", [])
+                    if isinstance(item, Mapping)
+                ),
+            }
+        return committed
 
     def _duckdb_outcome_rows(
         self, plan: OutcomePlan, rows: list[dict[str, Any]]
@@ -3247,12 +3751,24 @@ class GenesisService:
             return None
         if plan.operation != "aggregate" or plan.window is not None or not rows:
             return None
+        # The SQL path has no missingness policy: it always excludes nulls.
+        # Running it for a plan that declares "zero" would report a different
+        # number for the same declared measurement depending on an environment
+        # variable, so that plan stays on the in-process engine.
+        if plan.missingness != "exclude":
+            return None
+        if plan.filters:
+            return None
         self.last_outcome_engine = "python"
-        group_key = (
-            plan.group_by[0]
-            if isinstance(plan.group_by, tuple) and len(plan.group_by) == 1
-            else (plan.group_by if isinstance(plan.group_by, str) else None)
+        declared_keys = (
+            (plan.group_by,) if isinstance(plan.group_by, str) else tuple(plan.group_by or ())
         )
+        # The SQL path groups by a single column. A multi-key grouping passed
+        # through it silently lost its grouping entirely and pooled every
+        # condition into one row, so those plans stay on the in-process engine.
+        if len(declared_keys) > 1:
+            return None
+        group_key = declared_keys[0] if declared_keys else None
         try:
             from genesis.analysis import duckdb_aggregate
 
@@ -3339,22 +3855,7 @@ class GenesisService:
             declared_id = payload.get("declared_artifact_id")
             if isinstance(declared_id, str):
                 artifact_sources.setdefault(declared_id, []).append(artifact_row)
-        state_rows = []
-        # F8: annotate each committed snapshot with the protocol phase of the
-        # event that committed it, so "each_completed_round" can select the
-        # final snapshot of each completed round instead of one per process
-        # invocation.
-        version_phase: dict[int, int] = {}
-        for event in event_rows:
-            version = event.get("state_version")
-            phase = event.get("phase")
-            if isinstance(version, int) and isinstance(phase, int):
-                version_phase[version] = phase
-        for version, snapshot in self.persistence.list_state_history(run_id):
-            row = dict(snapshot)
-            row["state_version"] = version
-            row["_round"] = version_phase.get(version)
-            state_rows.append(row)
+        state_rows = self._round_annotated_state(run_id, run, event_rows)
         # OUT-005: generic outcome derivation. When the outcome plan declares
         # datasets, rows are materialized ONCE by the fixed operation registry
         # and exposed under the dataset ids; raw event rows are never enlarged
@@ -3392,11 +3893,13 @@ class GenesisService:
         }
         if outcome_plan.get("datasets"):
             sources.update(dataset_rows)
-        elif self._legacy_derived_rows(event_rows, artifact_rows):
+        else:
             # Legacy flat-row packages aggregate over a synthesized event
             # view; keep that behaviour only for pre-dataset packages.
-            event_rows = self._legacy_derived_rows(event_rows, artifact_rows) + event_rows
-            sources["events"] = event_rows
+            derived = self._legacy_derived_rows(event_rows, artifact_rows)
+            if derived:
+                event_rows = derived + event_rows
+                sources["events"] = event_rows
         results: list[dict[str, Any]] = []
         for definition in definitions:
             join = definition.get("join")
@@ -4863,6 +5366,19 @@ class GenesisService:
                     source_file = build_path / name
                     if source_file.is_file():
                         extras[name] = source_file.read_text()
+                # The live executors are rebuilt from these files, so a
+                # reproducibility bundle must carry them too — otherwise the
+                # restored build cannot re-execute generative/evaluator
+                # processes (partial/branch replay on an import would fail).
+                for name in (
+                    "model_profiles.json",
+                    "prompt_templates.json",
+                    "initialization.json",
+                    "schemas.json",
+                ):
+                    source_file = build_path / name
+                    if source_file.is_file():
+                        extras[name] = source_file.read_text()
             for name in (
                 "build_manifest.json",
                 "validation_report.json",
@@ -5048,209 +5564,197 @@ class GenesisService:
             )
         return builds
 
+    def list_traces(self, run_id: str) -> list[dict[str, Any]]:
+        """The traces a run's build declares."""
+        plan = self._run_outcome_plan(run_id)
+        return [
+            {
+                "id": str(trace.get("id", "")),
+                "title": trace.get("title"),
+                "seed_dataset": str((trace.get("seed") or {}).get("dataset", "")),
+            }
+            for trace in plan.get("traces", [])
+            if isinstance(trace, Mapping) and trace.get("id")
+        ]
+
+    def _run_outcome_plan(self, run_id: str) -> dict[str, Any]:
+        run = self.get_run(run_id)
+        build_ref = run.get("build") or run.get("build_path")
+        if not build_ref:
+            return {"datasets": [], "outcomes": [], "traces": []}
+        return compile_outcome_plan(self.resolve_path(build_ref))
+
     def natural_trace(
-        self, run_id: str, user: str | None = None, phase: int | None = None
+        self,
+        run_id: str,
+        trace: str | None = None,
+        event: str | None = None,
+        actor: str | None = None,
+        phase: int | None = None,
+        depth: int | None = None,
+        max_steps: int | None = None,
     ) -> dict[str, Any]:
-        """Connected trace under the frozen selection rule, or for ANY user.
+        """One causal chain from a run, as declared or as asked for.
 
-        Rule (predeclared, when ``user`` is None): the FIRST realized follow
-        decision in the run; if none occurs, the natural NON-follow trace of
-        the earliest high-engagement user (first user with clicks > 0, by
-        phase then event order). When ``user`` is given, the chain is built
-        for that user (at ``phase`` if provided, else the user's earliest
-        phase with activity) - an ad-hoc inspection trace, not evidence.
+        Traversal follows the causal parents and artifact lineage every run
+        records, so it needs no knowledge of a study's processes or state
+        fields. Only the starting point differs:
 
-        The chain links exposure (with delivery provenance) -> computational
-        selection -> per-user brief -> generated interpretation -> the
-        user-act event (input artifact reference + value) -> recorded
-        downstream state (analytics; follow delta + later recommendation
-        when a follow exists).
+        * ``event`` walks from any recorded event — no declaration required;
+        * ``actor`` walks from that actor's earliest recorded invocation
+          (optionally within ``phase``);
+        * ``trace`` uses a trace the package declares, whose seed is a row of a
+          declared outcome dataset;
+        * with none of them, the package's single declared trace is used, and a
+          package declaring none (or several) is told what to pass.
         """
-        if user is None:
-            follow_events = []
-            for event in self.trace_run(run_id):
-                delta = event.get("state_delta") or {}
-                for action in delta.get("actions") or []:
-                    if (
-                        isinstance(action, dict)
-                        and action.get("follow")
-                        and not action.get("diagnostic")
-                    ):
-                        follow_events.append((event, action))
-            follow_events.sort(
-                key=lambda pair: (pair[0].get("phase", 0), pair[0].get("commit_order", 0))
-            )
-            if follow_events:
-                event, action = follow_events[0]
-                user = str(action.get("user"))
-                phase = int(action.get("phase", event.get("phase", 0)))
-                rule_applied = "first realized follow"
-            else:
-                earliest: tuple[int, int, str] = (10**9, 10**9, "")
-                for event in self.trace_run(run_id):
-                    delta = event.get("state_delta") or {}
-                    for record in delta.get("analytics") or []:
-                        if not isinstance(record, dict):
-                            continue
-                        if int(record.get("clicked", 0) or 0) > 0:
-                            key = (
-                                int(record.get("phase", event.get("phase", 0))),
-                                int(event.get("commit_order", 0)),
-                                str(record.get("user", "")),
-                            )
-                            if key < earliest:
-                                earliest = key
-                user, phase = earliest[2], earliest[0]
-                rule_applied = "natural non-follow (earliest high-engagement user)"
-        else:
-            if phase is None:
-                candidates: list[tuple[int, int]] = []
-                for event in self.trace_run(run_id):
-                    delta = event.get("state_delta") or {}
-                    for record in delta.get("analytics") or []:
-                        if isinstance(record, dict) and record.get("user") == user:
-                            candidates.append(
-                                (
-                                    int(record.get("phase", event.get("phase", 0))),
-                                    int(event.get("commit_order", 0)),
-                                )
-                            )
-                if not candidates:
-                    raise ValueError(
-                        f"USER_TRACE_NOT_FOUND: no activity recorded for user '{user}'"
-                    )
-                candidates.sort()
-                phase = candidates[0][0]
-            rule_applied = f"user-specified (user={user}, phase={phase})"
-        events = sorted(
-            self.trace_run(run_id), key=lambda e: (e.get("phase", 0), e.get("commit_order", 0))
-        )
-        steps: list[dict[str, Any]] = []
-        seen_first: set[tuple[Any, Any]] = set()
-        brief_artifact_id = ""
-        brief_value: dict[str, Any] = {}
-        action_artifact_id = ""
-        action_value: dict[str, Any] = {}
-        for event in events:
-            delta = event.get("state_delta") or {}
-            if not isinstance(delta, dict):
-                continue
-            if (
-                event.get("process_id") == "recommend"
-                and event.get("phase") == phase
-                and not any(s.get("step") == "exposure" for s in steps)
-            ):
-                detail: dict[str, Any] = delta.get("exposure-detail") or {}
-                if isinstance(detail, dict) and str(user) in [str(k) for k in detail]:
-                    steps.append(
-                        {
-                            "step": "exposure",
-                            "event": event.get("event_id"),
-                            "value": detail.get(user),
-                        }
-                    )
-            if (
-                event.get("process_id") == "select-titles"
-                and event.get("phase") == phase
-                and user in [str(a) for a in (event.get("actors") or ())]
-            ):
-                for record in delta.get("selections") or []:
-                    if isinstance(record, dict) and record.get("user") == user:
-                        steps.append(
-                            {
-                                "step": "selection",
-                                "event": event.get("event_id"),
-                                "value": record.get("selected"),
-                            }
-                        )
-                        break
-            if (
-                event.get("process_id") == "user-interpret"
-                and event.get("phase") == phase
-                and user in [str(a) for a in (event.get("actors") or ())]
-            ):
-                input_refs = list(event.get("input_refs") or ())
-                brief_artifact_id = input_refs[0] if input_refs else ""
-                steps.append(
-                    {
-                        "step": "interpretation",
-                        "event": event.get("event_id"),
-                        "input_artifact": brief_artifact_id,
-                    }
-                )
-            if (
-                event.get("process_id") == "user-act"
-                and event.get("phase") == phase
-                and user in [str(a) for a in (event.get("actors") or ())]
-            ):
-                input_refs = list(event.get("input_refs") or ())
-                action_artifact_id = input_refs[0] if input_refs else ""
-                analytics_row = None
-                for record in delta.get("analytics") or []:
-                    if isinstance(record, dict) and record.get("user") == user:
-                        analytics_key = (record.get("user"), record.get("phase"))
-                        if analytics_key not in seen_first:
-                            seen_first.add(analytics_key)
-                            analytics_row = record
-                steps.append(
-                    {
-                        "step": "user-action",
-                        "event": event.get("event_id"),
-                        "input_artifact": action_artifact_id,
-                        "state_delta": analytics_row,
-                    }
-                )
-        # resolve the two artifact values (brief + user-action)
+        events = self.trace_run(run_id)
         artifacts = self.artifacts_for_run(run_id)
-        for artifact in artifacts:
-            artifact_id = str(artifact.get("artifact_id", ""))
-            payload = artifact.get("payload") or {}
-            value = payload.get("value") if isinstance(payload, dict) else None
-            if artifact_id == action_artifact_id and isinstance(value, dict):
-                action_value = value
-            if artifact_id == brief_artifact_id and isinstance(value, dict):
-                brief_value = value
-        for step in steps:
-            if step.get("step") == "interpretation" and brief_value:
-                step["value"] = brief_value
-            if step.get("step") == "user-action" and action_value:
-                step["value"] = action_value
-
-        follow_delta = None
-        later_recommendation = None
-        for event in events:
-            delta = event.get("state_delta") or {}
-            if event.get("process_id") == "update-follow-relation" and follow_delta is None:
-                follows = delta.get("follows")
-                if isinstance(follows, dict) and user in follows:
-                    follow_delta = {"event": event.get("event_id"), "value": follows.get(user)}
-            if event.get("process_id") == "recommend" and event.get("phase", 0) > phase:
-                detail = delta.get("exposure-detail") or {}
-                if isinstance(detail, dict) and user in detail:
-                    later_recommendation = {
-                        "event": event.get("event_id"),
-                        "value": detail.get(user),
-                    }
-                    break
-        if action_value.get("decided_follow"):
-            steps.append(
-                {"step": "follow-delta", **follow_delta}
-                if follow_delta
-                else {"step": "follow-delta", "value": None}
-            )
-            if later_recommendation is not None:
-                steps.append(
-                    {
-                        "step": "later-recommendation",
-                        "event": later_recommendation["event"],
-                        "value": later_recommendation["value"],
-                    }
+        labels: dict[str, str] = {}
+        bounded = depth
+        cap = max_steps
+        if event:
+            seed, rule = str(event), f"event (event={event})"
+        elif actor:
+            candidates = [
+                item
+                for item in events
+                if actor in [str(a) for a in (item.get("actors") or ())]
+                and (phase is None or int(item.get("phase", 0)) == int(phase))
+            ]
+            if not candidates:
+                where = "" if phase is None else f" at phase {phase}"
+                raise ValueError(
+                    f"ACTOR_TRACE_NOT_FOUND: no recorded invocation for actor '{actor}'{where}"
                 )
+            candidates.sort(key=lambda item: (item.get("phase", 0), item.get("commit_order", 0)))
+            seed = str(candidates[0]["event_id"])
+            rule = f"actor (actor={actor}" + ("" if phase is None else f", phase={phase}") + ")"
+        else:
+            declared = [
+                item
+                for item in self._run_outcome_plan(run_id).get("traces", [])
+                if isinstance(item, Mapping) and item.get("id")
+            ]
+            available = [str(item["id"]) for item in declared]
+            if trace:
+                chosen = next((item for item in declared if str(item["id"]) == trace), None)
+                if chosen is None:
+                    raise ValueError(
+                        f"TRACE_NOT_DECLARED: run '{run_id}' declares no trace '{trace}'; "
+                        f"declared traces are {available}"
+                    )
+            elif len(declared) == 1:
+                chosen = declared[0]
+            else:
+                detail = (
+                    "its package declares no trace"
+                    if not declared
+                    else f"its package declares several traces {available}"
+                )
+                raise ValueError(
+                    f"TRACE_SELECTION_REQUIRED: {detail}; pass trace=, event= or actor= "
+                    "to choose a starting point"
+                )
+            seed_spec = chosen.get("seed") or {}
+            rows = self._dataset_rows(run_id, str(seed_spec.get("dataset", "")))
+            seed = resolve_seed(
+                rows,
+                order_by=tuple(seed_spec.get("order_by") or ("phase", "commit_order")),
+                select=str(seed_spec.get("select", "first")),
+            )
+            labels = {str(k): str(v) for k, v in (chosen.get("labels") or {}).items()}
+            bounded = depth if depth is not None else int(chosen.get("depth", DEFAULT_DEPTH))
+            if cap is None:
+                cap = int(chosen.get("max_steps", DEFAULT_MAX_STEPS))
+            rule = f"declared trace ({chosen['id']})"
+        steps, coverage = build_chain(
+            events,
+            artifacts,
+            seed,
+            labels=labels,
+            depth=bounded if bounded is not None else DEFAULT_DEPTH,
+            max_steps=cap if cap is not None else DEFAULT_MAX_STEPS,
+        )
+        seed_step = next((item for item in steps if item["relation"] == "seed"), {})
         return {
             "run_id": run_id,
-            "selection_rule": rule_applied,
-            "illustration": {"user": user, "phase": phase, "steps": steps},
+            "selection_rule": rule,
+            "seed_event": seed,
+            "coverage": coverage,
+            "illustration": {
+                "actors": seed_step.get("actors", []),
+                "phase": seed_step.get("phase"),
+                "steps": steps,
+            },
         }
+
+    def _round_annotated_state(
+        self,
+        run_id: str,
+        run: Mapping[str, Any],
+        event_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Committed state snapshots annotated with the round that produced them.
+
+        One preparation shared by every consumer of state evidence. Outcome
+        evaluation and trace seeding must see the same rows: preparing them
+        separately let a ``each_completed_round`` dataset return one row per
+        state commit on one path and one row per completed round on the other.
+
+        F8: each snapshot carries the protocol phase of the event that committed
+        it, so ``each_completed_round`` selects the final snapshot of a round
+        rather than one per process invocation. F4: a phase counts as a
+        COMPLETED round only when nothing in it failed or was left active, and
+        an interrupted frontier is not proof of completion.
+        """
+        version_phase: dict[int, int] = {}
+        for event in event_rows:
+            version = event.get("state_version")
+            phase = event.get("phase")
+            if isinstance(version, int) and isinstance(phase, int):
+                version_phase[version] = phase
+        latest_attempts: dict[str, dict[str, Any]] = {}
+        for event in sorted(event_rows, key=lambda row: row.get("commit_order", 0)):
+            invocation = str(event.get("invocation_id") or event.get("event_id"))
+            latest_attempts[invocation] = event
+        failed_or_active_phases = {
+            int(event.get("phase", 0))
+            for event in latest_attempts.values()
+            if event.get("kind") in {"process_failed", "process_active"}
+        }
+        if run.get("status") != "completed" and version_phase:
+            failed_or_active_phases.add(max(version_phase.values()))
+        state_rows: list[dict[str, Any]] = []
+        for version, snapshot in self.persistence.list_state_history(run_id):
+            row = dict(snapshot)
+            row["state_version"] = version
+            phase = version_phase.get(version)
+            if phase is not None and phase in failed_or_active_phases:
+                # Mark for exclusion rather than an arbitrary "own round".
+                row["_round"] = _INCOMPLETE_ROUND
+            else:
+                row["_round"] = phase
+            state_rows.append(row)
+        return state_rows
+
+    def _dataset_rows(self, run_id: str, dataset_id: str) -> list[dict[str, Any]]:
+        """Materialize one declared dataset from a run's retained evidence."""
+        if not dataset_id:
+            raise ValueError("TRACE_SEED_UNKNOWN: the declared trace names no seed dataset")
+        plan = self._run_outcome_plan(run_id)
+        if not any(
+            isinstance(item, Mapping) and str(item.get("id", "")) == dataset_id
+            for item in plan.get("datasets", [])
+        ):
+            raise ValueError(f"TRACE_SEED_UNKNOWN: no declared dataset '{dataset_id}'")
+        event_rows = [dict(item) for item in self.trace_run(run_id)]
+        sources = {
+            "events": event_rows,
+            "artifacts": list(self.artifacts_for_run(run_id)),
+            "state": self._round_annotated_state(run_id, self.get_run(run_id), event_rows),
+        }
+        return materialize_datasets(plan, sources).get(dataset_id, [])
 
     def import_run(
         self,
@@ -5343,7 +5847,24 @@ class GenesisService:
                 )
             if total > size_limit_bytes:
                 raise ValueError(f"IMPORT_SIZE: bundle exceeds {size_limit_bytes} bytes")
+        # F3: a bundle with NEITHER a modern bundle_manifest.json NOR the
+        # legacy integrity.json offers no supported membership/integrity
+        # contract to verify. Such a bundle is not a product of this exporter;
+        # requiring a supported manifest closes the gap where removing both
+        # manifests bypassed all integrity and size enforcement.
+        if bundle_manifest is None and not integrity_path.is_file():
+            raise ValueError(
+                "IMPORT_MANIFEST_REQUIRED: bundle has neither bundle_manifest.json "
+                "nor integrity.json; refusing to import an unsupported unverified "
+                "bundle (no member coverage, containment, digest or size checks "
+                "could run)"
+            )
         run_manifest = json.loads((source_path / "run_manifest.json").read_text())
+        # Digests prove the bundle was not corrupted in transit; they cannot
+        # show that the manifest is internally consistent. A manifest whose
+        # seeds do not derive from the identity it states cannot reconstruct
+        # its own run, so it is rejected rather than imported as evidence.
+        self.verify_manifest_seeds(run_manifest)
         target_id = run_id or str(run_manifest.get("run_id", ""))
         if not target_id:
             raise ValueError("IMPORT_RUN: run_manifest has no run_id")
@@ -5382,6 +5903,13 @@ class GenesisService:
             "imported_outcomes": outcomes,
             "study_id": run_manifest.get("study_id", ""),
             "status": str(run_manifest.get("status", "completed")),
+            # F1: replay reads these from the run row, not the manifest. The
+            # pinned experimental configuration (condition, factors,
+            # replication) is lifted here so a replayed import inherits the
+            # source treatment instead of rebasing to base/1.
+            "condition_id": str(run_manifest.get("condition_id", "base")),
+            "replication": int(run_manifest.get("replication", 1)),
+            "condition": dict(run_manifest.get("condition") or {}),
         }
         # Direct insert: an imported run reflects a COMPLETED foreign run and
         # does not pass through the created->running lifecycle of local runs.

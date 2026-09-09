@@ -157,6 +157,7 @@ class ExecutionManifest:
     randomness_algorithm: str = RNG_ALGORITHM_VERSION
     stream_scheme_version: int = STREAM_SCHEME_VERSION
     model_configuration_digest: str = ""
+    outcome_plan_digest: str = ""
     runtime_contract_version: int = RUNTIME_CONTRACT_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -176,6 +177,10 @@ class ExecutionManifest:
                 "stream_scheme_version": self.stream_scheme_version,
             },
             "model_configuration_digest": self.model_configuration_digest,
+            # The predeclared measurement plan is part of the effective
+            # configuration: two runs measuring different observables are not
+            # realizations of the same configured study.
+            "outcome_plan_digest": self.outcome_plan_digest,
             "runtime_contract_version": self.runtime_contract_version,
         }
 
@@ -216,7 +221,6 @@ def resolve_execution_manifest(
         raise ValueError("EXECUTION_MANIFEST: package closure digest is required")
     if not protocol_digest:
         raise ValueError("EXECUTION_MANIFEST: protocol digest is required")
-    _ = outcome_plan_digest
     _ = protocol
     return ExecutionManifest(
         package_digest=package_closure_digest,
@@ -227,6 +231,7 @@ def resolve_execution_manifest(
         replication=int(replication or 1),
         origin_experiment_id=origin_experiment_id,
         model_configuration_digest=model_configuration_digest,
+        outcome_plan_digest=outcome_plan_digest,
     ).to_dict()
 
 

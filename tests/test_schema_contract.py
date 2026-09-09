@@ -147,6 +147,30 @@ def test_local_defs_and_references_resolve_within_package() -> None:
     assert catalog.validate("alias", 6) != []
 
 
+def test_local_fragment_under_nested_id_scopes_to_the_subschema() -> None:
+    """F5: a subschema declaring its own ``$id`` is an embedded resource; a
+    local fragment (``#/$defs/x``) inside it must resolve against that
+    ``$id`` as the new document base, exactly like the Draft 2020-12
+    validator — not against the enclosing schema's ``$defs``."""
+    catalog = _catalog(
+        {
+            "a": {
+                "type": "object",
+                "properties": {
+                    "leaf": {
+                        "$id": "https://schema.example.org/nested",
+                        "$defs": {"x": {"type": "integer"}},
+                        "type": "object",
+                        "properties": {"value": {"$ref": "#/$defs/x"}},
+                    }
+                },
+            }
+        }
+    )
+    assert catalog.validate("a", {"leaf": {"value": 9}}) == []
+    assert catalog.validate("a", {"leaf": {"value": "not-an-int"}}) != []
+
+
 def test_external_reference_is_rejected_at_construction() -> None:
     # F13: an external/unresolvable reference must fail at catalog
     # construction, before any model invocation, not only during validation.

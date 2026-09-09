@@ -17,6 +17,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from .execution_manifest import build_package_closure
+from .runtime import STATE_VALUE_TYPES, edge_delays
 from .schema_validation import PackageSchemaCatalog, SchemaValidationError
 from .specification.models import (
     DomainSpec,
@@ -29,6 +30,9 @@ from .specification.models import (
     TheorySpec,
 )
 from .theory_execution import compile_theory_execution
+
+# Protocol budget keys the runtime actually enforces.
+ENFORCED_BUDGETS = frozenset({"max_events"})
 
 CANONICAL: dict[str, type[StrictModel]] = {
     "study": StudySpec,
@@ -272,14 +276,21 @@ class StudyCompiler:
                 else None
             )
             if delay is not None:
+
+                def _positive_rounds(value: Any) -> bool:
+                    return (
+                        isinstance(value, int | float)
+                        and not isinstance(value, bool)
+                        and math.isfinite(value)
+                        and value > 0
+                    )
+
                 rounds = delay.get("rounds") if isinstance(delay, dict) else None
-                invalid_delay = (
-                    not isinstance(rounds, int | float)
-                    or isinstance(rounds, bool)
-                    or not math.isfinite(rounds)
-                    or rounds <= 0
-                )
-                if invalid_delay:
+                per_dependency = delay.get("per_dependency") if isinstance(delay, dict) else None
+                has_per_dependency = isinstance(per_dependency, dict) and bool(per_dependency)
+                # Either form is valid on its own: a process-wide ``rounds`` or a
+                # ``per_dependency`` map giving individual edges their own lag.
+                if not _positive_rounds(rounds) and not has_per_dependency:
                     errors.append(
                         {
                             "code": "DELAY_INVALID",
@@ -287,6 +298,43 @@ class StudyCompiler:
                             "message": "edge delay must be a positive number",
                         }
                     )
+                if isinstance(per_dependency, dict):
+                    for dep_id, value in per_dependency.items():
+                        if str(dep_id) not in {str(item) for item in dependencies}:
+                            errors.append(
+                                {
+                                    "code": "DELAY_INVALID",
+                                    "path": (
+                                        f"openness.processes.{process.id}"
+                                        f"/dependencies/delay/per_dependency/{dep_id}"
+                                    ),
+                                    "message": (
+                                        f"'{dep_id}' is not a declared dependency of '{process.id}'"
+                                    ),
+                                }
+                            )
+                        elif value != 0 and not _positive_rounds(value):
+                            errors.append(
+                                {
+                                    "code": "DELAY_INVALID",
+                                    "path": (
+                                        f"openness.processes.{process.id}"
+                                        f"/dependencies/delay/per_dependency/{dep_id}"
+                                    ),
+                                    "message": "edge delay must be zero or a positive number",
+                                }
+                            )
+                elif per_dependency is not None:
+                    errors.append(
+                        {
+                            "code": "DELAY_INVALID",
+                            "path": (
+                                f"openness.processes.{process.id}/dependencies/delay/per_dependency"
+                            ),
+                            "message": "per_dependency must map dependency ids to rounds",
+                        }
+                    )
+            resolved_delays = edge_delays(process.dependencies, dependencies)
             for dep in dependencies:
                 if dep not in process_ids:
                     errors.append(
@@ -297,8 +345,9 @@ class StudyCompiler:
                         }
                     )
                 else:
-                    # A declared temporal delay breaks an immediate cycle.
-                    if not process.dependencies.get("delay"):
+                    # A declared temporal delay breaks an immediate cycle, but
+                    # only on the edge that actually carries it.
+                    if not resolved_delays.get(str(dep)):
                         graph[process.id].add(dep)
             if process.executor.mode in {"stochastic", "computational"}:
                 required_key = (
@@ -405,6 +454,46 @@ class StudyCompiler:
         mapped_processes = {mapping.process for mapping in theory.process_mappings}
         errors: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
+        # A state's declared value_type is the runtime's type contract. An
+        # unrecognized name used to fall back to ``object``, which accepts any
+        # value: the contract silently disappeared while compilation and the
+        # integrity check both passed.
+        declared_datasets = {str(dataset.id) for dataset in loaded["outcomes"].datasets}
+        for trace in loaded["outcomes"].traces:
+            seed = str(trace.seed.dataset)
+            if seed not in declared_datasets:
+                errors.append(
+                    {
+                        "code": "TRACE_SEED_UNKNOWN",
+                        "path": f"outcomes.traces.{trace.id}/seed/dataset",
+                        "message": (
+                            f"trace '{trace.id}' seeds from dataset '{seed}', which is not "
+                            "declared in outcomes.datasets"
+                        ),
+                    }
+                )
+            unknown_labels = sorted(set(trace.labels) - process_ids)
+            if unknown_labels:
+                errors.append(
+                    {
+                        "code": "TRACE_LABEL_UNKNOWN",
+                        "path": f"outcomes.traces.{trace.id}/labels",
+                        "message": f"labels name processes that do not exist: {unknown_labels}",
+                    }
+                )
+        for state in domain.states:
+            declared = str(getattr(state, "value_type", "object") or "object")
+            if declared not in STATE_VALUE_TYPES:
+                errors.append(
+                    {
+                        "code": "STATE_VALUE_TYPE",
+                        "path": f"domain.states.{getattr(state, 'id', '')}/value_type",
+                        "message": (
+                            f"unknown value_type '{declared}'; expected one of "
+                            f"{sorted(STATE_VALUE_TYPES)}"
+                        ),
+                    }
+                )
         for process in openness.processes:
             if process.executor.mode != "generative":
                 continue
@@ -529,6 +618,24 @@ class StudyCompiler:
                             ),
                         }
                     )
+        # ``budgets`` sits next to enforced limits, so an unrecognised key
+        # reads as a constraint the runtime will apply. It will not: only the
+        # keys below are enforced, and the rest are inert annotations.
+        protocol_budgets = getattr(loaded["protocol"], "budgets", {}) or {}
+        if isinstance(protocol_budgets, dict):
+            for key in sorted(protocol_budgets):
+                if str(key) not in ENFORCED_BUDGETS:
+                    warnings.append(
+                        {
+                            "code": "BUDGET_NOT_ENFORCED",
+                            "severity": "warning",
+                            "path": f"protocol.budgets/{key}",
+                            "message": (
+                                f"budget '{key}' is recorded but not enforced by the runtime; "
+                                f"enforced budgets are {sorted(ENFORCED_BUDGETS)}"
+                            ),
+                        }
+                    )
         for process in openness.processes:
             if process.executor.mode == "generative" and process.id not in mapped_processes:
                 warnings.append(
@@ -601,6 +708,45 @@ class StudyCompiler:
                         "message": issue.message,
                     }
                 )
+        # Executable state-feedback bindings must be visible to the consumer:
+        # its context policy must expose every declared feedback slot under the
+        # ``feedback`` namespace, otherwise the injected value would silently
+        # never reach the process (XL-004/THY-006).
+        if theory_plan.feedback_bindings:
+            resolved_policies = _resolve_context_policies(loaded["domain"])
+            policies_by_id = {str(policy.get("id", "")): policy for policy in resolved_policies}
+            for (
+                declaration_id,
+                _source_id,
+                consumer,
+                slot,
+                _lag,
+                _initial,
+            ) in theory_plan.feedback_bindings:
+                consumer_process = next(
+                    (p for p in loaded["openness"].processes if str(p.id) == str(consumer)),
+                    None,
+                )
+                policy_id = (
+                    str(consumer_process.context_policy) if consumer_process is not None else ""
+                )
+                policy = policies_by_id.get(policy_id, {})
+                allow = policy.get("allow", ()) if isinstance(policy, Mapping) else ()
+                if f"feedback.{slot}" not in allow and "feedback" not in allow:
+                    errors.append(
+                        {
+                            "code": "THEORY_FEEDBACK_POLICY_MISSING",
+                            "severity": "error",
+                            "path": f"/theory/feedback/{declaration_id}",
+                            "message": (
+                                f"feedback binding '{declaration_id}' injects slot "
+                                f"'{slot}' into consumer '{consumer}' but its context "
+                                f"policy '{policy_id}' does not declare "
+                                f"'feedback.{slot}' in allow; add it so the injected "
+                                "prior-round state is actually visible to the process"
+                            ),
+                        }
+                    )
         # Compile-time schema checks: every declared schema must be a valid
         # Draft 2020-12 schema in the package dialect (SCH-001/004).
         try:
@@ -653,45 +799,50 @@ class StudyCompiler:
         if target.exists():
             raise ValueError("BUILD_EXISTS: refusing unsafe overwrite")
         temp = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
-        process_graph = {
-            p.id: [
-                {
-                    "dependency": dep,
-                    "delayed": bool(p.dependencies.get("delay")),
-                    "delay": p.dependencies.get("delay"),
-                }
-                for dep in sorted(p.dependencies.get("after", []))
-            ]
-            for p in loaded["openness"].processes
-        }
-        # THY-004: unify theory-generated zero-lag precedence edges into the
-        # compiled schedule, deduplicated against declared openness
-        # dependencies. Positive-lag edges remain recorded in the theory
-        # execution plan as temporal contracts, not same-round scheduling.
-        for producer, consumer, lag in theory_plan.precedence_edges:
-            if lag != 0:
-                continue
-            existing = {entry["dependency"] for entry in process_graph.get(consumer, [])}
-            if str(producer) in existing:
-                continue
-            process_graph.setdefault(str(consumer), []).append(
-                {"dependency": str(producer), "delayed": False, "delay": None}
-            )
-            process_graph[str(consumer)].sort(key=lambda entry: str(entry["dependency"]))
+        # Each entry reports the delay of THAT edge, not the process's delay
+        # block copied onto every edge, so the inspectable graph matches what
+        # the scheduler enforces.
         theory_functions = {
             mapping.process: mapping.theory_function
             for mapping in loaded["theory"].process_mappings
         }
-        # THY-004: apply zero-lag theory precedence edges to the *compiled
-        # process definitions* (processes.json), which is the schedule the
-        # runtime Scheduler actually reads. process_graph.json stays as the
-        # inspectable rendered graph, but execution order must reflect the
-        # approved theory bindings, not only the advisory file.
+        # THY-004: theory edges apply to the *compiled process definitions*
+        # (processes.json), which is the schedule the runtime Scheduler reads.
+        # Zero-lag edges become ordinary dependencies; positive-lag edges use
+        # the scheduler's native per-process delay (dependencies.delay) so the
+        # consumer does not run until ``lag`` rounds after the producer.
         theory_after: dict[str, list[str]] = {}
+        # Lag belongs to the individual precedence relation, so it is recorded
+        # per producer edge. Collapsing it into one process-level number made
+        # two relations into the same consumer share the larger lag and imposed
+        # that lag on the consumer's unrelated dependencies.
+        theory_lag: dict[str, dict[str, int]] = {}
         for producer, consumer, lag in theory_plan.precedence_edges:
-            if lag != 0:
-                continue
             theory_after.setdefault(str(consumer), []).append(str(producer))
+            if lag > 0:
+                edges = theory_lag.setdefault(str(consumer), {})
+                edges[str(producer)] = max(edges.get(str(producer), 0), int(lag))
+        # Executable state-feedback bindings ride on the consumer process so
+        # the runtime can inject prior-round state into the declared context
+        # slot (source validated against the domain in _validate_theory).
+        theory_feedback: dict[str, list[dict[str, Any]]] = {}
+        for (
+            declaration_id,
+            source_id,
+            consumer,
+            slot,
+            lag,
+            initial,
+        ) in theory_plan.feedback_bindings:
+            theory_feedback.setdefault(consumer, []).append(
+                {
+                    "declaration_id": declaration_id,
+                    "source": source_id,
+                    "context_slot": slot,
+                    "lag_rounds": lag,
+                    "initial": initial,
+                }
+            )
         compiled_processes = []
         for process in loaded["openness"].processes:
             record = process.model_dump(mode="json")
@@ -704,7 +855,43 @@ class StudyCompiler:
                 merged = sorted(set(current_after).union(added))
                 record.setdefault("dependencies", {})
                 record["dependencies"]["after"] = merged
+                lags = theory_lag.get(str(process.id), {})
+                if lags:
+                    existing_delay = record["dependencies"].get("delay") or {}
+                    if not isinstance(existing_delay, dict):
+                        existing_delay = {}
+                    per_dependency = dict(existing_delay.get("per_dependency") or {})
+                    for producer, lag in lags.items():
+                        per_dependency[producer] = max(
+                            int(per_dependency.get(producer, 0) or 0), int(lag)
+                        )
+                    merged_delay: dict[str, Any] = {"per_dependency": per_dependency}
+                    rounds = existing_delay.get("rounds")
+                    if isinstance(rounds, int | float) and not isinstance(rounds, bool):
+                        merged_delay["rounds"] = rounds
+                    record["dependencies"]["delay"] = merged_delay
+            feedback = theory_feedback.get(str(process.id))
+            if feedback:
+                record.setdefault("theory_feedback", []).extend(feedback)
             compiled_processes.append(record)
+        # The inspectable graph is derived from the FINAL compiled records —
+        # the same dependencies and delays processes.json hands the scheduler.
+        # Building it from the pre-merge declarations omitted every theory edge
+        # that carries a lag, so the graph reported processes as independent
+        # while the runtime enforced an ordering between them.
+        process_graph: dict[str, list[dict[str, Any]]] = {}
+        for record in compiled_processes:
+            dependencies = record.get("dependencies") or {}
+            after = sorted(str(dep) for dep in dependencies.get("after", []))
+            resolved = edge_delays(dependencies, after)
+            process_graph[str(record["id"])] = [
+                {
+                    "dependency": dep,
+                    "delayed": bool(resolved.get(dep)),
+                    "delay": {"rounds": resolved[dep]} if resolved.get(dep) else None,
+                }
+                for dep in after
+            ]
         files = {
             "processes.json": compiled_processes,
             "model_profiles.json": [
@@ -725,6 +912,7 @@ class StudyCompiler:
             "outcome_plan.json": {
                 "datasets": [d.model_dump(mode="json") for d in loaded["outcomes"].datasets],
                 "outcomes": [o.model_dump(mode="json") for o in loaded["outcomes"].outcomes],
+                "traces": [t.model_dump(mode="json") for t in loaded["outcomes"].traces],
             },
             "protocol.json": loaded["protocol"].model_dump(mode="json"),
             "initialization.json": (

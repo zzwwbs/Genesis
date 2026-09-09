@@ -7,13 +7,26 @@ import hashlib
 import json
 import random
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import product
 from types import MappingProxyType
 from typing import Any, cast
 
 _ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+
+# The declared vocabulary for ``domain.states[].value_type`` and the Python
+# types each admits. ``number`` accepts integers because JSON has one numeric
+# type; ``integer``/``number`` reject bool despite bool subclassing int.
+STATE_VALUE_TYPES: dict[str, type | tuple[type, ...]] = {
+    "integer": int,
+    "number": (int, float),
+    "string": str,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "json": dict,
+}
 
 
 def _check_id(value: str, name: str) -> str:
@@ -233,6 +246,37 @@ def _evaluate_condition(condition: Mapping[str, Any], state: Mapping[str, Any]) 
     return _evaluate_predicate(condition, state)
 
 
+def edge_delays(dependencies: Any, after: Sequence[str]) -> dict[str, int | float]:
+    """Resolve the declared delay for each dependency edge of one process.
+
+    ``dependencies.delay`` accepts two forms. ``{"rounds": N}`` (or a bare
+    number) is the process-wide default applied to every edge. ``per_dependency``
+    maps individual dependency ids to their own lag and takes precedence, so a
+    consumer can follow one producer immediately and another with a lag —
+    a distinction the theory layer needs and a single process-level number
+    cannot express. Edges with no declared delay are immediate (0).
+    """
+    delay = dependencies.get("delay") if isinstance(dependencies, Mapping) else dependencies
+    default: int | float = 0
+    per_dependency: Mapping[str, Any] = {}
+    if isinstance(delay, Mapping):
+        rounds = delay.get("rounds")
+        if isinstance(rounds, int | float) and not isinstance(rounds, bool):
+            default = rounds
+        candidate = delay.get("per_dependency")
+        if isinstance(candidate, Mapping):
+            per_dependency = candidate
+    elif isinstance(delay, int | float) and not isinstance(delay, bool):
+        default = delay
+    resolved: dict[str, int | float] = {}
+    for dependency in after:
+        value = per_dependency.get(str(dependency), default)
+        resolved[str(dependency)] = (
+            value if isinstance(value, int | float) and not isinstance(value, bool) else 0
+        )
+    return resolved
+
+
 def _validate_scheduling_effects(
     scheduler: Scheduler, effects: tuple[Mapping[str, Any], ...]
 ) -> None:
@@ -269,6 +313,7 @@ class ProcessInvocation:
     executor_binding: Mapping[str, Any] = field(default_factory=dict)
     condition: Mapping[str, Any] = field(default_factory=dict)
     event_history: tuple[Mapping[str, Any], ...] = ()
+    feedback_slots: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def temporal_position(self) -> tuple[int | float, int | float]:
@@ -377,6 +422,7 @@ class ContextEngine:
             "condition": invocation.condition,
             "actor": {"ids": invocation.actor_ids},
             "events": invocation.event_history,
+            "feedback": invocation.feedback_slots,
         }
         exposures: dict[str, dict[str, Any]] = {}
         for path in allowed or ():
@@ -544,7 +590,7 @@ def _aggregate_value(value: Any, rule: Any) -> Any:
 class StateStore:
     def __init__(
         self,
-        schema: Mapping[str, type] | None = None,
+        schema: Mapping[str, type | tuple[type, ...]] | None = None,
         initial: Mapping[str, Any] | None = None,
         reducers: Mapping[str, Callable[[Any, Any], Any]] | None = None,
     ):
@@ -552,9 +598,21 @@ class StateStore:
         self.reducers = dict(reducers or {})
         self._state = dict(initial or {})
         for key, value in self._state.items():
-            if key not in self.schema or not isinstance(value, self.schema[key]):
+            if key not in self.schema or not self._type_ok(self.schema[key], value):
                 raise TypeError(f"invalid type for state field {key}")
         self.version = 0
+
+    @staticmethod
+    def _type_ok(expected: type | tuple[type, ...], value: Any) -> bool:
+        """Whether ``value`` satisfies a declared state type.
+
+        ``bool`` subclasses ``int``, so a numeric field would otherwise silently
+        accept ``True``; only a field declared ``boolean`` may hold one.
+        """
+        allowed = expected if isinstance(expected, tuple) else (expected,)
+        if isinstance(value, bool) and bool not in allowed:
+            return False
+        return isinstance(value, allowed)
 
     def apply(
         self,
@@ -606,7 +664,7 @@ class StateStore:
         if any(k not in self.schema or k not in declared for k in effects):
             raise PermissionError("state effect is not declared in the state model")
         for key, value in effects.items():
-            if not isinstance(value, self.schema[key]):
+            if not self._type_ok(self.schema[key], value):
                 raise TypeError(f"invalid type for state field {key}")
         self._state.update(copy.deepcopy(dict(effects)))
         self.version += 1
@@ -619,7 +677,7 @@ class StateStore:
         """Restore a snapshot after an operation failed before durable commit."""
         candidate = dict(snapshot)
         for key, value in candidate.items():
-            if key not in self.schema or not isinstance(value, self.schema[key]):
+            if key not in self.schema or not self._type_ok(self.schema[key], value):
                 raise TypeError(f"invalid type for state field {key}")
         if version < 0:
             raise ValueError("state version must be non-negative")
@@ -690,6 +748,29 @@ class ArtifactStore:
     def metadata(self, artifact_id: str) -> dict[str, Any]:
         return copy.deepcopy(self._metadata[artifact_id])
 
+    # Declared lifecycle scopes that do not outlive the round that produced
+    # them. Anything else (``run``, or an undeclared scope) persists for the
+    # whole run, which is the conservative default.
+    _ROUND_SCOPED = frozenset({"round", "phase", "event", "invocation"})
+
+    def _in_scope(self, metadata: Mapping[str, Any], phase: int | float | None) -> bool:
+        """Whether a retained instance is still live at ``phase``.
+
+        ``lifecycle_scope`` declares how long an artifact persists (spec
+        §3.3: "how long they persist"). Without this, a round-scoped artifact
+        accumulated every prior instance for the whole run, so by round N a
+        consumer's authorized context carried all N-1 earlier rounds.
+        """
+        produced = metadata.get("phase")
+        if phase is None or produced is None:
+            return True
+        if produced > phase:
+            return False
+        scope = metadata.get("lifecycle_scope")
+        if isinstance(scope, str) and scope in self._ROUND_SCOPED:
+            return bool(produced == phase)
+        return True
+
     def resolve(
         self,
         references: list[str] | tuple[str, ...],
@@ -699,6 +780,7 @@ class ArtifactStore:
     ) -> dict[str, Any]:
         """Resolve declared artifact/process references to immutable instances.
 
+        Instances outside their declared ``lifecycle_scope`` are excluded.
         When same-actor instances exist for a reference, they take precedence;
         otherwise all eligible instances are returned. This permits actor-local
         state flow and deliberate many-to-one platform/recommendation processes.
@@ -712,7 +794,7 @@ class ArtifactStore:
                     metadata.get("artifact_type") == reference
                     or metadata.get("producer_process") == reference
                 )
-                and (phase is None or metadata.get("phase") is None or metadata["phase"] <= phase)
+                and self._in_scope(metadata, phase)
             ]
             if actor_ids:
                 matching = [
@@ -771,19 +853,42 @@ class GenerativeExecutor:
 
 
 def _invocation_namespace(invocation: ProcessInvocation) -> dict[str, Any]:
+    """Build the evaluation namespace for declarative (bounded) executors.
+
+    Bounded executors read the SAME authorized context as generative ones.
+    Reading ``invocation.inputs``/``event_history``/``condition`` directly would
+    bypass the declared context policy, so a rule or state transition could see
+    artifacts and events its policy never admitted — the policy would bind only
+    the model-backed executors.
+    """
     context = getattr(invocation.context, "data", invocation.context)
     plain_context = _plain(context or {})
+    authorized: Mapping[str, Any] = plain_context if isinstance(plain_context, Mapping) else {}
+    # Only a ContextEnvelope carries policy provenance; a bare mapping means no
+    # policy was applied (direct runtime use), so it must not be read as an
+    # empty authorization.
+    if isinstance(invocation.context, ContextEnvelope):
+        inputs = authorized.get("inputs") if isinstance(authorized.get("inputs"), Mapping) else {}
+        events = authorized.get("events") or ()
+        condition = (
+            authorized.get("condition") if isinstance(authorized.get("condition"), Mapping) else {}
+        )
+    else:
+        # No policy was applied (bare runtime use); fall back to the invocation.
+        inputs = _plain(invocation.inputs)
+        events = _plain(invocation.event_history)
+        condition = _plain(invocation.condition)
     namespace = {
-        "inputs": _plain(invocation.inputs),
+        "inputs": _plain(inputs),
         "context": plain_context,
         "actor": {"ids": list(invocation.actor_ids)},
-        "condition": _plain(invocation.condition),
-        "events": _plain(invocation.event_history),
+        "condition": _plain(condition),
+        "events": _plain(events),
         "phase": invocation.phase,
         "time": invocation.time,
     }
     artifacts: dict[str, list[Any]] = {}
-    for record in invocation.inputs.values():
+    for record in (inputs or {}).values():
         if not isinstance(record, Mapping) or not record.get("artifact_type"):
             continue
         artifacts.setdefault(str(record["artifact_type"]), []).append(_plain(record.get("value")))
@@ -847,11 +952,15 @@ class StateTransitionExecutor:
         namespace = _invocation_namespace(invocation)
         context = namespace.get("context", {})
         working = dict(context) if isinstance(context, Mapping) else {}
+        # A policy may admit a state either bare ("follows") or namespaced
+        # ("state.follows"); both name the same field, so read through either.
+        namespaced_state = working.get("state")
+        namespaced_state = namespaced_state if isinstance(namespaced_state, Mapping) else {}
         effects: dict[str, Any] = {}
         for operation in self.operations:
             op = str(operation.get("op", ""))
             state = _check_id(str(operation.get("state", "")), "state")
-            current = working.get(state)
+            current = working[state] if state in working else namespaced_state.get(state)
             if "value_from" in operation:
                 value = _resolve_path(namespace, str(operation["value_from"]))
             else:
@@ -981,11 +1090,27 @@ class Scheduler:
             for dependency in process.get("after", []):
                 if dependency not in self.processes:
                     raise ValueError(f"missing dependency reference: {dependency}")
+            declared = process.get("dependencies")
+            if not isinstance(declared, Mapping):
+                declared = {"delay": process.get("delay")}
+            resolved = edge_delays(declared, process.get("after", []))
+            if any(value < 0 for value in resolved.values()):
+                raise ValueError(f"invalid dependency delay for {pid}")
             delay = process.get("delay", 0)
             if isinstance(delay, Mapping):
+                unknown = sorted(
+                    str(key)
+                    for key in (delay.get("per_dependency") or {})
+                    if str(key) not in set(process.get("after", []))
+                )
+                if unknown:
+                    raise ValueError(
+                        f"dependency delay for {pid} names non-dependencies: {unknown}"
+                    )
                 delay = delay.get("rounds", 0)
             if not isinstance(delay, int | float) or isinstance(delay, bool) or delay < 0:
                 raise ValueError(f"invalid dependency delay for {pid}")
+            process["_edge_delays"] = resolved
         self._validate_cycles()
         self._delayed_bootstrap_edges = self._find_delayed_cycle_edges()
         self.completed: dict[str, int | float] = {}
@@ -993,10 +1118,21 @@ class Scheduler:
         self._event_consumed: dict[tuple[str, str], int] = {}
         self._scheduled: list[ScheduledProcess] = []
         self._completed_occurrences: set[tuple[str, int | float]] = set()
+        # Earliest phase at which each process completed. A delayed edge asks
+        # whether the producer ran at least ``lag`` rounds ago, which the
+        # latest completion alone cannot answer for a repeating producer.
+        self._earliest_completion: dict[str, int | float] = {}
 
     def _validate_cycles(self) -> None:
+        # Only a delayed EDGE is temporal; a delay declared for one dependency
+        # must not exempt this process's other, immediate edges from cycle
+        # detection (that hid genuine zero-lag cycles).
         graph = {
-            pid: {dependency for dependency in p.get("after", []) if not p.get("delay")}
+            pid: {
+                dependency
+                for dependency in p.get("after", [])
+                if not p.get("_edge_delays", {}).get(str(dependency))
+            }
             for pid, p in self.processes.items()
         }
         while graph:
@@ -1027,11 +1163,10 @@ class Scheduler:
             reachable[start] = seen
         edges = set()
         for process_id, process in self.processes.items():
-            delay = process.get("delay", 0)
-            delay_value = delay.get("rounds", 0) if isinstance(delay, Mapping) else delay
-            if delay_value <= 0:
-                continue
+            resolved = process.get("_edge_delays", {})
             for dependency in process.get("after", []):
+                if resolved.get(str(dependency), 0) <= 0:
+                    continue
                 if process_id in reachable[dependency]:
                     edges.add((process_id, dependency))
         return edges
@@ -1051,6 +1186,51 @@ class Scheduler:
             if item.process_id == process_id and item.phase <= phase:
                 self._scheduled.pop(index)
                 return
+
+    def _repeats(self, process_id: str) -> bool:
+        process = self.processes.get(process_id, {})
+        trigger = process.get("trigger", {})
+        trigger = trigger if isinstance(trigger, Mapping) else {}
+        return bool(process.get("repeat", trigger.get("repeat", False)))
+
+    def _dependency_satisfied(
+        self,
+        pid: str,
+        process: Mapping[str, Any],
+        dep: str,
+        resolved_delays: Mapping[str, int | float],
+        phase: int | float,
+    ) -> bool:
+        """Whether one declared dependency edge permits ``pid`` to run at ``phase``.
+
+        A zero-delay edge means "after the producer, in this round". When the
+        producer repeats each round, "has completed at some earlier phase" is
+        not enough: it let every process in a repeating chain become ready at
+        once from the second round onward, so the chain ran in process-id order
+        and each consumer read the PREVIOUS round's artifacts. A repeating
+        producer must therefore have completed in the current phase.
+
+        A positive-delay edge is temporal: the producer must have completed at
+        least ``lag`` rounds ago. That is a question about the producer's
+        HISTORY, not its latest completion — a repeating producer advances its
+        latest completion every round, so ``last + lag <= phase`` could never
+        become true and a lag of two or more starved the consumer forever.
+        """
+        delay = resolved_delays.get(str(dep), 0)
+        if dep not in self.completed:
+            # A delayed edge inside a dependency cycle bootstraps on the first
+            # phase so the cycle can start at all.
+            return bool(
+                delay > 0
+                and (pid, dep) in self._delayed_bootstrap_edges
+                and phase == process.get("phase", 0)
+            )
+        if delay > 0:
+            earliest = self._earliest_completion.get(str(dep), self.completed[dep])
+            return bool(earliest + delay <= phase)
+        if self._repeats(dep):
+            return (str(dep), phase) in self._completed_occurrences
+        return bool(self.completed[dep] <= phase)
 
     def ready(
         self,
@@ -1074,7 +1254,15 @@ class Scheduler:
                 declared_after = dependencies_block.get("after")
                 if isinstance(declared_after, list | tuple):
                     deps = list(declared_after)
-            delay = p.get("delay", 0)
+            # Resolved once per process at construction; recompute only for a
+            # process that did not pass through Scheduler.__init__.
+            if "_edge_delays" in p:
+                resolved_delays = p["_edge_delays"]
+            else:
+                declared = p.get("dependencies")
+                resolved_delays = edge_delays(
+                    declared if isinstance(declared, Mapping) else p, deps
+                )
             trigger = p.get("trigger", {})
             if (
                 isinstance(trigger, Mapping)
@@ -1092,21 +1280,7 @@ class Scheduler:
                 if not _evaluate_predicate(predicate, state or {}):
                     continue
             if any(
-                (
-                    dep not in self.completed
-                    and not (
-                        (delay.get("rounds", 0) if isinstance(delay, Mapping) else delay) > 0
-                        and (pid, dep) in self._delayed_bootstrap_edges
-                        and phase == p.get("phase", 0)
-                    )
-                )
-                or (
-                    dep in self.completed
-                    and self.completed[dep]
-                    + (delay.get("rounds", 0) if isinstance(delay, Mapping) else delay)
-                    > phase
-                )
-                for dep in deps
+                not self._dependency_satisfied(pid, p, dep, resolved_delays, phase) for dep in deps
             ):
                 continue
             out.append(ScheduledProcess(pid, p.get("phase", 0)))
@@ -1117,6 +1291,9 @@ class Scheduler:
     def complete(self, process_id: str, phase: int | float) -> None:
         self.completed[process_id] = phase
         self._completed_occurrences.add((process_id, phase))
+        previous = self._earliest_completion.get(process_id)
+        if previous is None or phase < previous:
+            self._earliest_completion[process_id] = phase
         trigger = self.processes[process_id].get("trigger", {})
         if isinstance(trigger, Mapping) and trigger.get("type") == "event":
             event = str(trigger.get("event"))
@@ -1156,6 +1333,82 @@ class RunController:
         self._completed_process_events: list[dict[str, Any]] = []
         self._actor_queues: dict[tuple[str, int | float], list[tuple[str, ...]]] = {}
         self._completed_actor_occurrences: set[tuple[str, int | float, tuple[str, ...]]] = set()
+        # Round-state ring for state-feedback bindings: snapshot the state at
+        # the start of each phase, keyed by phase, so a consumer can read the
+        # state as of ``lag`` completed rounds earlier.
+        self._round_state_at_phase: dict[int | float, dict[str, Any]] = {}
+        # The protocol's first phase; the floor for "a round that actually ran".
+        self._phase_start: int = 0
+        # Ring entry reconstructed from an interrupted round's partial state.
+        self._speculative_round_start: int | None = None
+        # Committed writers of each state field, in commit order, so a lagged
+        # feedback read can name the event that produced the value it saw.
+        self._state_writers: dict[str, list[tuple[int | float, str]]] = {}
+        # Feedback provenance for the invocation currently being dispatched.
+        self._feedback_parents: tuple[str, ...] = ()
+
+    def _feedback_history(
+        self, process: Mapping[str, Any], phase: int | float
+    ) -> tuple[dict[str, Any], bool]:
+        """Resolve declared state-feedback context slots for one invocation.
+
+        Returns (slots, blocked). ``slots`` maps each declared context slot to
+        the state ``lag`` completed rounds before ``phase`` (the snapshot kept
+        at the start of ``phase - lag``); when that history does not exist, the
+        researcher-declared ``initial`` policy applies: ``declared_default``
+        injects ``initial.value``, ``skip_consumer`` sets blocked=True so the
+        dispatcher defers the process until enough rounds have elapsed.
+        """
+        slots: dict[str, Any] = {}
+        blocked = False
+        parents: list[str] = []
+        for binding in process.get("theory_feedback", []) or []:
+            if not isinstance(binding, Mapping):
+                continue
+            slot = str(binding.get("context_slot", ""))
+            if not slot:
+                continue
+            lag = int(binding.get("lag_rounds", 1))
+            # "Lag N completed rounds" reads the state snapshot captured at
+            # the start of ``phase - lag + 1`` — the state that round
+            # ``phase - lag`` finished with (the ring stores the snapshot taken
+            # at the start of each phase). History exists only when that round
+            # actually ran, so the floor is the protocol's FIRST phase, not 0:
+            # a protocol declaring ``time_model.start: 1`` has no round 0, and
+            # treating phase 0 as completed would shift every lag consumer one
+            # round early and serve the pre-run snapshot as a completed round.
+            history_phase: int | float = phase - lag + 1
+            snapshot = (
+                self._round_state_at_phase.get(history_phase)
+                if (phase - lag) >= self._phase_start
+                else None
+            )
+            if snapshot is not None:
+                source = str(binding.get("source", ""))
+                if source not in snapshot:
+                    raise ValueError(f"THEORY_FEEDBACK_SOURCE_UNKNOWN: state '{source}' is absent")
+                slots[slot] = {source: _plain(snapshot[source])}
+                # The value came from the last committed write of ``source`` at
+                # or before the round the snapshot describes. Recording it makes
+                # the influence traceable; without it a consumer of prior-round
+                # state appears to depend on nothing.
+                producing_phase = phase - lag
+                writers = [
+                    event_id
+                    for written_phase, event_id in self._state_writers.get(source, ())
+                    if written_phase <= producing_phase
+                ]
+                if writers:
+                    parents.append(writers[-1])
+                continue
+            initial = binding.get("initial") or {}
+            policy = str(initial.get("policy") or "declared_default")
+            if policy == "skip_consumer":
+                blocked = True
+            else:
+                slots[slot] = _plain(initial.get("value", {}))
+        self._feedback_parents = tuple(dict.fromkeys(parents))
+        return slots, blocked
 
     def pause(self) -> None:
         if self.status in {"running", "created"}:
@@ -1203,11 +1456,35 @@ class RunController:
                 return inputs
         return {}
 
+    def _record_state_writes(self, event_id: str, phase: int | float, state_delta: Any) -> None:
+        """Remember which committed event last wrote each state field.
+
+        A lagged feedback binding reads a value some earlier event produced.
+        Without this the reader's causal parents are empty and a trace cannot
+        explain where the value it acted on came from.
+        """
+        if not event_id:
+            return
+        if isinstance(state_delta, Mapping):
+            written: list[str] = [str(name) for name in state_delta]
+        elif isinstance(state_delta, list | tuple):
+            # Effect-list form: [{field, op, value}, ...].
+            written = [
+                str(item["field"])
+                for item in state_delta
+                if isinstance(item, Mapping) and item.get("field")
+            ]
+        else:
+            return
+        for field_name in written:
+            self._state_writers.setdefault(field_name, []).append((phase, event_id))
+
     def _causal_parent_events(
         self, process: Mapping[str, Any], call: ProcessInvocation
     ) -> list[str]:
-        """Resolve causal parents from actual inputs and declared dependencies."""
-        parents: list[str] = []
+        """Causal parents: consumed inputs, declared dependencies, and the
+        committed state writes a lagged feedback binding read."""
+        parents: list[str] = list(self._feedback_parents)
         for record in self._consumed_input_records(call).values():
             if isinstance(record, Mapping) and record.get("producer_event"):
                 parents.append(str(record["producer_event"]))
@@ -1327,6 +1604,64 @@ class RunController:
                 )
         if completed:
             self._next_phase = max(event.get("phase", 0) for event in completed)
+        # Rebuild the round-state ring so lagged state-feedback bindings keep
+        # working after a pause/resume: every committed state version's phase
+        # is known from the events, and the state snapshot for each phase is
+        # the one in effect at that phase's start (the first commit of the
+        # previous phase, or the latest state before the first commit).
+        if self.state_store and hasattr(self.persistence, "list_state_history"):
+            version_phase: dict[int, int] = {}
+            for event in events:
+                version = event.get("state_version")
+                phase = event.get("phase")
+                if isinstance(version, int) and isinstance(phase, int):
+                    version_phase[version] = phase
+            history = self.persistence.list_state_history(run_id)
+            ordered: list[tuple[int, dict[str, Any]]] = [
+                (version, snapshot) for version, snapshot in history
+            ]
+            initial_snapshot = ordered[0][1] if ordered else {}
+            # Each phase's ring entry is the FINAL state committed in that
+            # phase (the state the next phase starts with). Take the last
+            # version per phase, then key it as the start of the next phase.
+            phase_final: dict[int, dict[str, Any]] = {}
+            for version, snapshot in ordered:
+                phase = version_phase.get(version)
+                if phase is None:
+                    continue
+                phase_final[phase] = dict(snapshot)
+            ring: dict[int | float, dict[str, Any]] = {}
+            for phase, final_state in phase_final.items():
+                ring[int(phase) + 1] = final_state
+            # ``_next_phase`` is the frontier: the phase execution re-enters.
+            # Its recorded state may be only PARTIAL — the writes committed
+            # when the run stopped — so the entry derived from it for the
+            # FOLLOWING round is speculative. Record that, so the run loop
+            # replaces it with the genuine snapshot once the round really
+            # finishes, instead of preserving a stale value across resumption.
+            self._speculative_round_start = int(self._next_phase) + 1
+            # The earliest phase has no "previous phase"; its start state is
+            # the initial snapshot (pre-first-commit).
+            if events:
+                earliest = min(
+                    (
+                        int(e.get("phase", 0))
+                        for e in events
+                        if e.get("kind") in {"process_completed", "process_skipped"}
+                    ),
+                    default=None,
+                )
+                if earliest is not None:
+                    ring.setdefault(earliest, dict(initial_snapshot))
+            sorted_phases = sorted(ring)
+            for index, phase in enumerate(sorted_phases):
+                # Fill any phase gap with the previous phase's final state so
+                # lag lookups never miss a round that ran no state writes.
+                if index > 0 and phase - sorted_phases[index - 1] > 1:
+                    fill = ring[sorted_phases[index - 1]]
+                    for missing in range(int(sorted_phases[index - 1]) + 1, int(phase)):
+                        ring[int(missing)] = dict(fill)
+            self._round_state_at_phase = dict(sorted(ring.items()))
         for event in events:
             if "dispatch_order" in event:
                 self.dispatch_log.append(
@@ -1365,6 +1700,9 @@ class RunController:
                     }
                 )
                 self._completed_actor_occurrences.add((str(process_id), phase, actors))
+                self._record_state_writes(
+                    str(event.get("event_id", "")), phase, event.get("state_delta")
+                )
                 completed_groups.setdefault((str(process_id), phase), set()).add(actors)
             for emitted in event.get("events", []):
                 self._event_history.append(
@@ -1453,6 +1791,7 @@ class RunController:
         if self._run_id is not None and self._run_id != run_id:
             raise ValueError("controller cannot be reused for a different run")
         self.status, self._run_id = "running", run_id
+        self._phase_start = int(phase_start)
         if self.state_store is None and state is not None:
             # A caller may provide a lightweight initial snapshot without a
             # separately declared state schema. Infer the narrow runtime schema
@@ -1474,6 +1813,22 @@ class RunController:
             if self.status in {"paused", "cancelled"}:
                 return executed
             executed_this_phase: set[str] = set()
+            # Capture the state snapshot at the START of every phase for the
+            # state-feedback ring (feedback lag N reads the ring at phase - N).
+            # Resuming re-enters the interrupted phase with state that is
+            # already partly updated, so an existing entry — the real
+            # round-start snapshot, kept in memory or rebuilt from persistence —
+            # is never overwritten. Otherwise pausing mid-round changed what
+            # later readers saw, making an operational interruption alter the
+            # simulation's information flow.
+            snapshot_now = self.state_store.snapshot() if self.state_store else dict(state or {})
+            if self._speculative_round_start == phase:
+                # Reconstructed from the interrupted round before it finished;
+                # the round has now completed, so record its real end state.
+                self._round_state_at_phase[phase] = snapshot_now
+                self._speculative_round_start = None
+            else:
+                self._round_state_at_phase.setdefault(phase, snapshot_now)
             while True:
                 if self._poll_external_status():
                     return executed
@@ -1499,6 +1854,12 @@ class RunController:
                 executed_this_phase.add(item.process_id)
                 self.scheduler.consume_scheduled(item.process_id, phase)
                 process = self.scheduler.processes[item.process_id]
+                feedback_slots, feedback_blocked = self._feedback_history(process, phase)
+                if feedback_blocked:
+                    # initial.policy skip_consumer: not enough rounds of
+                    # history yet — defer this process to a later phase.
+                    executed_this_phase.add(item.process_id)
+                    continue
                 if (
                     terminal_phase is not None
                     and phase >= terminal_phase
@@ -1572,6 +1933,7 @@ class RunController:
                         attempt=attempt,
                         condition=condition,
                         event_history=tuple(self._event_history),
+                        feedback_slots=feedback_slots,
                     )
                     policy_id = process.get("context_policy", "private")
                     call = ProcessInvocation(
@@ -1595,6 +1957,7 @@ class RunController:
                         process.get("executor", {}),
                         call.condition,
                         call.event_history,
+                        call.feedback_slots,
                     )
                     dispatch_order = len(self.dispatch_log) + 1
                     self.dispatch_log.append(
@@ -1638,6 +2001,7 @@ class RunController:
                                 call.executor_binding,
                                 call.condition,
                                 call.event_history,
+                                call.feedback_slots,
                             )
                         result = self.registry.execute(item.process_id, call)
                         executor_returned = True
@@ -1742,6 +2106,7 @@ class RunController:
                                         "commit_order": failed_commit_order,
                                         "metadata": _event_safe_metadata(result.metadata),
                                         **self._trace_meta(process, call),
+                                        "state_version": self._persisted_count + 1,
                                         "state_delta": {},
                                     },
                                     {
@@ -1788,6 +2153,7 @@ class RunController:
                                         "commit_order": skipped_commit_order,
                                         "metadata": _event_safe_metadata(result.metadata),
                                         **self._trace_meta(process, call),
+                                        "state_version": self._persisted_count + 1,
                                         "state_delta": {},
                                     },
                                     {
@@ -1945,6 +2311,7 @@ class RunController:
                                     "metadata": _event_safe_metadata(result.metadata),
                                     "scheduling_effects": _plain(result.scheduling_effects),
                                     **self._trace_meta(process, call),
+                                    "state_version": persist_version,
                                     "state_delta": state_delta,
                                 },
                                 {
@@ -1982,6 +2349,10 @@ class RunController:
                                 "actors": list(call.actor_ids),
                             }
                         )
+                        if state_applied:
+                            self._record_state_writes(
+                                f"{call.invocation_id}-attempt-{attempt}", phase, effects
+                            )
                         self.results.append(result)
                         for emitted in result.events:
                             self._event_history.append(
@@ -2052,6 +2423,7 @@ class RunController:
                                         "classification": classification,
                                         "error": str(exc),
                                         **self._trace_meta(process, call),
+                                        "state_version": self._persisted_count + 1,
                                         "state_delta": {},
                                     },
                                     {

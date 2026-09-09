@@ -412,11 +412,16 @@ def test_outcome_consumes_declared_artifact_values(tmp_path) -> None:
         by_id = {row["outcome_id"]: row for row in outcomes}
         assert by_id["declared-value-count"]["value_count"] >= 1
         named = [row for row in outcomes if row["outcome_id"] == "named-artifact-count"]
+        # A multi-key grouping labels each group with the declared field names
+        # as well as the positional labels, so a consumer can tell which
+        # condition and phase a value belongs to.
         assert named == [
             {
                 "outcome_id": "named-artifact-count",
                 "group_0": "base",
                 "group_1": 0,
+                "condition_id": "base",
+                "phase": 0,
                 "value_count": 1,
                 "value_missing": 0,
             }

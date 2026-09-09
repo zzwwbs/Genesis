@@ -66,9 +66,9 @@ def test_precedence_binding_adds_schedule_edge() -> None:
     assert "write-after-strategy" in plan.resolved
 
 
-def test_feedback_context_executable_binding_is_rejected() -> None:
-    """F2: feedback-context execution is unsupported, so it fails compilation
-    loudly instead of being recorded as resolved while processes run without it."""
+def test_feedback_context_state_binding_is_executable() -> None:
+    """F2+: a state-source feedback binding with an initial policy resolves
+    into an executable plan (the runtime injects prior-round state)."""
     plan = compile_theory_execution(
         {
             "feedback": [
@@ -91,10 +91,17 @@ def test_feedback_context_executable_binding_is_rejected() -> None:
         known_processes=PROCESSES,
         known_mechanisms=set(),
     )
-    assert "THEORY_FEEDBACK_UNSUPPORTED" in _codes(plan)
-    assert not plan.feedback_bindings
-    # A one-round lag without an initial policy is also unsupported (the
-    # runtime cannot apply either), never recorded as resolved.
+    assert plan.valid
+    assert len(plan.feedback_bindings) == 1
+    declaration_id, source, consumer, slot, lag, initial = plan.feedback_bindings[0]
+    assert source == "performance-state"
+    assert consumer == "form-strategy"
+    assert slot == "prior-performance"
+    assert lag == 1
+    assert initial["policy"] == "declared_default"
+    assert "perf-to-strategy" in plan.resolved
+    # A one-round lag without an initial policy stays rejected (there is no
+    # history for the first rounds and no defined fallback).
     plan2 = compile_theory_execution(
         {
             "feedback": [
@@ -116,8 +123,38 @@ def test_feedback_context_executable_binding_is_rejected() -> None:
         known_processes=PROCESSES,
         known_mechanisms=set(),
     )
-    assert "THEORY_FEEDBACK_UNSUPPORTED" in _codes(plan2)
+    assert "THEORY_INITIAL_POLICY_REQUIRED" in _codes(plan2)
     assert not plan2.feedback_bindings
+
+
+def test_feedback_context_non_state_source_is_rejected() -> None:
+    """F2+: only prior-round state snapshots are executable; other sources
+    (artifacts/events) stay annotations and fail loudly if executable."""
+    plan = compile_theory_execution(
+        {
+            "feedback": [
+                {
+                    "id": "art-to-strategy",
+                    "from": "article-title",
+                    "to": "form-strategy",
+                    "relation": "adapts to prior titles",
+                    "execution": {
+                        "kind": "feedback_context",
+                        "source": {"kind": "artifact", "id": "article-title"},
+                        "consumer_process": "form-strategy",
+                        "context_slot": "prior-titles",
+                        "lag_rounds": 1,
+                        "initial": {"policy": "declared_default", "value": {}},
+                    },
+                }
+            ]
+        },
+        known_processes=PROCESSES,
+        known_mechanisms=set(),
+    )
+    assert "THEORY_FEEDBACK_SOURCE_UNSUPPORTED" in _codes(plan)
+    assert not plan.feedback_bindings
+    assert "art-to-strategy" not in plan.resolved
 
 
 def test_zero_lag_dependency_cycle_is_rejected() -> None:
@@ -279,8 +316,8 @@ def test_unknown_process_and_unsupported_kind_fail_visibly() -> None:
 
 
 def test_plan_is_versioned_and_serializable() -> None:
-    # F2: executable feedback bindings are rejected, so the serializable plan
-    # records the unsupported issue instead of a resolved feedback binding.
+    # F2+: executable state-feedback bindings serialize into the plan's
+    # feedback_bindings record (with slot, lag, initial policy).
     plan = compile_theory_execution(
         {
             "feedback": [
@@ -305,9 +342,14 @@ def test_plan_is_versioned_and_serializable() -> None:
     )
     serialized = plan.to_dict()
     assert serialized["version"] == 1
-    assert serialized["feedback_bindings"] == []
-    codes = {issue["code"] for issue in serialized["issues"]}
-    assert "THEORY_FEEDBACK_UNSUPPORTED" in codes
+    assert len(serialized["feedback_bindings"]) == 1
+    binding = serialized["feedback_bindings"][0]
+    assert binding["source"] == "s"
+    assert binding["consumer_process"] == "form-strategy"
+    assert binding["context_slot"] == "slot"
+    assert binding["lag_rounds"] == 1
+    assert binding["initial"]["policy"] == "skip_consumer"
+    assert not any(issue["code"] == "THEORY_FEEDBACK_UNSUPPORTED" for issue in serialized["issues"])
 
 
 # ---------------------------------------------------------------------------
@@ -430,3 +472,31 @@ def _yaml_dump(value):
     import yaml
 
     return yaml.safe_dump(value, sort_keys=False)
+
+
+def test_positive_lag_precedence_is_executable() -> None:
+    """F2+: a positive-lag precedence binding resolves into the plan (the
+    scheduler enforces the delay natively), never silently dropped."""
+    plan = compile_theory_execution(
+        {
+            "relations": [
+                {
+                    "id": "lag1",
+                    "from": "p",
+                    "to": "c",
+                    "relation": "c adapts one round after p",
+                    "execution": {
+                        "kind": "precedence",
+                        "producer_process": "p",
+                        "consumer_process": "c",
+                        "lag_rounds": 1,
+                    },
+                }
+            ]
+        },
+        known_processes={"p", "c"},
+        known_mechanisms=set(),
+    )
+    assert plan.valid
+    assert plan.precedence_edges == [("p", "c", 1)]
+    assert "lag1" in plan.resolved

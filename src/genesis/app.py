@@ -62,6 +62,9 @@ _REMEDIATION: dict[str, str] = {
 
 _LOGGER = logging.getLogger("genesis.app")
 
+# A GENESIS domain error is raised as "CODE: message" with an UPPER_SNAKE code.
+_DOMAIN_CODE = re.compile(r"[A-Z][A-Z0-9_]*")
+
 
 def _service_error(exc: Exception) -> JSONResponse:
     _LOGGER.warning("service error: %s", exc)
@@ -84,7 +87,19 @@ def _service_error(exc: Exception) -> JSONResponse:
             remediation=_REMEDIATION["NOT_FOUND"],
         )
     message = str(exc)
-    code = message.split(":", 1)[0] if ":" in message else "VALIDATION_ERROR"
+    code = message.split(":", 1)[0] if ":" in message else ""
+    # GENESIS domain errors carry an UPPER_SNAKE code prefix. Anything else is
+    # an internal fault, not a client mistake: reporting it as a 422 with the
+    # raw exception text both misclassifies the failure and echoes local
+    # details (filesystem paths, driver messages) back to the caller.
+    if not _DOMAIN_CODE.fullmatch(code):
+        _LOGGER.exception("unhandled service error", exc_info=exc)
+        return _error(
+            "INTERNAL_ERROR",
+            "the request failed inside the service; see the server log",
+            500,
+            remediation="Retry; if it persists, inspect the server log for the correlation id.",
+        )
     status = (
         404
         if code == "PROFILE_NOT_FOUND"
@@ -509,11 +524,34 @@ def create_app(
         except Exception as exc:
             return _service_error(exc)
 
+    @app.get("/runs/{run_id}/traces")
+    def list_traces(run_id: str) -> Any:
+        try:
+            return {"run_id": run_id, "traces": service.list_traces(run_id)}
+        except Exception as exc:
+            return _service_error(exc)
+
     @app.get("/runs/{run_id}/natural-trace")
-    def natural_trace(run_id: str, user: str | None = None, phase: int | None = None) -> Any:
+    def natural_trace(
+        run_id: str,
+        trace: str | None = None,
+        event: str | None = None,
+        actor: str | None = None,
+        user: str | None = None,
+        phase: int | None = None,
+        depth: int | None = None,
+        max_steps: int | None = None,
+    ) -> Any:
         try:
             return service.natural_trace(
-                run_id, user=user, phase=int(phase) if phase is not None else None
+                run_id,
+                trace=trace,
+                event=event,
+                # ``user`` is the former name for an actor-seeded trace.
+                actor=actor or user,
+                phase=int(phase) if phase is not None else None,
+                depth=int(depth) if depth is not None else None,
+                max_steps=int(max_steps) if max_steps is not None else None,
             )
         except Exception as exc:
             return _service_error(exc)

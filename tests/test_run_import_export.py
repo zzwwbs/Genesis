@@ -168,34 +168,45 @@ def test_import_row_is_isolated_from_source_workspace(tmp_path: Path) -> None:
         service.close()
 
 
-def test_natural_trace_endpoint_shape(tmp_path: Path) -> None:
+def test_natural_trace_requires_a_starting_point_when_none_is_declared(tmp_path: Path) -> None:
+    """A package declaring no trace must be told what to pass, not guessed at."""
     workspace = _prepared_workspace(tmp_path)
     client = TestClient(create_app(workspace))
+    assert client.get("/runs/xrun/traces").json()["traces"] == []
     response = client.get("/runs/xrun/natural-trace")
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "TRACE_SELECTION_REQUIRED"
+
+
+def test_natural_trace_walks_from_any_actor_without_a_declaration(tmp_path: Path) -> None:
+    """Traversal is generic: it works on a study that declares no trace at all."""
+    workspace = _prepared_workspace(tmp_path)
+    service = GenesisService(workspace)
+    try:
+        actors = [
+            actor for event in service.trace_run("xrun") for actor in (event.get("actors") or ())
+        ]
+        events = service.trace_run("xrun")
+    finally:
+        service.close()
+    client = TestClient(create_app(workspace))
+
+    # An unknown actor is a structured error, not an empty illustration.
+    response = client.get("/runs/xrun/natural-trace", params={"actor": "nobody"})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "ACTOR_TRACE_NOT_FOUND"
+
+    # Any recorded event is a valid starting point.
+    seed = str(events[0]["event_id"])
+    response = client.get("/runs/xrun/natural-trace", params={"event": seed})
     assert response.status_code == 200
     body = response.json()
-    assert "selection_rule" in body
-    assert body["run_id"] == "xrun"
-    assert "illustration" in body
-    illustration = body["illustration"]
-    assert {"user", "phase", "steps"} <= set(illustration)
-    for step in illustration["steps"]:
-        assert "step" in step
-
-
-def test_natural_trace_user_param(tmp_path: Path) -> None:
-    """Bound the user-parameterized trace view: error envelope for unknowns,
-    rule label for a specified user on a run with records."""
-    workspace = _prepared_workspace(tmp_path)
-    client = TestClient(create_app(workspace))
-    # unknown user -> structured 422 envelope
-    response = client.get("/runs/xrun/natural-trace", params={"user": "u99"})
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "USER_TRACE_NOT_FOUND"
-    # no user -> frozen-rule path still works
-    response = client.get("/runs/xrun/natural-trace")
-    assert response.status_code == 200
-    assert "selection_rule" in response.json()
+    assert body["seed_event"] == seed
+    assert body["illustration"]["steps"], "the seed itself is always a step"
+    assert any(step["relation"] == "seed" for step in body["illustration"]["steps"])
+    if actors:
+        response = client.get("/runs/xrun/natural-trace", params={"actor": actors[0]})
+        assert response.status_code == 200
 
 
 def test_outcomes_build_hash_fallback(tmp_path: Path) -> None:
@@ -223,5 +234,79 @@ def test_outcomes_build_hash_fallback(tmp_path: Path) -> None:
         outcomes = service.evaluate_outcomes("xrun")
         assert isinstance(outcomes, list) and outcomes, "fallback must recover the plan"
         assert any(row.get("outcome_id") == "note-count" for row in outcomes)
+    finally:
+        service.close()
+
+
+def test_import_preserves_condition_and_replication(tmp_path, monkeypatch) -> None:
+    """F1: importing a reproducibility bundle of a conditioned run must keep
+    the condition (factors), condition_id and replication on the imported run
+    and on its replay children, with the original seed preserved."""
+    import importlib.util
+
+    from genesis.evidence import ExportMode
+    from genesis.replay import ReplayMode
+
+    spec = importlib.util.spec_from_file_location(
+        "replay_configuration", str(Path(__file__).parent / "test_replay_configuration.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    source_service = mod._source_run(tmp_path, monkeypatch)
+    try:
+        source_service.export_run(
+            "source-strict-3", "exports/cond-bundle", mode=ExportMode.REPRODUCIBILITY
+        )
+        bundle = tmp_path / "workspace" / "exports" / "cond-bundle"
+
+        other = tmp_path / "other-workspace"
+        (other / "imports").mkdir(parents=True)
+        shutil.copytree(bundle, other / "imports" / "cond-bundle")
+        importer = GenesisService(other)
+        try:
+            imported = importer.import_run(other / "imports" / "cond-bundle", run_id="imp-strict")
+            assert imported["status"] == "imported"
+            record = importer.get_run("imp-strict")
+            assert record.get("condition_id") == "strict"
+            assert record.get("condition", {}).get("factors") == {
+                "policy": "strict",
+                "peer": "low",
+            }
+            assert record.get("replication") == 3
+            replay = importer.replay_run("imp-strict", mode=ReplayMode.FULL)
+            child = importer.get_run(replay["run_id"])
+            assert child.get("condition_id") == "strict"
+            assert child.get("replication") == 3
+            assert child.get("condition", {}).get("factors") == {
+                "policy": "strict",
+                "peer": "low",
+            }
+        finally:
+            importer.close()
+    finally:
+        source_service.close()
+
+
+def test_import_rejects_bundle_without_any_manifest(tmp_path: Path) -> None:
+    """F3: a bundle directory that contains the required member files but
+    NEITHER bundle_manifest.json NOR integrity.json must be rejected, instead
+    of importing with a silently unverified / unsized manifest."""
+    import json as _json
+
+    workspace = tmp_path / "workspace"
+    service = GenesisService(workspace)
+    try:
+        (workspace / "imports").mkdir(exist_ok=True)
+        bare = workspace / "imports" / "bare-bundle"
+        bare.mkdir(exist_ok=True)
+        (bare / "run_manifest.json").write_text(_json.dumps({"run_id": "bare"}))
+        (bare / "events.json").write_text("[]")
+        (bare / "artifacts.json").write_text("[]")
+        try:
+            service.import_run("imports/bare-bundle", size_limit_bytes=1)
+            raise AssertionError("a bare bundle must be rejected")
+        except ValueError as exc:
+            assert "IMPORT_MANIFEST_REQUIRED" in str(exc)
     finally:
         service.close()
