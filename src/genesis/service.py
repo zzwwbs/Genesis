@@ -3808,7 +3808,19 @@ class GenesisService:
         outcome_plan = compile_outcome_plan(build_path)
         definitions = outcome_plan["outcomes"]
         schema_catalog = self._build_schema_catalog(build_path)
-        outcome_catalog = PackageSchemaCatalog(schema_catalog) if schema_catalog else None
+        # A build compiled before the package dialect was tightened cannot bind
+        # a catalog. Refusing to read it at all would make already-recorded,
+        # integrity-verified evidence unevaluable and unexportable, so the
+        # catalog is optional here exactly as it is on the execution path; an
+        # outcome that actually asks for schema validation is refused below by
+        # name, so nothing is silently left unvalidated.
+        outcome_catalog: PackageSchemaCatalog | None = None
+        catalog_error: str | None = None
+        if schema_catalog:
+            try:
+                outcome_catalog = PackageSchemaCatalog(schema_catalog)
+            except SchemaValidationError as exc:
+                catalog_error = str(exc)
         event_rows = []
         for event in self.trace_run(run_id):
             row = dict(event)
@@ -3967,7 +3979,13 @@ class GenesisService:
                 self.last_outcome_engine = "python"
             output_schema_ref = definition.get("output_schema")
             if isinstance(output_schema_ref, str) and output_schema_ref in schema_catalog:
-                assert outcome_catalog is not None
+                if outcome_catalog is None:
+                    raise ValueError(
+                        "OUTCOME_SCHEMA_UNAVAILABLE: outcome "
+                        f"{definition['id']} declares output_schema "
+                        f"'{output_schema_ref}', but this run's build cannot bind a "
+                        f"schema catalog: {catalog_error}"
+                    )
                 for row in evaluated:
                     diagnostics = outcome_catalog.validate(output_schema_ref, row)
                     errors = [

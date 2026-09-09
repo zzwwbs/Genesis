@@ -1827,3 +1827,135 @@ def test_coverage_distinguishes_depth_truncation_from_step_truncation() -> None:
     assert complete["returned"] == 4
     assert complete["truncated"] is False
     assert complete["truncated_by"] == []
+
+
+# ---------------------------------------------------------------------------
+# Ninth review round: retained evidence stays readable
+# ---------------------------------------------------------------------------
+
+
+def _legacy_catalog_package(root, *, output_schema: bool):
+    import json as _json
+
+    import yaml
+
+    source = root / "pkg"
+    source.mkdir(parents=True)
+    (source / "schemas").mkdir()
+    (source / "schemas" / "row.json").write_text(_json.dumps({"type": "object"}))
+    base = {"schema_version": "1.0", "study_id": "lg"}
+    executor = {
+        "mode": "computational",
+        "parameters": {"entry_point": "tests.resume_executors:bump"},
+    }
+    outcome = {
+        "id": "n",
+        "source": "events",
+        "grouping": [],
+        "aggregation": {"op": "count", "field": "phase"},
+    }
+    if output_schema:
+        outcome["output_schema"] = "row"
+    files = {
+        "study": {**base, "title": "l"},
+        "openness": {
+            **base,
+            "processes": [
+                {
+                    "id": "a",
+                    "executor": executor,
+                    "context_policy": "s",
+                    "trigger": {"type": "phase", "phase": 0, "repeat": True},
+                    "state_effects": [{"field": "counter", "op": "set"}],
+                }
+            ],
+        },
+        "theory": {**base, "theory_family": "exploratory"},
+        "domain": {
+            **base,
+            "visibility": [{"id": "s", "allow": ["counter"]}],
+            "states": [{"id": "counter", "value_type": "integer", "initial": 0}],
+        },
+        "protocol": {**base, "time_model": {"type": "rounds", "start": 0, "end": 1}},
+        "outcomes": {**base, "outcomes": [outcome]},
+        "models": {**base, "models": []},
+    }
+    for name, value in files.items():
+        (source / f"{name}.yaml").write_text(yaml.safe_dump(value, sort_keys=False))
+    return source
+
+
+def _degrade_pinned_catalog(service, build_ref):
+    """Rewrite a pinned build's catalog to a pre-tightening dialect."""
+    import json as _json
+    import os
+    import stat as _stat
+
+    path = service.resolve_path(build_ref) / "schemas.json"
+    os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR)
+    legacy = {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}
+    path.write_text(_json.dumps({"row": legacy}))
+
+
+def test_a_legacy_schema_catalog_does_not_make_recorded_evidence_unreadable(tmp_path) -> None:
+    """Tightening the package dialect must not lock out runs already on disk.
+
+    Outcome evaluation built the catalog unguarded while every other site
+    guarded it, so a build compiled before the dialect changed — authentic,
+    integrity-verified evidence — could no longer be evaluated or exported.
+    """
+    from genesis.evidence import ExportMode
+    from genesis.service import GenesisService
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    source = _legacy_catalog_package(workspace, output_schema=False)
+    service = GenesisService(workspace)
+    try:
+        build = service.compile_study(source, "builds/l")
+        service.create_run({"id": "l1", "study_id": "lg", "build": build["path"]})
+        service.execute_run("l1")
+        _degrade_pinned_catalog(service, build["path"])
+
+        assert service.evaluate_outcomes("l1"), "outcomes must still be computable"
+        assert service.export_run("l1", "exports/legacy", mode=ExportMode.EXPLORATION)
+    finally:
+        service.close()
+
+
+def test_an_outcome_that_asks_for_validation_is_refused_by_name(tmp_path) -> None:
+    """Tolerating a legacy catalog must not silently skip requested validation."""
+    from genesis.service import GenesisService
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    source = _legacy_catalog_package(workspace, output_schema=True)
+    service = GenesisService(workspace)
+    try:
+        build = service.compile_study(source, "builds/l")
+        service.create_run({"id": "l1", "study_id": "lg", "build": build["path"]})
+        service.execute_run("l1")
+        # With a bindable catalog the declared schema is enforced as before.
+        assert service.evaluate_outcomes("l1")
+
+        _degrade_pinned_catalog(service, build["path"])
+        with pytest.raises(ValueError, match="OUTCOME_SCHEMA_UNAVAILABLE") as caught:
+            service.evaluate_outcomes("l1")
+        # The refusal names the outcome and the schema it wanted.
+        assert "'row'" in str(caught.value)
+    finally:
+        service.close()
+
+
+def test_compilation_still_refuses_a_legacy_dialect(tmp_path) -> None:
+    """Enforcement belongs at compile time, not when reading retained evidence."""
+    import json as _json
+
+    from genesis.compiler import StudyCompiler, ValidationIssue
+
+    source = _legacy_catalog_package(tmp_path, output_schema=False)
+    (source / "schemas" / "row.json").write_text(
+        _json.dumps({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"})
+    )
+    with pytest.raises((ValidationIssue, ValueError), match="SCHEMA_DIALECT_UNSUPPORTED"):
+        StudyCompiler(source).compile(tmp_path / "build")
