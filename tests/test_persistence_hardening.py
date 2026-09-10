@@ -228,7 +228,7 @@ def test_exact_populated_v0_schema_upgrades_to_strict_v2_without_data_loss(tmp_p
 
     persistence = coordinator(tmp_path)
 
-    assert persistence.connection.execute("PRAGMA user_version").fetchone() == (7,)
+    assert persistence.connection.execute("PRAGMA user_version").fetchone() == (9,)
     assert persistence.count("events") == 1
     assert persistence.count("states") == 1
     assert persistence.count("artifacts") == 1
@@ -261,7 +261,7 @@ def test_populated_immediate_prior_seven_table_v0_upgrades_without_data_loss(tmp
 
     persistence = coordinator(tmp_path)
 
-    assert persistence.connection.execute("PRAGMA user_version").fetchone() == (7,)
+    assert persistence.connection.execute("PRAGMA user_version").fetchone() == (9,)
     assert persistence.connection.execute(
         "SELECT commit_hash FROM events WHERE event_id = ?", (event["event_id"],)
     ).fetchone() == ("c" * 64,)
@@ -541,7 +541,7 @@ def test_database_object_metadata_conflict_is_detected_across_live_coordinators(
 def test_database_schema_uses_explicit_current_user_version(tmp_path):
     persistence = coordinator(tmp_path)
 
-    assert persistence.connection.execute("PRAGMA user_version").fetchone() == (7,)
+    assert persistence.connection.execute("PRAGMA user_version").fetchone() == (9,)
 
 
 def test_database_rejects_unsupported_future_schema_version(tmp_path):

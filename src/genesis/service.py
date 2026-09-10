@@ -12,9 +12,10 @@ import stat
 import statistics
 import tempfile
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
@@ -62,6 +63,7 @@ from genesis.outcome_plan import (
 )
 from genesis.persistence import ObjectRef, PersistenceCoordinator
 from genesis.providers import (
+    AnswerPoolProvider,
     OpenAICompatibleProvider,
     ProviderExecutor,
     ProviderRequest,
@@ -244,6 +246,15 @@ _PROTOCOL_BLOCK_FIELDS = frozenset(
 )
 
 
+def _file_digest(path: Path, *, chunk: int = 1 << 20) -> str:
+    """sha256 of a file read in bounded chunks (STH-003)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(chunk):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _parquet_safe(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Project rows to parquet-writable scalars (nested values as JSON strings)."""
     safe = []
@@ -256,6 +267,85 @@ def _parquet_safe(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 item[key] = value
         safe.append(item)
     return safe
+
+
+def _artifact_row(
+    artifact: Mapping[str, Any],
+    run_id: str,
+    run: Mapping[str, Any],
+    declared_ids: set[str],
+) -> dict[str, Any] | None:
+    """One artifact as an analysis row, or None if its payload is not an object."""
+    payload = artifact["payload"]
+    if not isinstance(payload, dict):
+        return None
+    row: dict[str, Any] = {
+        "artifact_id": artifact["artifact_id"],
+        "run_id": run_id,
+        "time": 0,
+        "condition_id": run.get("condition_id", "base"),
+        "replication": int(run.get("replication", 1)),
+    }
+    row.setdefault("invocation_id", payload.get("invocation_id"))
+    row.setdefault("process_id", payload.get("process_id"))
+    row.setdefault("phase", payload.get("phase"))
+    # Synthetic trace rows defer to the declared row for declared keys.
+    row.update(
+        {key: value for key, value in payload.get("outputs", {}).items() if key not in declared_ids}
+    )
+    if "value" in payload:
+        row["value"] = payload["value"]
+        if isinstance(payload["value"], dict):
+            row.update(payload["value"])
+        if isinstance(payload.get("declared_artifact_id"), str):
+            row[payload["declared_artifact_id"]] = payload["value"]
+    return row
+
+
+def _source_rows(sources: Mapping[str, Any], name: str) -> Iterable[Mapping[str, Any]]:
+    """A fresh walk of one relation, whether it is a list or a lazy factory."""
+    source = sources.get(name)
+    if source is None:
+        return ()
+    rows: Iterable[Mapping[str, Any]] = source() if callable(source) else source
+    return rows
+
+
+def _hash_join(
+    left: Iterable[Mapping[str, Any]], right: Iterable[Mapping[str, Any]], on: str
+) -> list[dict[str, Any]]:
+    """Join two relations on a key by indexing the right side (OUT-005).
+
+    This was a nested loop, so a joined outcome cost O(left x right)
+    comparisons -- roughly 621 million at the illustrated scale, for one
+    outcome. Indexing the right relation once makes it O(left + right).
+
+    Row order is unchanged: matches are emitted in left order, and within one
+    left row in right order, exactly as the nested loop produced them.
+
+    An unhashable key cannot index, but it can still compare equal -- ``{} ==
+    {}`` is true, and the nested loop matched such rows. They are kept aside and
+    scanned linearly so they still match. A hashable key and an unhashable one
+    never compare equal, so the two sets do not cross.
+    """
+    index: dict[Any, list[Mapping[str, Any]]] = {}
+    unindexed: list[Mapping[str, Any]] = []
+    for row in right:
+        key = row.get(on)
+        try:
+            index.setdefault(key, []).append(row)
+        except TypeError:
+            unindexed.append(row)
+    merged: list[dict[str, Any]] = []
+    for row in left:
+        key = row.get(on)
+        try:
+            matches: Iterable[Mapping[str, Any]] = index.get(key) or ()
+        except TypeError:
+            matches = [other for other in unindexed if other.get(on) == key]
+        for match in matches:
+            merged.append({**row, **match})
+    return merged
 
 
 def _load_empirical_data(path: Path, data_ref: str) -> dict[str, Any]:
@@ -971,7 +1061,49 @@ class GenesisService:
             r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", profile_id
         ):
             raise ValueError("INVALID_ID: model profile id must be a stable lowercase identifier")
-        if payload.get("provider") != "openai-compatible":
+        provider_kind = payload.get("provider")
+        if provider_kind == "answer-pool":
+            # A local pool has no endpoint and no credential; what it needs is a
+            # pool to draw from and a seed, so the run is reproducible.
+            pool = payload.get("pool")
+            if not isinstance(pool, str) or not pool.strip():
+                raise ValueError("ANSWER_POOL: pool must be a workspace-relative path")
+            model = payload.get("model")
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError("MODEL_NAME: model must be a non-empty string")
+            echo = payload.get("echo", {})
+            if not isinstance(echo, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in echo.items()
+            ):
+                raise ValueError("ANSWER_POOL: echo must map field names to patterns")
+            for name, pattern in echo.items():
+                try:
+                    compiled = re.compile(pattern)
+                except re.error as exc:
+                    raise ValueError(
+                        f"ANSWER_POOL: echo pattern for '{name}' is invalid: {exc}"
+                    ) from exc
+                if compiled.groups < 1:
+                    raise ValueError(
+                        f"ANSWER_POOL: echo pattern for '{name}' needs a capture group"
+                    )
+            seed = payload.get("seed", 0)
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise ValueError("ANSWER_POOL: seed must be an integer")
+            parameters = payload.get("parameters", {})
+            if not isinstance(parameters, dict):
+                raise ValueError("MODEL_PARAMETERS: parameters must be an object")
+            return {
+                "id": profile_id,
+                "provider": "answer-pool",
+                "model": model.strip(),
+                "pool": pool.strip(),
+                "seed": seed,
+                "echo": dict(echo),
+                "parameters": dict(parameters),
+                "version": int(payload.get("version", 1)),
+            }
+        if provider_kind != "openai-compatible":
             raise ValueError("MODEL_PROVIDER: only openai-compatible is supported")
         base_url = payload.get("base_url")
         parsed = urlparse(str(base_url))
@@ -1865,17 +1997,7 @@ class GenesisService:
                 configured = self.get_model_profile(str(profile_id))
             except KeyError:
                 continue
-            endpoint_identity = hashlib.sha256(
-                json.dumps(
-                    {
-                        "base_url": configured.get("base_url"),
-                        "model": configured.get("model"),
-                        "timeout": configured.get("timeout"),
-                        "provider": configured.get("provider"),
-                    },
-                    sort_keys=True,
-                ).encode()
-            ).hexdigest()[:16]
+            endpoint_identity = self._profile_identity(configured)
             resolved[str(profile_id)] = {
                 "parameters": dict(configured.get("parameters", {})),
                 "endpoint_hash": endpoint_identity,
@@ -2197,20 +2319,25 @@ class GenesisService:
                 )
             configured = self._full_model_profile(profile_id)
             profile = model_profiles[profile_id]
-            if profile.get("provider") != "openai-compatible":
+            provider_kind = str(profile.get("provider") or "")
+            if provider_kind not in {"openai-compatible", "answer-pool"}:
                 raise ValueError(f"MODEL_PROVIDER: unsupported provider {profile.get('provider')}")
             resolved_build = json.loads((build_path / "build_manifest.json").read_text())
             _check_profile_drift(
                 profile_id, configured, profile, str(resolved_build.get("build_hash", ""))
             )
-            provider = OpenAICompatibleProvider(
-                base_url=str(configured["base_url"]),
-                model=str(configured["model"]),
-                api_key_env=str(configured["api_key_env"]),
-                api_key=configured.get("api_key"),
-                timeout=float(configured.get("timeout", 60)),
-                cancel_event=cancel_event,
-            )
+            provider: Any
+            if provider_kind == "answer-pool":
+                provider = self._answer_pool_provider(configured)
+            else:
+                provider = OpenAICompatibleProvider(
+                    base_url=str(configured["base_url"]),
+                    model=str(configured["model"]),
+                    api_key_env=str(configured["api_key_env"]),
+                    api_key=configured.get("api_key"),
+                    timeout=float(configured.get("timeout", 60)),
+                    cancel_event=cancel_event,
+                )
             prompt_ref = process.get("prompt_ref")
             prompt_template = (
                 prompt_templates.get(prompt_ref, "{context}")
@@ -2694,22 +2821,198 @@ class GenesisService:
             )
         return aggregates
 
-    def trace_run(self, run_id: str) -> list[dict[str, Any]]:
-        run = self.get_run(run_id)
-        return [*self.persistence.list_events(run_id), *run.get("events", [])]
+    # Event fields retained as evidence but never read by any analysis path.
+    # ``context`` is the authorized context an invocation received; it is 62% of
+    # event bytes on a real run and is consumed only by export and the trace
+    # endpoints, so analysis reads project it away.
+    _EVIDENCE_ONLY_EVENT_FIELDS = ("context",)
 
-    def artifacts_for_run(self, run_id: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _plan_reads_artifact_relation(outcome_plan: Mapping[str, Any]) -> bool:
+        """Whether anything in this plan reads the generic ``artifacts`` relation.
+
+        Only the per-invocation record artifacts carry ``outputs``; a declared
+        artifact carries ``value`` and is exposed under its own id instead. So
+        when nothing sources from ``artifacts``, those output payloads — which
+        grow with accumulated state — are never read.
+
+        Returns True whenever the answer is not certain, so a plan shape not
+        anticipated here keeps everything.
+        """
+        datasets = outcome_plan.get("datasets") or []
+        outcomes = outcome_plan.get("outcomes") or []
+        if not datasets:
+            # No declared datasets: the legacy synthesis reads artifacts.
+            return True
+        for dataset in datasets:
+            if not isinstance(dataset, Mapping):
+                return True
+            source = dataset.get("source") or {}
+            if not isinstance(source, Mapping):
+                return True
+            if str(source.get("kind", "")) == "artifacts":
+                return True
+        for outcome in outcomes:
+            if not isinstance(outcome, Mapping):
+                return True
+            source = outcome.get("source")
+            names = source if isinstance(source, list) else [source]
+            if any(str(name) == "artifacts" for name in names):
+                return True
+            join = outcome.get("join")
+            if isinstance(join, Mapping) and "artifacts" in {
+                str(join.get("left", "events")),
+                str(join.get("right", "artifacts")),
+            }:
+                return True
+        return False
+
+    @staticmethod
+    def _unused_event_fields(outcome_plan: Mapping[str, Any]) -> tuple[str, ...]:
+        """Heavy event fields this plan demonstrably does not read.
+
+        ``state_delta`` carries whole-field replacements, so it grows with the
+        accumulated state and dominates memory on a long run. It is read only by
+        datasets sourced from events through a ``state_delta`` path, and by the
+        legacy flat-row synthesis. When a plan declares datasets and none of them
+        reach into it, retaining it costs memory for nothing.
+
+        Conservative by construction: a plan with no declared datasets keeps
+        everything, because the legacy path may still read it.
+        """
+        datasets = outcome_plan.get("datasets") or []
+        if not datasets:
+            return ()
+        for dataset in datasets:
+            if not isinstance(dataset, Mapping):
+                return ()
+            source = dataset.get("source") or {}
+            if not isinstance(source, Mapping) or str(source.get("kind", "")) != "events":
+                continue
+            path = str(source.get("path") or "")
+            if not path or path.split(".", 1)[0] == "state_delta":
+                return ()
+        # Inspecting source paths alone was not enough: an outcome sourced from
+        # events, or a dataset reaching state_delta through fields, where or
+        # deduplicate_on, read it as empty once any dataset was declared.
+        if GenesisService._plan_mentions(outcome_plan, "state_delta"):
+            return ()
+        return ("state_delta",)
+
+    @staticmethod
+    def _plan_mentions(outcome_plan: Mapping[str, Any], token: str) -> bool:
+        """Whether any dataset, outcome or trace names ``token`` as a path segment."""
+
+        def mentions(value: Any) -> bool:
+            if isinstance(value, str):
+                return token in value.split(".")
+            if isinstance(value, Mapping):
+                return any(mentions(str(key)) or mentions(item) for key, item in value.items())
+            if isinstance(value, list | tuple):
+                return any(mentions(item) for item in value)
+            return False
+
+        return any(
+            mentions(outcome_plan.get(section) or [])
+            for section in ("datasets", "outcomes", "traces")
+        )
+
+    @classmethod
+    def _unused_evidence_fields(
+        cls, outcome_plan: Mapping[str, Any]
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Fields analysis may project away: (event fields, artifact fields).
+
+        Recorded contexts and provider exchanges are retained as evidence and
+        dominate memory, so analysis reads drop them -- but only when nothing
+        in the plan names them. That no analysis path reads them used to be
+        assumed, and a dataset declaring ``context.topic`` then read None from
+        every row.
+        """
+        events = tuple(cls._unused_event_fields(outcome_plan)) + tuple(
+            name
+            for name in cls._EVIDENCE_ONLY_EVENT_FIELDS
+            if not cls._plan_mentions(outcome_plan, name)
+        )
+        artifacts = tuple(
+            name
+            for name in cls._EVIDENCE_ONLY_ARTIFACT_FIELDS
+            if not cls._plan_mentions(outcome_plan, name)
+        )
+        if not cls._plan_reads_artifact_relation(outcome_plan):
+            artifacts += ("outputs",)
+        return events, artifacts
+
+    def trace_run(
+        self, run_id: str, *, evidence: bool = True, drop: tuple[str, ...] = ()
+    ) -> list[dict[str, Any]]:
+        """A run's committed events.
+
+        ``evidence=True`` (default) returns the complete record, which is what
+        export and the trace endpoints must serve. ``evidence=False`` projects
+        away fields no analysis path reads, so a consumer that retains the whole
+        list does not also retain the recorded contexts.
+        """
         run = self.get_run(run_id)
-        artifacts = self.persistence.list_artifacts(run_id)
-        decoded = []
-        for artifact in artifacts:
+        drop = tuple(drop) + (() if evidence else self._EVIDENCE_ONLY_EVENT_FIELDS)
+        excluded = set(drop)
+        events = self.persistence.list_events(run_id, exclude_fields=drop)
+        # Stored events are already projected; only run-level ones need it.
+        events.extend(
+            {key: value for key, value in event.items() if key not in excluded}
+            if excluded
+            else event
+            for event in run.get("events", [])
+        )
+        return events
+
+    # Artifact payload fields retained as evidence but never read by an
+    # analysis path: the provider exchange behind a generated value. Retention
+    # and export read them; outcomes, datasets and traces do not.
+    _EVIDENCE_ONLY_ARTIFACT_FIELDS = ("provider_attempts", "raw_response", "parsed_response")
+
+    def artifacts_for_run(
+        self, run_id: str, *, evidence: bool = True, drop: tuple[str, ...] = ()
+    ) -> list[dict[str, Any]]:
+        """A run's retained artifacts.
+
+        ``evidence=False`` projects away the provider exchange, which no
+        analysis path reads and which grows with the run.
+        """
+        return list(self.iter_artifacts_for_run(run_id, evidence=evidence, drop=drop))
+
+    def iter_artifacts_for_run(
+        self, run_id: str, *, evidence: bool = True, drop: tuple[str, ...] = ()
+    ) -> Iterator[dict[str, Any]]:
+        """A run's retained artifacts, decoded and projected one at a time.
+
+        The list form read every payload into memory and then built a second
+        list of the parsed values, so both were resident at peak. Nothing that
+        scans artifacts needs either list.
+        """
+        run = self.get_run(run_id)
+        drop = tuple(drop) + (() if evidence else self._EVIDENCE_ONLY_ARTIFACT_FIELDS)
+        for artifact in self.persistence.iter_artifacts(run_id):
             payload = artifact["payload"]
             try:
                 value = json.loads(payload)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 value = payload.hex()
-            decoded.append({**artifact, "payload": value})
-        return [*decoded, *run.get("artifacts", [])]
+            if drop and isinstance(value, dict):
+                for field_name in drop:
+                    value.pop(field_name, None)
+            yield {**artifact, "payload": value}
+        # Run-level artifacts get the same projection, so what a reader sees does
+        # not depend on where an artifact happens to be stored.
+        for item in run.get("artifacts", []):
+            payload = item.get("payload") if isinstance(item, Mapping) else None
+            if drop and isinstance(payload, Mapping):
+                yield {
+                    **item,
+                    "payload": {key: value for key, value in payload.items() if key not in drop},
+                }
+            else:
+                yield item
 
     def append_run_collection(
         self, run_id: str, field: str, payload: dict[str, Any]
@@ -3711,7 +4014,7 @@ class GenesisService:
         reporting success.
         """
         committed: dict[tuple[str, int], dict[str, Any]] = {}
-        for event in self.trace_run(run_id):
+        for event in self.trace_run(run_id, evidence=False):
             if event.get("kind") != "process_completed":
                 continue
             invocation = str(event.get("invocation_id", ""))
@@ -3769,6 +4072,12 @@ class GenesisService:
         if len(declared_keys) > 1:
             return None
         group_key = declared_keys[0] if declared_keys else None
+        from genesis.analysis import _duckdb_is_exact
+
+        # Only calls DuckDB answers byte-for-byte take its path; anything else
+        # stays in-process and is labelled so.
+        if not _duckdb_is_exact(rows, select=plan.select, op=plan.aggregation, group_by=group_key):
+            return None
         try:
             from genesis.analysis import duckdb_aggregate
 
@@ -3821,98 +4130,133 @@ class GenesisService:
                 outcome_catalog = PackageSchemaCatalog(schema_catalog)
             except SchemaValidationError as exc:
                 catalog_error = str(exc)
-        event_rows = []
-        for event in self.trace_run(run_id):
-            row = dict(event)
-            row["time"] = event.get("phase", 0)
-            event_rows.append(row)
-        artifacts = self.artifacts_for_run(run_id)
+        drop_fields, artifact_drop = self._unused_evidence_fields(outcome_plan)
+        excluded = set(drop_fields)
+        run_events = list(run.get("events", []) or [])
+
+        def event_stream() -> Iterator[dict[str, Any]]:
+            """A fresh walk of the ledger, projected as the analysis rows.
+
+            The same rows ``trace_run(evidence=False, drop=unused)`` returns,
+            yielded one at a time rather than returned as a list (OUT-001). The
+            ledger dominated outcome memory: 91% of what evaluation reads is
+            ``state_delta``, and it is load-bearing -- forcing it out zeroes
+            every outcome -- so it cannot be projected away, only streamed.
+            """
+            for event in self.persistence.iter_events(run_id, exclude_fields=drop_fields):
+                row = {key: value for key, value in event.items() if key not in excluded}
+                row["time"] = event.get("phase", 0)
+                yield row
+            for event in run_events:
+                row = {key: value for key, value in event.items() if key not in excluded}
+                row["time"] = event.get("phase", 0)
+                yield row
+
+        # One walk builds the small projections the rest of the path needs, so
+        # no consumer holds the whole ledger to reach a few scalar fields.
+        annotation_rows: list[dict[str, Any]] = []
+        lineage_rows: list[dict[str, Any]] = []
+        for row in event_stream():
+            annotation_rows.append(
+                {
+                    "event_id": row.get("event_id"),
+                    "invocation_id": row.get("invocation_id"),
+                    "kind": row.get("kind"),
+                    "phase": row.get("phase"),
+                    "state_version": row.get("state_version"),
+                    "commit_order": row.get("commit_order"),
+                }
+            )
+            lineage_rows.append(
+                {
+                    "event_id": row.get("event_id"),
+                    "invocation_id": row.get("invocation_id"),
+                    "process_id": row.get("process_id"),
+                    "phase": row.get("phase", 0),
+                    "parent_events": row.get("parent_events", []),
+                }
+            )
+
+        def artifact_records() -> Iterator[dict[str, Any]]:
+            return self.iter_artifacts_for_run(run_id, evidence=True, drop=artifact_drop)
+
+        # The declared ids are a handful of strings; finding them does not
+        # require the payloads that carry them to stay resident.
         declared_ids = {
             str(payload["declared_artifact_id"])
-            for artifact in artifacts
+            for artifact in artifact_records()
             if isinstance((payload := artifact["payload"]), dict)
             and isinstance(payload.get("declared_artifact_id"), str)
         }
-        artifact_rows = []
+
+        def artifact_row_stream() -> Iterator[dict[str, Any]]:
+            for artifact in artifact_records():
+                row = _artifact_row(artifact, run_id, run, declared_ids)
+                if row is not None:
+                    yield row
+
+        # Only the declared relations are grouped, so only those rows are held.
         artifact_sources: dict[str, list[dict[str, Any]]] = {}
-        for artifact in artifacts:
+        for artifact in artifact_records():
             payload = artifact["payload"]
-            if not isinstance(payload, dict):
+            declared_id = payload.get("declared_artifact_id") if isinstance(payload, dict) else None
+            if not isinstance(declared_id, str):
                 continue
-            artifact_row: dict[str, Any] = {
-                "artifact_id": artifact["artifact_id"],
-                "run_id": run_id,
-                "time": 0,
-                "condition_id": run.get("condition_id", "base"),
-                "replication": int(run.get("replication", 1)),
-            }
-            artifact_row.setdefault("invocation_id", payload.get("invocation_id"))
-            artifact_row.setdefault("process_id", payload.get("process_id"))
-            artifact_row.setdefault("phase", payload.get("phase"))
-            # Synthetic trace rows defer to the declared row for declared keys.
-            artifact_row.update(
-                {
-                    key: value
-                    for key, value in payload.get("outputs", {}).items()
-                    if key not in declared_ids
-                }
-            )
-            if "value" in payload:
-                artifact_row["value"] = payload["value"]
-                if isinstance(payload["value"], dict):
-                    artifact_row.update(payload["value"])
-                if isinstance(payload.get("declared_artifact_id"), str):
-                    artifact_row[payload["declared_artifact_id"]] = payload["value"]
-            artifact_rows.append(artifact_row)
-            declared_id = payload.get("declared_artifact_id")
-            if isinstance(declared_id, str):
-                artifact_sources.setdefault(declared_id, []).append(artifact_row)
-        state_rows = self._round_annotated_state(run_id, run, event_rows)
+            row = _artifact_row(artifact, run_id, run, declared_ids)
+            if row is not None:
+                artifact_sources.setdefault(declared_id, []).append(row)
+
+        def state_stream() -> Iterator[dict[str, Any]]:
+            """The round snapshots, one at a time.
+
+            This is the largest thing left in outcome memory: one accumulated
+            snapshot per round, and an accumulated snapshot grows with
+            population x horizon. Holding forty of them is what a long run
+            costs; producing them one at a time is what an outcome needs.
+            """
+            yield from self._iter_round_annotated_state(run_id, run, annotation_rows)
+
         # OUT-005: generic outcome derivation. When the outcome plan declares
         # datasets, rows are materialized ONCE by the fixed operation registry
         # and exposed under the dataset ids; raw event rows are never enlarged
         # by derived rows, so an outcome counting events counts exactly the
         # raw evidence (F4 fix: no double-counting). The legacy flat-row
         # synthesis remains for packages that predate the datasets contract.
-        raw_event_rows = event_rows
         dataset_rows: dict[str, list[dict[str, Any]]] = {}
         if outcome_plan.get("datasets"):
             dataset_rows = materialize_datasets(
                 outcome_plan,
+                # Factories, not lists: listing all three first held the whole
+                # ledger, every artifact and every round snapshot at once.
                 {
-                    "events": raw_event_rows,
-                    "artifacts": artifacts,
-                    "state": state_rows,
+                    "events": event_stream,
+                    "artifacts": artifact_records,
+                    "state": state_stream,
                 },
             )
-        lineage_rows = [
-            {
-                "event_id": event.get("event_id"),
-                "invocation_id": event.get("invocation_id"),
-                "process_id": event.get("process_id"),
-                "phase": event.get("phase", 0),
-                "parent_events": event.get("parent_events", []),
-            }
-            for event in raw_event_rows
-        ]
-        event_rows = raw_event_rows
-        sources: dict[str, list[dict[str, Any]]] = {
-            "events": event_rows,
-            "artifacts": artifact_rows,
-            "state": state_rows,
+        sources: dict[str, Any] = {
+            "events": event_stream,
+            "artifacts": artifact_row_stream,
+            "state": state_stream,
             "lineage": lineage_rows,
             **artifact_sources,
         }
         if outcome_plan.get("datasets"):
             sources.update(dataset_rows)
         else:
-            # Legacy flat-row packages aggregate over a synthesized event
-            # view; keep that behaviour only for pre-dataset packages.
-            derived = self._legacy_derived_rows(event_rows, artifact_rows)
+            # Legacy flat-row packages aggregate over a synthesized event view;
+            # keep that behaviour only for pre-dataset packages. The derived
+            # rows are bounded by the records they summarise, so they are held;
+            # the ledger behind them still streams.
+            # Streamed: listing the artifact rows held every artifact's outputs
+            # at once -- 342 MB at 40 rounds for an accumulating study.
+            derived = self._legacy_derived_rows(event_stream(), artifact_row_stream())
             if derived:
-                event_rows = derived + event_rows
-                sources["events"] = event_rows
+                sources["events"] = lambda: chain(derived, event_stream())
         results: list[dict[str, Any]] = []
+        # OUT-002: build every plan first, then evaluate them together, so a
+        # relation is walked once rather than once per outcome reading it.
+        prepared: list[tuple[dict[str, Any], OutcomePlan]] = []
         for definition in definitions:
             join = definition.get("join")
             joined_name: str | None = None
@@ -3920,15 +4264,10 @@ class GenesisService:
                 left = str(join.get("left", "events"))
                 right = str(join.get("right", "artifacts"))
                 on = str(join.get("on", "invocation_id"))
-                merged_rows: list[dict[str, Any]] = []
-                for left_row in sources.get(left, []):
-                    for right_row in sources.get(right, []):
-                        if left_row.get(on) == right_row.get(on):
-                            combined: dict[str, Any] = dict(left_row)
-                            combined.update(right_row)
-                            merged_rows.append(combined)
                 joined_name = f"{left}+{right}"
-                sources[joined_name] = merged_rows
+                sources[joined_name] = _hash_join(
+                    _source_rows(sources, left), _source_rows(sources, right), on
+                )
             aggregation = definition.get("aggregation", {})
             op_type = str(
                 aggregation.get(
@@ -3970,8 +4309,19 @@ class GenesisService:
                 missingness=missingness,
                 window=window,
             )
-            evaluated = AnalysisEngine().evaluate(plan, sources)
-            alternate = self._duckdb_outcome_rows(plan, sources.get(str(plan.source), []))
+            prepared.append((definition, plan))
+
+        evaluations = AnalysisEngine().evaluate_many([plan for _d, plan in prepared], sources)
+        for (definition, plan), evaluated in zip(prepared, evaluations, strict=True):
+            # The SQL path needs a materialised relation; it is opt-in, so a
+            # lazy source is only walked into a list when it is actually on.
+            alternate = (
+                self._duckdb_outcome_rows(
+                    plan, [dict(row) for row in _source_rows(sources, str(plan.source))]
+                )
+                if os.environ.get("GENESIS_USE_DUCKDB", "0") == "1"
+                else None
+            )
             if alternate is not None:
                 evaluated, engine = alternate
                 self.last_outcome_engine = engine
@@ -4004,7 +4354,7 @@ class GenesisService:
 
     @staticmethod
     def _legacy_derived_rows(
-        event_rows: list[dict[str, Any]], artifact_rows: list[dict[str, Any]]
+        event_rows: Iterable[Mapping[str, Any]], artifact_rows: Iterable[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Legacy flat-row synthesis for packages predating declared datasets.
 
@@ -5250,6 +5600,67 @@ class GenesisService:
             "theory_templates": sorted(workflow.theory_templates),
         }
 
+    def _answer_pool_provider(self, configured: Mapping[str, Any]) -> Any:
+        """Build a local answer-pool provider from a model profile.
+
+        Declared rather than injected, so a pooled run is a property of the
+        profile the run resolved and is recorded as such. The pool file stays
+        outside the package: it is test scaffolding, not part of a study.
+        """
+        pool_ref = configured.get("pool")
+        if not isinstance(pool_ref, str) or not pool_ref:
+            raise ValueError("ANSWER_POOL: profile requires a 'pool' path")
+        pool_path = self.resolve_path(pool_ref)
+        if not pool_path.is_file():
+            raise ValueError(f"ANSWER_POOL: pool file not found: {pool_ref}")
+        try:
+            pool = json.loads(pool_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"ANSWER_POOL: pool file is not valid JSON: {pool_ref}") from exc
+        if not isinstance(pool, dict) or not pool:
+            raise ValueError("ANSWER_POOL: pool must be a non-empty object keyed by process id")
+        echo = configured.get("echo")
+        return AnswerPoolProvider(
+            pool,
+            seed=int(configured.get("seed", 0)),
+            echo=echo if isinstance(echo, Mapping) else None,
+        )
+
+    def _profile_identity(self, configured: Mapping[str, Any]) -> str:
+        """The endpoint identity recorded for a resolved model profile.
+
+        A live profile keeps exactly the identity it always had. A pooled one
+        also carries its pool, seed, echo patterns and the pool file's digest:
+        without them two different pools resolved to the same identity, so a
+        pooled run could change its answers with nothing in the manifest to
+        show it.
+        """
+        identity: dict[str, Any] = {
+            "base_url": configured.get("base_url"),
+            "model": configured.get("model"),
+            "timeout": configured.get("timeout"),
+            "provider": configured.get("provider"),
+        }
+        if configured.get("provider") == "answer-pool":
+            pool_ref = configured.get("pool")
+            digest = None
+            if isinstance(pool_ref, str) and pool_ref:
+                try:
+                    pool_path = self.resolve_path(pool_ref)
+                    if pool_path.is_file():
+                        digest = _file_digest(pool_path)
+                except ValueError:
+                    digest = None
+            identity.update(
+                {
+                    "pool": pool_ref,
+                    "seed": configured.get("seed"),
+                    "echo": configured.get("echo"),
+                    "pool_sha256": digest,
+                }
+            )
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+
     def _provider_fail_safe(self, builder: Any, profile_id: str) -> tuple[str, Any]:
         provider = builder(profile_id)
         return getattr(provider, "provider", "unknown"), provider
@@ -5452,13 +5863,15 @@ class GenesisService:
             )
             # NOTE: raw cumulative state snapshots are intentionally NOT exported
             # as JSON (hundreds of MB); the compact parquet projection is kept.
-            state_history = self.persistence.list_state_history(run_id)
-            state_rows_for_export = [
-                {**snapshot, "state_version": version} for version, snapshot in state_history
-            ]
+            # STH-003: stream the projection; the full history is quadratic in
+            # population x horizon and must never be resident at once.
             output_paths.append(
-                AnalysisExporter.rows_to_parquet(
-                    _parquet_safe(state_rows_for_export), destination / "states.parquet"
+                AnalysisExporter.stream_rows_to_parquet(
+                    lambda: (
+                        _parquet_safe([{**snapshot, "state_version": version}])[0]
+                        for version, snapshot in self.persistence.iter_state_history(run_id)
+                    ),
+                    destination / "states.parquet",
                 )
             )
         else:
@@ -5495,10 +5908,8 @@ class GenesisService:
             for path in destination.rglob("*")
             if path.is_file() and path.name not in {"integrity.json", "bundle_manifest.json"}
         ]
-        integrity = {
-            path.relative_to(destination).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in files
-        }
+        # Chunked so a streamed file is not reloaded whole just to hash it.
+        integrity = {path.relative_to(destination).as_posix(): _file_digest(path) for path in files}
         integrity_path = destination / "integrity.json"
         integrity_path.write_text(json.dumps(integrity, indent=2, sort_keys=True) + "\n")
         output_paths.append(integrity_path)
@@ -5626,8 +6037,8 @@ class GenesisService:
         * with none of them, the package's single declared trace is used, and a
           package declaring none (or several) is told what to pass.
         """
-        events = self.trace_run(run_id)
-        artifacts = self.artifacts_for_run(run_id)
+        events = self.trace_run(run_id, evidence=False)
+        artifacts = self.artifacts_for_run(run_id, evidence=False)
         labels: dict[str, str] = {}
         bounded = depth
         cap = max_steps
@@ -5713,6 +6124,15 @@ class GenesisService:
         run: Mapping[str, Any],
         event_rows: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        """Every round's snapshot as a list. Prefer the iterator where possible."""
+        return list(self._iter_round_annotated_state(run_id, run, event_rows))
+
+    def _iter_round_annotated_state(
+        self,
+        run_id: str,
+        run: Mapping[str, Any],
+        event_rows: list[dict[str, Any]],
+    ) -> Iterator[dict[str, Any]]:
         """Committed state snapshots annotated with the round that produced them.
 
         One preparation shared by every consumer of state evidence. Outcome
@@ -5732,6 +6152,21 @@ class GenesisService:
             phase = event.get("phase")
             if isinstance(version, int) and isinstance(phase, int):
                 version_phase[version] = phase
+        if not version_phase and event_rows:
+            # Events recorded before `state_version` was added to the event
+            # payload carry no mapping. Each commit writes exactly one state
+            # version in the same transaction, numbered from 1 in commit order,
+            # so the Nth event is version N. Applied only when the counts match
+            # exactly, so a partial or interleaved history is never guessed at.
+            # Only the version numbers matter here; reading every snapshot to
+            # count them decoded and deep-copied the whole history.
+            versions = self.persistence.state_versions(run_id)
+            if versions == list(range(1, len(event_rows) + 1)):
+                ordered = sorted(event_rows, key=lambda row: row.get("commit_order", 0))
+                for version, event in zip(versions, ordered, strict=True):
+                    phase = event.get("phase")
+                    if isinstance(phase, int):
+                        version_phase[version] = phase
         latest_attempts: dict[str, dict[str, Any]] = {}
         for event in sorted(event_rows, key=lambda row: row.get("commit_order", 0)):
             invocation = str(event.get("invocation_id") or event.get("event_id"))
@@ -5743,18 +6178,57 @@ class GenesisService:
         }
         if run.get("status") != "completed" and version_phase:
             failed_or_active_phases.add(max(version_phase.values()))
-        state_rows: list[dict[str, Any]] = []
-        for version, snapshot in self.persistence.list_state_history(run_id):
+
+        # STH-002: keep only the FINAL snapshot of each round while iterating.
+        # `each_completed_round` collapses to exactly this downstream, so
+        # materialising one row per state commit first costs memory quadratic in
+        # population x horizon to produce a result of size O(rounds).
+        def marker_for(version: int) -> Any:
+            phase = version_phase.get(version)
+            return (
+                _INCOMPLETE_ROUND
+                if phase is not None and phase in failed_or_active_phases
+                else phase
+            )
+
+        def key_for(version: int, marker: Any) -> Any:
+            # An unannotated row has no round identity and is its own group, so
+            # it is keyed by version to preserve the previous behaviour.
+            return marker if marker is not None else ("_unkeyed", version)
+
+        # Which version wins each round is decided from the annotations alone,
+        # so the snapshots themselves are read once and only the winners are
+        # held. The result is O(rounds) rows either way; what changes is whether
+        # every round's snapshot is resident to produce them.
+        versions = self.persistence.state_versions(run_id)
+        winner: dict[Any, int] = {}
+        for version in versions:
+            winner[key_for(version, marker_for(version))] = version
+        # Rows come back in first-appearance order of the round key. When the
+        # winning versions already ascend in that same order -- an ordinary run,
+        # where rounds do not interleave -- the snapshots can be emitted as they
+        # arrive and none needs to be held.
+        emitted_in_version_order = list(winner.values()) == sorted(winner.values())
+        wanted = {version: key for key, version in winner.items()}
+
+        def annotate(version: int, snapshot: Mapping[str, Any]) -> dict[str, Any]:
             row = dict(snapshot)
             row["state_version"] = version
-            phase = version_phase.get(version)
-            if phase is not None and phase in failed_or_active_phases:
-                # Mark for exclusion rather than an arbitrary "own round".
-                row["_round"] = _INCOMPLETE_ROUND
-            else:
-                row["_round"] = phase
-            state_rows.append(row)
-        return state_rows
+            row["_round"] = marker_for(version)
+            return row
+
+        if emitted_in_version_order:
+            for version, snapshot in self.persistence.iter_state_history(run_id):
+                if version in wanted:
+                    yield annotate(version, snapshot)
+            return
+        held: dict[Any, dict[str, Any]] = {}
+        for version, snapshot in self.persistence.iter_state_history(run_id):
+            if version in wanted:
+                held[wanted[version]] = annotate(version, snapshot)
+        for key in winner:
+            if key in held:
+                yield held[key]
 
     def _dataset_rows(self, run_id: str, dataset_id: str) -> list[dict[str, Any]]:
         """Materialize one declared dataset from a run's retained evidence."""
@@ -5766,10 +6240,13 @@ class GenesisService:
             for item in plan.get("datasets", [])
         ):
             raise ValueError(f"TRACE_SEED_UNKNOWN: no declared dataset '{dataset_id}'")
-        event_rows = [dict(item) for item in self.trace_run(run_id)]
+        # The same plan-aware projection outcome evaluation uses, so a trace
+        # seeded from a dataset sees exactly the rows its outcome saw.
+        event_drop, artifact_drop = self._unused_evidence_fields(plan)
+        event_rows = self.trace_run(run_id, evidence=True, drop=event_drop)
         sources = {
             "events": event_rows,
-            "artifacts": list(self.artifacts_for_run(run_id)),
+            "artifacts": self.artifacts_for_run(run_id, evidence=True, drop=artifact_drop),
             "state": self._round_annotated_state(run_id, self.get_run(run_id), event_rows),
         }
         return materialize_datasets(plan, sources).get(dataset_id, [])

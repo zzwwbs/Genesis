@@ -149,12 +149,11 @@ def test_failed_retry_attempts_are_persisted_with_unique_event_ids(tmp_path: Pat
     )
     controller.run("run-1")
     rows = persistence.connection.execute(
-        "SELECT event_id, payload_ref FROM events WHERE run_id = ? ORDER BY rowid", ("run-1",)
+        "SELECT event_id FROM events WHERE run_id = ? ORDER BY rowid", ("run-1",)
     ).fetchall()
-    payloads = []
-    for _event_id, payload_ref in rows:
-        path = persistence.object_store.root / payload_ref[:2] / payload_ref[2:]
-        payloads.append(json.loads(path.read_text()))
+    # Read through the decode path: an event may be stored as a patch against
+    # its predecessor, so the raw object file is not the whole event (STH-009).
+    payloads = persistence.list_events("run-1")
     assert len({row[0] for row in rows}) == 2
     assert [payload["kind"] for payload in payloads] == ["process_failed", "process_completed"]
     assert {payload["invocation_id"] for payload in payloads} == {"run-1-p-0"}

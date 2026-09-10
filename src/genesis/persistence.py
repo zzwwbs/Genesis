@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import tempfile
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,7 +15,18 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, cast
 
-_SCHEMA_VERSION = 7
+from genesis.state_encoding import (
+    EVENT_BASE_COST_RATIO,
+    FORM_BASE,
+    FORM_PATCH,
+    apply_patch,
+    canonical_bytes,
+    copy_value,
+    encode_patch,
+    should_write_base,
+)
+
+_SCHEMA_VERSION = 9
 _RUN_STATUSES = {"created", "running", "paused", "completed", "failed", "cancelled"}
 _RUN_TRANSITIONS = {
     "created": {"running", "failed", "cancelled"},
@@ -106,8 +118,20 @@ class ObjectStore:
         return removed
 
     def get(self, ref: ObjectRef) -> bytes:
-        self.verify(ref)
-        return (ref.path or self.root / ref.digest[:2] / ref.digest[2:]).read_bytes()
+        """Read an object, verifying it against its digest.
+
+        The bytes are read once and checked in memory. Reading twice — once to
+        verify, once to return — doubled the cost of every reconstruction, which
+        walks a chain of objects per commit.
+        """
+        path = ref.path or self.root / ref.digest[:2] / ref.digest[2:]
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"integrity check failed for object {ref.digest}") from exc
+        if len(data) != ref.size or hashlib.sha256(data).hexdigest() != ref.digest:
+            raise ValueError(f"integrity check failed for object {ref.digest}")
+        return data
 
     def verify(self, ref: ObjectRef) -> None:
         path = ref.path or self.root / ref.digest[:2] / ref.digest[2:]
@@ -122,6 +146,13 @@ class ObjectStore:
 class PersistenceCoordinator:
     def __init__(self, database: str | Path, objects: str | Path):
         self._lock = RLock()
+        # Last reconstructed predecessor per (table, run). Choosing a storage
+        # form needs the value the new record follows; rebuilding it from the
+        # nearest base on every commit walks the whole chain, which made
+        # committing quadratic in run length. The entry is only used when it
+        # still matches the row actually at the end of the chain, so a
+        # concurrent writer or a reopened database falls back to reconstruction.
+        self._chain_cache: dict[tuple[str, str], tuple[tuple[int, str], dict[str, Any]]] = {}
         self.object_store = ObjectStore(objects)
         self.connection = sqlite3.connect(database, isolation_level=None, check_same_thread=False)
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -176,12 +207,15 @@ class PersistenceCoordinator:
                     self._migration_6()
                 elif target == 7:
                     self._migration_7()
+                elif target == 8:
+                    self._migration_8()
+                elif target == 9:
+                    self._migration_9()
                 self._validate_schema_version(target)
                 self.connection.execute(f"PRAGMA user_version = {target}")
                 self.connection.execute("COMMIT")
             except Exception:
-                if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
+                self._rollback()
                 raise
             version = target
 
@@ -450,6 +484,26 @@ class PersistenceCoordinator:
         if "snapshot_digest" not in self._table_columns("package_versions"):
             self.connection.execute("ALTER TABLE package_versions ADD COLUMN snapshot_digest TEXT")
 
+    def _migration_8(self) -> None:
+        """STH-005/STH-008: state rows record their storage form.
+
+        Additive and idempotent. Existing rows keep a NULL form and are read as
+        bases, so a workspace may hold runs in both formats and a run resumed
+        across the change may contain both.
+        """
+        if "form" not in self._table_columns("states"):
+            self.connection.execute("ALTER TABLE states ADD COLUMN form TEXT")
+
+    def _migration_9(self) -> None:
+        """STH-009/STH-010: event rows record their storage form.
+
+        Additive and idempotent, on the same terms as ``_migration_8``: existing
+        event rows keep a NULL form and are read as whole payloads, so a run may
+        contain both formats.
+        """
+        if "form" not in self._table_columns("events"):
+            self.connection.execute("ALTER TABLE events ADD COLUMN form TEXT")
+
     def _validate_schema(self) -> None:
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
         if version != _SCHEMA_VERSION:
@@ -472,11 +526,13 @@ class PersistenceCoordinator:
                 "kind": ("TEXT", 1, 0),
                 "payload_ref": ("TEXT", 1, 0),
                 "event_hash": ("TEXT", 1, 0),
+                **({"form": ("TEXT", 0, 0)} if version >= 9 else {}),
             },
             "states": {
                 "run_id": ("TEXT", 1, 1),
                 "state_version": ("INTEGER", 1, 2),
                 "payload_ref": ("TEXT", 1, 0),
+                **({"form": ("TEXT", 0, 0)} if version >= 8 else {}),
             },
             "artifacts": {
                 "artifact_id": ("TEXT", primary_key_not_null, 1),
@@ -659,15 +715,12 @@ class PersistenceCoordinator:
             raise ValueError("RUN_ID: event and state run IDs must match")
         if any(artifact["run_id"] != event["run_id"] for artifact in artifacts):
             raise ValueError("RUN_ID: artifact run IDs must match event and state run ID")
-        event_bytes = json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+        event_bytes = self._event_bytes(event)
         commit_hash = self._commit_hash(event, state, artifacts)
-        event_object = self.object_store.put(event_bytes, "application/json")
-        state_object = self.object_store.put(state["payload"])
-        refs = [event_object, state_object]
         artifact_refs = [
             (a["artifact_id"], a["run_id"], self.object_store.put(a["payload"])) for a in artifacts
         ]
-        refs.extend(ref for _, _, ref in artifact_refs)
+        refs = [ref for _, _, ref in artifact_refs]
         try:
             self.connection.execute("BEGIN IMMEDIATE")
             current = self.connection.execute(
@@ -713,12 +766,26 @@ class PersistenceCoordinator:
                 )
             if state["state_version"] != current + 1:
                 raise ValueError("STATE_VERSION: state versions must progress sequentially")
+            # STH-005: choose the storage form INSIDE the transaction, against
+            # the version this commit actually follows, so a patch can never
+            # reference a base that is absent or a different predecessor.
+            state_form, state_payload = self._encode_state_for_storage(
+                str(state["run_id"]), int(current), state["payload"]
+            )
+            state_object = self.object_store.put(state_payload)
+            # STH-010: the same reasoning applies to the event ledger — the
+            # predecessor must be the event this commit actually follows.
+            event_form, event_payload = self._encode_event_for_storage(
+                str(event["run_id"]), event_bytes
+            )
+            event_object = self.object_store.put(event_payload, "application/json")
+            refs = [*refs, state_object, event_object]
             for ref in refs:
                 self._record_object(ref)
             self.connection.execute(
                 """INSERT INTO events(
-                       event_id, run_id, kind, payload_ref, event_hash, commit_hash
-                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                       event_id, run_id, kind, payload_ref, event_hash, commit_hash, form
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     event["event_id"],
                     event["run_id"],
@@ -726,13 +793,14 @@ class PersistenceCoordinator:
                     event_object.digest,
                     event_hash,
                     commit_hash,
+                    event_form,
                 ),
             )
             if fail_after == "event":
                 raise RuntimeError("injected failure")
             self.connection.execute(
-                "INSERT INTO states(run_id, state_version, payload_ref) VALUES (?, ?, ?)",
-                (state["run_id"], state["state_version"], state_object.digest),
+                "INSERT INTO states(run_id, state_version, payload_ref, form) VALUES (?, ?, ?, ?)",
+                (state["run_id"], state["state_version"], state_object.digest, state_form),
             )
             if fail_after == "state":
                 raise RuntimeError("injected failure")
@@ -742,10 +810,22 @@ class PersistenceCoordinator:
                 [(artifact_id, run_id, ref.digest) for artifact_id, run_id, ref in artifact_refs],
             )
             self.connection.execute("COMMIT")
+            self._remember_committed(str(event["run_id"]), event_bytes, state["payload"])
         except Exception:
-            if self.connection.in_transaction:
-                self.connection.execute("ROLLBACK")
+            self._rollback()
             raise
+
+    def _rollback(self) -> None:
+        """Unwind the open transaction, if one is still open.
+
+        A failing ``COMMIT`` can end the transaction itself. Rolling back
+        unconditionally then raises "cannot rollback - no transaction is
+        active" from the handler, which replaces the real cause -- a disk or
+        locking failure -- with a misleading one at exactly the moment the
+        original error matters most.
+        """
+        if self.connection.in_transaction:
+            self.connection.execute("ROLLBACK")
 
     def _record_object(self, ref: ObjectRef) -> None:
         existing = self.connection.execute(
@@ -816,10 +896,25 @@ class PersistenceCoordinator:
         ).fetchone()
         if event_row is None or state_row is None:
             return False
+        # Compared against the stored bytes directly, unlike state below. The
+        # caller reaches here only when the run holds exactly one event, and a
+        # run's first event is always written whole (there is no predecessor to
+        # patch against), so this row can never be a patch.
         if self._read_object(event_row[0]) != event_bytes:
             return False
-        if self._read_object(state_row[0]) != state["payload"]:
-            return False
+        # A patch row stores only the change, so the comparison is against the
+        # reconstructed state, not the stored bytes (STH-007).
+        stored_state = self._read_object(state_row[0])
+        if stored_state != state["payload"]:
+            try:
+                version = int(state["state_version"])
+                if (
+                    canonical_bytes(self._reconstruct_state(str(state["run_id"]), version))
+                    != state["payload"]
+                ):
+                    return False
+            except (ValueError, KeyError, TypeError):
+                return False
 
         stored_artifacts = self.connection.execute(
             "SELECT artifact_id, run_id, payload_ref FROM artifacts WHERE run_id = ?",
@@ -960,61 +1055,429 @@ class PersistenceCoordinator:
             ).fetchall()
         ]
 
-    def list_events(self, run_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self.connection.execute(
-                "SELECT payload_ref FROM events WHERE run_id = ? ORDER BY rowid", (run_id,)
+    # ---- event storage form (STH-009..STH-013) -------------------------------
+
+    @staticmethod
+    def _event_bytes(event: Mapping[str, Any]) -> bytes:
+        """The serialization the commit path writes for an event.
+
+        ``event_hash`` digests exactly these bytes, so a reconstructed event must
+        reproduce them rather than an equivalent encoding (STH-011). Note the
+        compact separators: this is *not* the state canonicalization.
+        """
+        return json.dumps(dict(event), sort_keys=True, separators=(",", ":")).encode()
+
+    def _event_rows(self, run_id: str) -> list[tuple[int, str, str | None]]:
+        """(rowid, payload_ref, form) for a run's events, in commit order."""
+        return [
+            (int(rowid), str(ref), form)
+            for rowid, ref, form in self.connection.execute(
+                "SELECT rowid, payload_ref, form FROM events WHERE run_id = ? ORDER BY rowid",
+                (run_id,),
             ).fetchall()
-            return [json.loads(self._read_object(row[0])) for row in rows]
+        ]
+
+    def _encode_event_for_storage(self, run_id: str, payload: bytes) -> tuple[str, bytes]:
+        """Store this event whole or as a patch against its predecessor.
+
+        A patch is used only when it is *strictly smaller* than the whole payload
+        (STH-009) and the chain since the last base has not grown expensive. An
+        unrelated predecessor therefore costs nothing rather than causing a
+        regression: measured on real evidence, patching events unconditionally
+        would have inflated artifacts 1.48 -> 1.76 MB, which this rule prevents.
+        """
+        rows = self._event_rows(run_id)
+        if not rows:
+            return FORM_BASE, payload
+        # STH-012: only a payload that round-trips byte-for-byte may be patched,
+        # because event identity compares bytes.
+        try:
+            current = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return FORM_BASE, payload
+        if not isinstance(current, dict) or self._event_bytes(current) != payload:
+            return FORM_BASE, payload
+        cached = self._cached_predecessor("events", run_id, (rows[-1][0], rows[-1][1]))
+        if cached is not None:
+            previous = cached
+        else:
+            try:
+                previous = self._reconstruct_event(run_id, len(rows) - 1, rows)
+            except ValueError:
+                return FORM_BASE, payload
+        patch_bytes = json.dumps(
+            encode_patch(previous, current), sort_keys=True, separators=(",", ":")
+        ).encode()
+        if len(patch_bytes) >= len(payload):
+            return FORM_BASE, payload
+        base_size, since_base = self._base_cost(rows)
+        if should_write_base(since_base + len(patch_bytes), base_size, EVENT_BASE_COST_RATIO):
+            return FORM_BASE, payload
+        return FORM_PATCH, patch_bytes
+
+    def _reconstruct_event(
+        self, run_id: str, index: int, rows: list[tuple[int, str, str | None]]
+    ) -> dict[str, Any]:
+        """The event at ``index`` in commit order, rebuilt from its nearest base."""
+        if not 0 <= index < len(rows):
+            raise ValueError(f"EVENT_INDEX_MISSING: run '{run_id}' has no event at {index}")
+        start = index
+        while start >= 0 and rows[start][2] == FORM_PATCH:
+            start -= 1
+        if start < 0:
+            raise ValueError(
+                f"EVENT_BASE_MISSING: event {rows[index][0]} of run '{run_id}' has no base "
+                "to reconstruct from; the history is incomplete"
+            )
+        event = self._decode_event_object(rows[start][1], run_id, rows[start][0])
+        for step in range(start + 1, index + 1):
+            patch = self._decode_event_object(rows[step][1], run_id, rows[step][0])
+            event = apply_patch(event, patch)
+        return event
+
+    def _decode_event_object(self, digest: str, run_id: str, rowid: int) -> dict[str, Any]:
+        try:
+            decoded = json.loads(self._read_object(digest))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"EVENT_OBJECT_UNREADABLE: event {rowid} of run '{run_id}' could not be decoded"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise ValueError(
+                f"EVENT_OBJECT_UNREADABLE: event {rowid} of run '{run_id}' is not an object"
+            )
+        return decoded
+
+    def iter_events(
+        self, run_id: str, *, exclude_fields: tuple[str, ...] = ()
+    ) -> Iterator[dict[str, Any]]:
+        """A run's events, oldest first, reconstructed in a single forward pass.
+
+        ``exclude_fields`` is applied to the *yielded copy* only. The running
+        predecessor keeps every field, because dropping one before reconstruction
+        would corrupt every later event in the chain (STH-013).
+        """
+        with self._lock:
+            rows = self._event_rows(run_id)
+        excluded = set(exclude_fields)
+        event: dict[str, Any] = {}
+        for rowid, payload_ref, form in rows:
+            with self._lock:
+                decoded = self._decode_event_object(payload_ref, run_id, rowid)
+            if form == FORM_PATCH:
+                event = apply_patch(event, decoded)
+            else:
+                event = decoded
+            # Deep-copied for the same reason as ``iter_state_history``: a patch
+            # shares unchanged nested values with its predecessor. Excluded
+            # fields are skipped before copying, so they are never duplicated.
+            yield {key: copy_value(value) for key, value in event.items() if key not in excluded}
+
+    def list_events(
+        self, run_id: str, *, exclude_fields: tuple[str, ...] = ()
+    ) -> list[dict[str, Any]]:
+        """A run's committed events, oldest first.
+
+        ``exclude_fields`` drops named fields as each event is decoded, so an
+        excluded value is never retained. Projecting after the fact would not
+        help: the full list and the projected copy are both alive at peak.
+        """
+        return list(self.iter_events(run_id, exclude_fields=exclude_fields))
 
     def list_artifacts(self, run_id: str) -> list[dict[str, Any]]:
+        return list(self.iter_artifacts(run_id))
+
+    def iter_artifacts(self, run_id: str) -> Iterator[dict[str, Any]]:
+        """A run's retained artifacts, oldest first, one at a time.
+
+        The payload bytes were previously read into a list in one go, and the
+        caller then built a second list of the parsed values, so both were
+        resident at peak. For a study whose executors return large outputs that
+        is the whole of outcome memory.
+
+        The row index is resolved once, under the lock, so iteration is a stable
+        view of the artifacts present when the call was made.
+        """
         with self._lock:
-            rows = self.connection.execute(
+            index = self.connection.execute(
                 """SELECT artifacts.artifact_id, artifacts.payload_ref,
                           objects.media_type, objects.size
                    FROM artifacts JOIN objects ON objects.digest = artifacts.payload_ref
                    WHERE run_id = ? ORDER BY artifact_id""",
                 (run_id,),
             ).fetchall()
-            return [
-                {
-                    "artifact_id": artifact_id,
-                    "payload": self._read_object(payload_ref),
-                    "media_type": media_type,
-                    "size": size,
-                }
-                for artifact_id, payload_ref, media_type, size in rows
-            ]
+        for artifact_id, payload_ref, media_type, size in index:
+            with self._lock:
+                try:
+                    payload = self._read_object(payload_ref)
+                except ValueError:
+                    # The list form read every payload under one lock hold, so a
+                    # purge could not land mid-read. Streaming releases the lock
+                    # between rows, and artifacts are the one record type
+                    # retention deletes. Distinguish that from a corrupt store
+                    # by asking whether the row is still there, and say plainly
+                    # that the view is no longer the one this call started with
+                    # rather than reporting a missing object.
+                    still_present = self.connection.execute(
+                        "SELECT 1 FROM artifacts WHERE artifact_id = ? AND run_id = ?",
+                        (artifact_id, run_id),
+                    ).fetchone()
+                    if still_present is None:
+                        raise ValueError(
+                            f"ARTIFACT_PURGED_DURING_READ: artifact '{artifact_id}' of run "
+                            f"'{run_id}' was removed while its artifacts were being read; "
+                            "retry the read"
+                        ) from None
+                    raise
+            yield {
+                "artifact_id": artifact_id,
+                "payload": payload,
+                "media_type": media_type,
+                "size": size,
+            }
 
-    def list_state_history(self, run_id: str) -> list[tuple[int, dict[str, Any]]]:
-        """Every committed state snapshot for a run, oldest first (AW-09)."""
-        with self._lock:
-            rows = self.connection.execute(
-                """SELECT states.state_version, states.payload_ref
-                   FROM states WHERE run_id = ? ORDER BY state_version""",
+    # ---- state storage form (STH-005..STH-008) -------------------------------
+
+    def _state_rows(self, run_id: str) -> list[tuple[int, str, str | None]]:
+        """(version, payload_ref, form) for a run, oldest first."""
+        return [
+            (int(version), str(ref), form)
+            for version, ref, form in self.connection.execute(
+                """SELECT state_version, payload_ref, form FROM states
+                   WHERE run_id = ? ORDER BY state_version""",
                 (run_id,),
             ).fetchall()
-            history = []
-            for version, payload_ref in rows:
-                try:
-                    decoded = json.loads(self._read_object(payload_ref))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    decoded = {}
-                if isinstance(decoded, dict):
-                    history.append((version, decoded))
-            return history
+        ]
+
+    def _encode_state_for_storage(
+        self, run_id: str, previous_version: int, payload: bytes
+    ) -> tuple[str, bytes]:
+        """Store this commit whole or as a patch against its predecessor.
+
+        A base is rewritten once the patches since the last base have cost more
+        than a fraction of it, so reconstruction stays bounded while the stored
+        bytes stay linear in what actually changed.
+        """
+        if previous_version <= 0:
+            return FORM_BASE, payload
+        rows = self._state_rows(run_id)
+        if not rows or rows[-1][0] != previous_version:
+            # No usable predecessor in this run: store whole rather than guess.
+            return FORM_BASE, payload
+        try:
+            current = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return FORM_BASE, payload
+        if not isinstance(current, dict):
+            return FORM_BASE, payload
+        cached = self._cached_predecessor("states", run_id, (rows[-1][0], rows[-1][1]))
+        if cached is None:
+            cached = self._reconstruct_state(run_id, previous_version, rows)
+        previous = cached
+        patch = encode_patch(previous, current)
+        patch_bytes = json.dumps(patch, sort_keys=True, separators=(",", ":")).encode()
+        base_size, since_base = self._base_cost(rows)
+        if should_write_base(since_base + len(patch_bytes), base_size):
+            return FORM_BASE, payload
+        return FORM_PATCH, patch_bytes
+
+    def _base_cost(self, rows: list[tuple[int, str, str | None]]) -> tuple[int, int]:
+        """(size of the last base, bytes of patches committed since it).
+
+        Scanned backwards to the most recent base rather than forwards over the
+        whole run: this runs once per commit, so a forward scan cost one query
+        per row already written and made committing quadratic in run length.
+        """
+        since = 0
+        for index in range(len(rows) - 1, -1, -1):
+            _key, ref, form = rows[index]
+            if form != FORM_PATCH:
+                return self._object_size(ref), since
+            since += self._object_size(ref)
+        return 0, since
+
+    def _remember_committed(self, run_id: str, event_bytes: bytes, state_payload: Any) -> None:
+        """Cache what this commit wrote as the predecessor of the next commit."""
+        for table, payload in (("events", event_bytes), ("states", state_payload)):
+            try:
+                decoded = json.loads(payload)
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                self._chain_cache.pop((table, run_id), None)
+                continue
+            if not isinstance(decoded, dict):
+                self._chain_cache.pop((table, run_id), None)
+                continue
+            self._remember_predecessor(table, run_id, decoded)
+
+    def _cached_predecessor(
+        self, table: str, run_id: str, tail: tuple[int, str]
+    ) -> dict[str, Any] | None:
+        """The cached predecessor, but only if it is still the row at the tail."""
+        entry = self._chain_cache.get((table, run_id))
+        if entry is None or entry[0] != tail:
+            return None
+        return entry[1]
+
+    def _remember_predecessor(self, table: str, run_id: str, value: dict[str, Any]) -> None:
+        """Record a just-committed record as the predecessor of the next one.
+
+        Called only after the transaction commits, so a rolled-back write never
+        becomes the base of a later patch. The stored key is the new tail row,
+        which is re-read here rather than assumed.
+        """
+        order = "state_version" if table == "states" else "rowid"
+        row = self.connection.execute(
+            f"SELECT {order}, payload_ref FROM {table} WHERE run_id = ? "  # noqa: S608
+            f"ORDER BY {order} DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            self._chain_cache.pop((table, run_id), None)
+            return
+        self._chain_cache[(table, run_id)] = ((int(row[0]), str(row[1])), value)
+
+    def _object_size(self, digest: str) -> int:
+        row = self.connection.execute(
+            "SELECT size FROM objects WHERE digest = ?", (digest,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def _reconstruct_state(
+        self, run_id: str, version: int, rows: list[tuple[int, str, str | None]] | None = None
+    ) -> dict[str, Any]:
+        """The committed state at ``version``, rebuilt from its nearest base.
+
+        A row with no recorded form predates this encoding and is a base
+        (STH-008).
+        """
+        rows = self._state_rows(run_id) if rows is None else rows
+        index = next((i for i, row in enumerate(rows) if row[0] == version), None)
+        if index is None:
+            raise ValueError(f"STATE_VERSION_MISSING: run '{run_id}' has no version {version}")
+        start = index
+        while start >= 0 and rows[start][2] == FORM_PATCH:
+            start -= 1
+        if start < 0:
+            raise ValueError(
+                f"STATE_BASE_MISSING: version {version} of run '{run_id}' has no base to "
+                "reconstruct from; the history is incomplete"
+            )
+        state = self._decode_state_object(rows[start][1], run_id, rows[start][0])
+        for step in range(start + 1, index + 1):
+            patch = self._decode_state_object(rows[step][1], run_id, rows[step][0])
+            state = apply_patch(state, patch)
+        return state
+
+    def _decode_state_object(self, digest: str, run_id: str, version: int) -> dict[str, Any]:
+        try:
+            decoded = json.loads(self._read_object(digest))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"STATE_OBJECT_UNREADABLE: version {version} of run '{run_id}' could not be decoded"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise ValueError(
+                f"STATE_OBJECT_UNREADABLE: version {version} of run '{run_id}' is not an object"
+            )
+        return decoded
+
+    def iter_state_history(self, run_id: str) -> Iterator[tuple[int, dict[str, Any]]]:
+        """Committed state snapshots for a run, oldest first, one at a time.
+
+        Each payload is read only when its version is yielded, so a consumer
+        that does not retain them holds one snapshot at a time rather than the
+        whole history. State accumulates across rounds, so materialising every
+        version at once costs memory quadratic in population x horizon —
+        prohibitive at study scale (STH-001).
+
+        The version list is resolved once, under the lock, so iteration is a
+        stable view of the versions present when the call was made; a concurrent
+        writer's later commits are not observed. Each yielded snapshot is an
+        independent object, so a consumer may mutate one without affecting
+        another or the store.
+        """
+        with self._lock:
+            rows = self._state_rows(run_id)
+        state: dict[str, Any] = {}
+        # Whether the state the next patch would apply to was actually read.
+        base_readable = False
+        for version, payload_ref, form in rows:
+            with self._lock:
+                # A missing or corrupt object raises, as it always did. Reading
+                # it as an empty state would make that state the base of every
+                # later patch, silently rebuilding the run on nothing.
+                payload = self._read_object(payload_ref)
+            decoded: Any
+            try:
+                decoded = json.loads(payload)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                decoded = None
+            if form == FORM_PATCH:
+                if not base_readable or not isinstance(decoded, dict):
+                    raise ValueError(
+                        f"STATE_BASE_UNREADABLE: version {version} of run '{run_id}' is a "
+                        "patch against a state that could not be read; the history cannot "
+                        "be rebuilt"
+                    )
+                # Applied against the version just yielded, so a whole run is
+                # reconstructed in one forward pass rather than per version.
+                state = apply_patch(state, decoded)
+            elif isinstance(decoded, dict):
+                state = decoded
+                base_readable = True
+            elif decoded is None:
+                # An undecodable whole payload reads as empty, as it always has;
+                # nothing may be patched on top of it.
+                state = {}
+                base_readable = False
+            else:
+                # Valid JSON that is not an object was never part of the history.
+                base_readable = False
+                continue
+            # A shallow copy is not enough: a patch leaves unchanged fields as
+            # the *same* nested objects as the previous version, so a consumer
+            # mutating one would corrupt the running state and every later
+            # snapshot. Only whole-payload rows were ever safe.
+            yield version, copy_value(state)
+
+    def state_versions(self, run_id: str) -> list[int]:
+        """The committed state versions for a run, without reading any payload.
+
+        A caller that only needs to know which versions exist should not pay to
+        decode and copy every snapshot to find out.
+        """
+        with self._lock:
+            return [version for version, _ref, _form in self._state_rows(run_id)]
+
+    def list_state_history(self, run_id: str) -> list[tuple[int, dict[str, Any]]]:
+        """Every committed state snapshot for a run, oldest first (AW-09).
+
+        Retained for compatibility; it materialises the whole history, so
+        prefer ``iter_state_history`` or one of the service's per-round access
+        contracts for anything that scales with the run.
+        """
+        return list(self.iter_state_history(run_id))
 
     def latest_state(self, run_id: str) -> tuple[int, bytes, str] | None:
+        """The most recent committed state, as the bytes the run committed.
+
+        A patch row stores only the change, so the state is reconstructed and
+        re-serialized canonically — reproducing the committed bytes exactly,
+        which a commit's identity depends on (STH-007).
+        """
         with self._lock:
             row = self.connection.execute(
-                """SELECT states.state_version, states.payload_ref, objects.media_type
+                """SELECT states.state_version, states.payload_ref, objects.media_type,
+                          states.form
                    FROM states JOIN objects ON objects.digest = states.payload_ref
                    WHERE run_id = ? ORDER BY state_version DESC LIMIT 1""",
                 (run_id,),
             ).fetchone()
             if row is None:
                 return None
-            return row[0], self._read_object(row[1]), row[2]
+            if row[3] != FORM_PATCH:
+                return row[0], self._read_object(row[1]), row[2]
+            return row[0], canonical_bytes(self._reconstruct_state(run_id, int(row[0]))), row[2]
 
     def latest_json_state(self, run_id: str) -> tuple[int, dict[str, Any]] | None:
         latest = self.latest_state(run_id)
@@ -1060,8 +1523,7 @@ class PersistenceCoordinator:
                 self.connection.execute("COMMIT")
                 return deepcopy(record)
             except Exception:
-                if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
+                self._rollback()
                 raise
 
     def append_run_collection(
@@ -1085,7 +1547,7 @@ class PersistenceCoordinator:
                 self.connection.execute("COMMIT")
                 return deepcopy(item)
             except Exception:
-                self.connection.execute("ROLLBACK")
+                self._rollback()
                 raise
 
     def _transition_run(self, run_id: str, target: str, expected_version: int) -> dict[str, Any]:
@@ -1116,7 +1578,7 @@ class PersistenceCoordinator:
             self.connection.execute("COMMIT")
             return record
         except Exception:
-            self.connection.execute("ROLLBACK")
+            self._rollback()
             raise
 
     @staticmethod
@@ -1154,7 +1616,7 @@ class PersistenceCoordinator:
             self.connection.execute("COMMIT")
             return str(cursor.lastrowid)
         except Exception:
-            self.connection.execute("ROLLBACK")
+            self._rollback()
             raise
 
     def restore_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:

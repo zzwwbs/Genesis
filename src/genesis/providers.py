@@ -9,11 +9,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -29,6 +31,7 @@ class ProviderRequest:
     parameters: dict[str, Any] = field(default_factory=dict)
     context_hash: str | None = None
     artifact_id: str | None = None
+    process_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +148,7 @@ class ProviderExecutor:
             prompt=prompt,
             parameters=self.parameters,
             context_hash=getattr(invocation.context, "content_hash", None),
+            process_id=getattr(invocation, "process_id", None),
         )
         self._raise_if_cancelled()
         started = time.perf_counter()
@@ -182,6 +186,7 @@ class ProviderExecutor:
                     prompt=repair_prompt,
                     parameters=self.parameters,
                     context_hash=getattr(invocation.context, "content_hash", None),
+                    process_id=getattr(invocation, "process_id", None),
                 )
                 response = self.provider.generate(request)
                 provider_attempts.append(
@@ -273,6 +278,105 @@ class DeterministicMockProvider:
             digest,
             parsed=text,
             usage={"prompt_tokens": self.estimate_tokens(request), "completion_tokens": 1},
+        )
+
+
+class AnswerPoolProvider:
+    """Answer generative calls from a local pool instead of a paid provider.
+
+    The two existing stand-ins cannot drive a study whose package has changed.
+    ``DeterministicMockProvider`` returns a digest string, which fails any
+    declared output schema. ``RecordedArtifactProvider`` replays one recorded
+    artifact by id and refuses anything else -- correct for replay, but a
+    changed package produces invocations it has never seen.
+
+    This answers *any* invocation with a real recorded response of the right
+    shape, chosen deterministically. Choice depends on ``context_hash``, so a
+    policy change that alters what an actor sees produces a different answer:
+    that is what makes "does the context actually reach the model" testable
+    rather than assumed.
+
+    It is not a model. Answers do not read the context they are keyed by, so a
+    pooled run can show that machinery works under a changed package -- it
+    cannot show that the change alters behaviour. It names itself in every
+    response so a pooled run is never mistaken for evidence.
+    """
+
+    provider = "answer-pool"
+
+    def __init__(
+        self,
+        pool: Mapping[str, Sequence[Any]],
+        *,
+        seed: int = 0,
+        echo: Mapping[str, str] | None = None,
+    ) -> None:
+        self._pool = {str(key): list(value) for key, value in pool.items() if value}
+        if not self._pool:
+            raise ValueError("ANSWER_POOL: the pool is empty")
+        self._seed = int(seed)
+        # Fields to copy out of the prompt into the answer, declared as
+        # single-capture patterns. Keeps the acting identity consistent without
+        # putting any study's field names in the provider.
+        self._echo: dict[str, re.Pattern[str]] = {}
+        for name, pattern in (echo or {}).items():
+            try:
+                compiled = re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"ANSWER_POOL: echo pattern for '{name}' is invalid: {exc}"
+                ) from exc
+            if compiled.groups < 1:
+                # The captured group is what gets copied. Without one, every
+                # pooled answer raised instead of carrying the acting identity.
+                raise ValueError(f"ANSWER_POOL: echo pattern for '{name}' needs a capture group")
+            self._echo[str(name)] = compiled
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(structured_output=True, token_estimation=False)
+
+    def estimate_tokens(self, request: ProviderRequest) -> int:
+        return max(1, len(request.prompt.split()))
+
+    def _choose(self, request: ProviderRequest) -> tuple[str, Any]:
+        group = str(request.process_id or request.artifact_id or "")
+        answers = self._pool.get(group)
+        if answers is None:
+            # An unknown process still gets an answer, drawn from the whole
+            # pool, so a new process does not stop a pooled run dead.
+            answers = [item for values in self._pool.values() for item in values]
+            group = "*"
+        key = "|".join([str(self._seed), group, str(request.context_hash or ""), request.prompt])
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        return digest, answers[int(digest, 16) % len(answers)]
+
+    def generate(self, request: ProviderRequest) -> ProviderResponse:
+        digest, answer = self._choose(request)
+        value = deepcopy(answer)
+        if isinstance(value, dict):
+            for name, pattern in self._echo.items():
+                found = pattern.search(request.prompt)
+                if found:
+                    captured = found.group(1)
+                    current = value.get(name)
+                    # Match the recorded field's type where it is unambiguous,
+                    # so an echoed phase stays an integer.
+                    if isinstance(current, bool) or not isinstance(current, int):
+                        value[name] = captured
+                    else:
+                        try:
+                            value[name] = int(captured)
+                        except ValueError:
+                            value[name] = captured
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return ProviderResponse(
+            encoded,
+            self.provider,
+            request.model,
+            digest,
+            parsed=value,
+            usage={"prompt_tokens": self.estimate_tokens(request), "completion_tokens": 0},
+            metadata={"answer_pool": True, "pool_seed": self._seed},
         )
 
 

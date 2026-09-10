@@ -11,7 +11,7 @@ study-specific names such as ``evaluate-clickbait`` or ``titles``.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 OUTCOME_PLAN_VERSION = 1
@@ -118,6 +118,40 @@ def _matches(row: Mapping[str, Any], predicate: Mapping[str, Any]) -> bool:
     return bool(handler(actual, expected))
 
 
+def _relation(sources: Mapping[str, Any], name: str) -> Iterable[Any]:
+    """A fresh walk of one source relation, given as a sequence or a factory.
+
+    A factory lets the service hand over the event ledger and the artifact
+    store without listing them first; each dataset that reads a relation walks
+    it anew rather than every dataset sharing one resident copy.
+    """
+    source = sources.get(name)
+    if source is None:
+        return ()
+    relation: Iterable[Any] = source() if callable(source) else source
+    return relation
+
+
+def _final_position(entries: list[Any]) -> int:
+    """Index of the latest committed version among state entries.
+
+    Falls back to the last position when no entry carries a version, which is
+    what a caller supplying the full history in order has always received.
+    """
+    best, best_version = len(entries) - 1, None
+    for position, entry in enumerate(entries):
+        if isinstance(entry, Mapping):
+            version = entry.get("state_version")
+        elif isinstance(entry, tuple | list) and len(entry) == 2:
+            version = entry[0]
+        else:
+            version = None
+        if isinstance(version, int) and not isinstance(version, bool):
+            if best_version is None or version >= best_version:
+                best, best_version = position, version
+    return best
+
+
 def materialize_datasets(
     plan: Mapping[str, Any], sources: Mapping[str, Any]
 ) -> dict[str, list[dict[str, Any]]]:
@@ -138,7 +172,7 @@ def materialize_datasets(
         rows: list[dict[str, Any]] = []
         if kind == "events":
             path = str(source.get("path") or "")
-            for event in sources.get("events", []):
+            for event in _relation(sources, "events"):
                 if not isinstance(event, Mapping):
                     continue
                 records = _resolve_path(event, path) if path else [dict(event)]
@@ -152,7 +186,7 @@ def materialize_datasets(
         elif kind == "artifacts":
             artifact_type = str(source.get("artifact_type") or "")
             process = str(source.get("process") or "")
-            for artifact in sources.get("artifacts", []):
+            for artifact in _relation(sources, "artifacts"):
                 if not isinstance(artifact, Mapping):
                     continue
                 payload = (
@@ -177,7 +211,7 @@ def materialize_datasets(
                 rows.append(row)
         elif kind == "state":
             snapshot = str(source.get("snapshot", "final"))
-            state_rows = list(sources.get("state", []))
+            state_rows = list(_relation(sources, "state"))
 
             # The service supplies state history as dict-shaped snapshots
             # (with a state_version key); tolerate legacy (version, snapshot)
@@ -195,7 +229,10 @@ def materialize_datasets(
                 return None
 
             if snapshot == "final" and state_rows:
-                record = _snapshot(state_rows[-1])
+                # The last *committed* version, not the last row: the service
+                # supplies one row per round, in round order, and rounds can
+                # interleave, so the final commit is not necessarily last.
+                record = _snapshot(state_rows[_final_position(state_rows)])
                 if record is not None:
                     record = dict(record)
                     field = str(source.get("state") or "")

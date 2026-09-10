@@ -128,7 +128,7 @@ def test_retained_objects_survive_split_into_two_services(tmp_path: Path) -> Non
     service.close()
     reopened = GenesisService(tmp_path / "workspace")
     try:
-        assert reopened.persistence.schema_version() == 7
+        assert reopened.persistence.schema_version() == 9
         assert reopened.trace_run("ops-run")
     finally:
         reopened.close()

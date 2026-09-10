@@ -8,6 +8,8 @@ and cross-realization reporting.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from genesis.runtime import (
@@ -1959,3 +1961,2112 @@ def test_compilation_still_refuses_a_legacy_dialect(tmp_path) -> None:
     )
     with pytest.raises((ValidationIssue, ValueError), match="SCHEMA_DIALECT_UNSUPPORTED"):
         StudyCompiler(source).compile(tmp_path / "build")
+
+
+# ---------------------------------------------------------------------------
+# State-history scaling, Phase 1 (docs/plans/2026-09-09-...-specification.md)
+# ---------------------------------------------------------------------------
+
+
+def test_state_history_iteration_does_not_scale_with_commit_count(tmp_path) -> None:
+    """STH-001: iterating holds one snapshot; materialising holds them all.
+
+    Measured as the evidence alive part-way through each call, attributed to the
+    JSON decoder and this package. The whole-process peak this used to compare
+    was fragile -- it depended on when a collection happened to run, and an
+    unrelated 1.9 MB lru-cache resize inside pathlib landed in the window.
+    """
+    import gc
+    import tracemalloc
+    from json import decoder as json_decoder
+    from pathlib import Path
+
+    from genesis import persistence as persistence_module
+    from genesis.persistence import PersistenceCoordinator
+
+    # Attribute memory to the decoded evidence: the JSON decoder that builds
+    # each snapshot, plus this package. A whole-process total also counts
+    # unrelated allocations that land in the window -- an lru-cache resize
+    # inside pathlib produced a single 1.9 MB block that looked exactly like a
+    # retained history until it was itemised.
+    traced = (
+        tracemalloc.Filter(True, str(Path(persistence_module.__file__).parent / "*")),
+        tracemalloc.Filter(True, json_decoder.__file__),
+    )
+
+    def alive_during(operation) -> int:
+        """Evidence alive at the moment ``operation`` reports back.
+
+        Sampled *during* the work, not after it: a generator that secretly
+        accumulated every snapshot would drop them all when it was exhausted,
+        so a measurement taken afterwards cannot tell the two apart.
+        """
+        gc.collect()
+        tracemalloc.start()
+        try:
+            snapshot = operation()
+            snapshot = snapshot.filter_traces(traced)
+        finally:
+            tracemalloc.stop()
+        return sum(stat.size for stat in snapshot.statistics("filename"))
+
+    def measure(commits: int) -> tuple[int, int]:
+        store = PersistenceCoordinator(
+            tmp_path / f"{commits}.sqlite", tmp_path / f"objects-{commits}"
+        )
+        try:
+            store.create_run({"id": "r", "study_id": "s"})
+            for version in range(1, commits + 1):
+                # Distinct payloads: identical ones share their string object,
+                # which would mask what materialising really costs.
+                payload = {"field": f"{version:05d}" + "x" * 4096}
+                store.commit_process_result(
+                    {
+                        "event_id": f"e{version}",
+                        "invocation_id": f"i{version}",
+                        "run_id": "r",
+                        "kind": "process_completed",
+                        "phase": version,
+                        "state_version": version,
+                    },
+                    {"run_id": "r", "state_version": version, "payload": _json_bytes(payload)},
+                    [],
+                )
+
+            def stream():
+                sampled = None
+                seen = 0
+                for _version, _state in store.iter_state_history("r"):
+                    seen += 1
+                    if seen == commits // 2:
+                        sampled = tracemalloc.take_snapshot()
+                assert seen == commits
+                assert sampled is not None
+                return sampled
+
+            def whole():
+                history = store.list_state_history("r")
+                assert len(history) == commits
+                sampled = tracemalloc.take_snapshot()
+                del history
+                return sampled
+
+            return alive_during(stream), alive_during(whole)
+        finally:
+            store.close()
+
+    small_stream, small_whole = measure(100)
+    large_stream, large_whole = measure(400)
+
+    # Four times the commits, four times the history held.
+    assert large_whole > small_whole * 3, (small_whole, large_whole)
+    # Iterating holds one snapshot, so the extra 300 commits cost it only their
+    # version-index entries -- a small fraction of what holding them all costs.
+    assert (large_stream - small_stream) * 4 < large_whole - small_whole, (
+        large_stream - small_stream,
+        large_whole - small_whole,
+    )
+    # And at any one size it stays well below the materialised history.
+    assert large_stream * 5 < large_whole, (large_stream, large_whole)
+    assert small_stream * 5 < small_whole, (small_stream, small_whole)
+
+
+def _json_bytes(value):
+    import json as _json
+
+    return _json.dumps(value, sort_keys=True).encode()
+
+
+def test_iterated_snapshots_are_independent_objects(tmp_path) -> None:
+    """A consumer mutating one yielded snapshot must not affect another."""
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    try:
+        store.create_run({"id": "r", "study_id": "s"})
+        for version in (1, 2):
+            store.commit_process_result(
+                {
+                    "event_id": f"e{version}",
+                    "invocation_id": f"i{version}",
+                    "run_id": "r",
+                    "kind": "process_completed",
+                    "phase": version,
+                    "state_version": version,
+                },
+                {
+                    "run_id": "r",
+                    "state_version": version,
+                    "payload": _json_bytes({"shared": [1, 2, 3]}),
+                },
+                [],
+            )
+        seen = []
+        for _version, snapshot in store.iter_state_history("r"):
+            snapshot["shared"].append(99)
+            seen.append(snapshot)
+        assert seen[0] is not seen[1]
+        assert seen[1]["shared"] == [1, 2, 3, 99], "a mutation must not leak between snapshots"
+    finally:
+        store.close()
+
+
+def test_streamed_parquet_matches_a_whole_table_write(tmp_path) -> None:
+    """STH-003: batching changes the file layout, never the rows."""
+    import pyarrow.parquet as pq
+
+    from genesis.analysis import AnalysisExporter
+
+    rows = [{"a": index, "b": None if index % 3 else f"v{index}"} for index in range(50)]
+    whole = AnalysisExporter.rows_to_parquet(list(rows), tmp_path / "whole.parquet")
+    streamed = AnalysisExporter.stream_rows_to_parquet(
+        iter(rows), tmp_path / "streamed.parquet", batch_rows=7
+    )
+    assert pq.read_table(whole).to_pylist() == pq.read_table(streamed).to_pylist()
+
+    # A column first seen in a later batch is kept -- neither refused, which
+    # failed exports of valid runs, nor dropped, which the whole-table writer
+    # does silently because it infers columns from the first row.
+    late = pq.read_table(
+        AnalysisExporter.stream_rows_to_parquet(
+            iter([{"a": 1}, {"a": 2, "late": 3}]), tmp_path / "late.parquet", batch_rows=1
+        )
+    )
+    assert late.to_pylist() == [{"a": 1, "late": None}, {"a": 2, "late": 3}]
+
+    # An empty relation still yields a readable file.
+    empty = AnalysisExporter.stream_rows_to_parquet(iter([]), tmp_path / "empty.parquet")
+    assert empty.exists()
+
+
+def test_analysis_reads_project_away_fields_no_consumer_reads(tmp_path) -> None:
+    """Evidence-only fields are served by export, not carried into analysis.
+
+    `context` on an event and the provider exchange on an artifact are retained
+    as evidence and read by nobody analysing a run, but they grow with the run.
+    Export and the trace endpoints must still see the complete record.
+    """
+    import yaml
+
+    from genesis.service import GenesisService
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    source = workspace / "pkg"
+    source.mkdir()
+    base = {"schema_version": "1.0", "study_id": "proj"}
+    executor = {
+        "mode": "computational",
+        "parameters": {"entry_point": "tests.resume_executors:bump"},
+    }
+    files = {
+        "study": {**base, "title": "p"},
+        "openness": {
+            **base,
+            "processes": [
+                {
+                    "id": "a",
+                    "executor": executor,
+                    "context_policy": "s",
+                    "trigger": {"type": "phase", "phase": 0, "repeat": True},
+                    "state_effects": [{"field": "counter", "op": "set"}],
+                }
+            ],
+        },
+        "theory": {**base, "theory_family": "exploratory"},
+        "domain": {
+            **base,
+            "visibility": [{"id": "s", "allow": ["counter"]}],
+            "states": [{"id": "counter", "value_type": "integer", "initial": 0}],
+        },
+        "protocol": {**base, "time_model": {"type": "rounds", "start": 0, "end": 2}},
+        "outcomes": {**base, "outcomes": []},
+        "models": {**base, "models": []},
+    }
+    for name, value in files.items():
+        (source / f"{name}.yaml").write_text(yaml.safe_dump(value, sort_keys=False))
+
+    service = GenesisService(workspace)
+    try:
+        build = service.compile_study(source, "builds/p")
+        service.create_run({"id": "p1", "study_id": "proj", "build": build["path"]})
+        service.execute_run("p1")
+
+        evidence = service.trace_run("p1")
+        analysis = service.trace_run("p1", evidence=False)
+        assert any("context" in event for event in evidence), "evidence keeps the context"
+        assert all("context" not in event for event in analysis)
+        # Everything else is untouched.
+        assert [
+            {k: v for k, v in event.items() if k != "context"} for event in evidence
+        ] == analysis
+
+        art_evidence = service.artifacts_for_run("p1")
+        art_analysis = service.artifacts_for_run("p1", evidence=False)
+        assert len(art_evidence) == len(art_analysis)
+        for full, projected in zip(art_evidence, art_analysis, strict=True):
+            if isinstance(full["payload"], dict):
+                assert not (
+                    {"provider_attempts", "raw_response", "parsed_response"}
+                    & set(projected["payload"])
+                )
+    finally:
+        service.close()
+
+
+def test_plan_aware_projection_is_conservative() -> None:
+    """A plan that might read a field keeps it; only a provable miss drops it."""
+    from genesis.service import GenesisService
+
+    reads_state_delta = {
+        "datasets": [{"id": "d", "source": {"kind": "events", "path": "state_delta.x"}}],
+        "outcomes": [],
+    }
+    ignores_state_delta = {
+        "datasets": [{"id": "d", "source": {"kind": "state", "snapshot": "final"}}],
+        "outcomes": [],
+    }
+    assert GenesisService._unused_event_fields(reads_state_delta) == ()
+    assert GenesisService._unused_event_fields(ignores_state_delta) == ("state_delta",)
+    # No declared datasets: the legacy synthesis may read it, so keep everything.
+    assert GenesisService._unused_event_fields({"datasets": [], "outcomes": []}) == ()
+
+    assert GenesisService._plan_reads_artifact_relation({"datasets": [], "outcomes": []}) is True
+    assert (
+        GenesisService._plan_reads_artifact_relation(
+            {"datasets": [{"id": "d", "source": {"kind": "artifacts"}}], "outcomes": []}
+        )
+        is True
+    )
+    assert (
+        GenesisService._plan_reads_artifact_relation(
+            {
+                "datasets": [{"id": "d", "source": {"kind": "state"}}],
+                "outcomes": [{"id": "o", "source": "artifacts"}],
+            }
+        )
+        is True
+    )
+    assert (
+        GenesisService._plan_reads_artifact_relation(
+            {
+                "datasets": [{"id": "d", "source": {"kind": "state"}}],
+                "outcomes": [{"id": "o", "source": "d"}],
+            }
+        )
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# State-history scaling, Phase 2: append-aware patch storage
+# ---------------------------------------------------------------------------
+
+
+def _state_store(tmp_path, name="db"):
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(tmp_path / f"{name}.sqlite", tmp_path / f"objects-{name}")
+    store.create_run({"id": "r", "study_id": "s"})
+    return store
+
+
+def _commit_state(store, version, snapshot):
+    from genesis.state_encoding import canonical_bytes
+
+    store.commit_process_result(
+        {
+            "event_id": f"e{version}",
+            "invocation_id": f"i{version}",
+            "run_id": "r",
+            "kind": "process_completed",
+            "phase": version,
+            "state_version": version,
+        },
+        {"run_id": "r", "state_version": version, "payload": canonical_bytes(snapshot)},
+        [],
+    )
+
+
+def test_patch_encoding_round_trips_every_shape() -> None:
+    """STH-006: a patch describes the transition exactly, whatever changed."""
+    from genesis.state_encoding import apply_patch, canonical_bytes, encode_patch
+
+    transitions = [
+        ({}, {"a": 1}),
+        ({"b": [1, 2]}, {"b": [1, 2, 3, 4]}),  # append: only the tail is stored
+        ({"b": [1, 2, 3]}, {"b": [9, 9]}),  # rewritten, not extended
+        ({"b": [1, 2, 3]}, {"b": [1, 2]}),  # shrunk
+        ({"a": 1, "b": 2}, {"a": 1}),  # removal
+        ({"a": None}, {"a": 1}),
+        ({"a": 1}, {"a": None}),
+        ({"x": {"k": [1]}}, {"x": {"k": [1, 2]}}),  # nested: replaced wholesale
+    ]
+    for previous, current in transitions:
+        patch = encode_patch(previous, current)
+        rebuilt = apply_patch(previous, patch)
+        assert rebuilt == current, (previous, current, patch)
+        # Byte-exactness matters: a commit's identity digests these bytes.
+        assert canonical_bytes(rebuilt) == canonical_bytes(current)
+
+    # A growing list is stored as its tail, not wholesale.
+    grown = encode_patch({"b": [1, 2]}, {"b": [1, 2, 3, 4]})
+    assert grown["fields"]["b"] == {"op": "append", "items": [3, 4]}
+
+
+def test_patch_storage_reconstructs_exactly_and_shrinks(tmp_path) -> None:
+    """STH-005/006 on an accumulating run: every version exact, far less stored."""
+    from genesis.state_encoding import FORM_PATCH, canonical_bytes
+
+    # Entries carry real content, as accumulating study state does; a ledger of
+    # bare integers understates what patching saves.
+    snapshots = [
+        {"ledger": [{"i": i, "text": f"entry-{i}-" + "x" * 200} for i in range(n)], "n": n}
+        for n in range(1, 121)
+    ]
+    store = _state_store(tmp_path)
+    try:
+        for version, snapshot in enumerate(snapshots, 1):
+            _commit_state(store, version, snapshot)
+
+        rows = store._state_rows("r")
+        assert any(form == FORM_PATCH for _v, _r, form in rows), "patches must be used"
+
+        stored = sum(store._object_size(ref) for _v, ref, _f in rows)
+        whole = sum(len(canonical_bytes(s)) for s in snapshots)
+        # Patching stores what changed; snapshots store the whole accumulation.
+        assert stored * 10 < whole, (stored, whole)
+
+        # Exhaustive, not sampled: every version, by value and by bytes.
+        for version, expected in enumerate(snapshots, 1):
+            rebuilt = store._reconstruct_state("r", version)
+            assert rebuilt == expected, version
+            assert canonical_bytes(rebuilt) == canonical_bytes(expected), version
+
+        assert [s for _v, s in store.iter_state_history("r")] == snapshots
+        _version, payload, _media = store.latest_state("r")
+        assert payload == canonical_bytes(snapshots[-1])
+    finally:
+        store.close()
+
+
+def test_commit_identity_is_unchanged_by_the_storage_form(tmp_path) -> None:
+    """STH-007: a commit's hash must not depend on how its state was stored."""
+    snapshots = [{"ledger": [{"i": i} for i in range(n)], "n": n} for n in range(1, 40)]
+
+    def commit_hashes(force_whole: bool, name: str):
+        store = _state_store(tmp_path, name)
+        try:
+            if force_whole:
+                # Emulate the pre-change format: every commit stored whole.
+                store._encode_state_for_storage = lambda run, prev, payload: ("base", payload)
+            for version, snapshot in enumerate(snapshots, 1):
+                _commit_state(store, version, snapshot)
+            hashes = [
+                row[0]
+                for row in store.connection.execute("SELECT commit_hash FROM events ORDER BY rowid")
+            ]
+            states = [s for _v, s in store.iter_state_history("r")]
+            return hashes, states
+        finally:
+            store.close()
+
+    whole_hashes, whole_states = commit_hashes(True, "whole")
+    patch_hashes, patch_states = commit_hashes(False, "patched")
+
+    assert whole_hashes == patch_hashes, "storage form must not change commit identity"
+    assert whole_states == patch_states == snapshots
+
+
+def test_a_run_spanning_the_format_change_reconstructs(tmp_path) -> None:
+    """STH-008: rows predating the encoding are bases; a resumed run mixes forms."""
+    snapshots = [{"ledger": [{"i": i} for i in range(n)], "n": n} for n in range(1, 31)]
+    store = _state_store(tmp_path)
+    try:
+        original = store._encode_state_for_storage
+        store._encode_state_for_storage = lambda run, prev, payload: ("base", payload)
+        for version, snapshot in enumerate(snapshots[:15], 1):
+            _commit_state(store, version, snapshot)
+        # Rows written before the encoding existed carry no form at all.
+        store.connection.execute("UPDATE states SET form = NULL WHERE run_id='r'")
+
+        store._encode_state_for_storage = original
+        for version, snapshot in enumerate(snapshots[15:], 16):
+            _commit_state(store, version, snapshot)
+
+        forms = [form for _v, _r, form in store._state_rows("r")]
+        assert forms.count(None) == 15, "the legacy half keeps a NULL form"
+        assert any(form == "patch" for form in forms), "the resumed half uses patches"
+
+        for version, expected in enumerate(snapshots, 1):
+            assert store._reconstruct_state("r", version) == expected, version
+        assert [s for _v, s in store.iter_state_history("r")] == snapshots
+    finally:
+        store.close()
+
+
+def test_reconstruction_failure_names_the_run_and_version(tmp_path) -> None:
+    """A patch whose base is gone must fail by name, never silently half-rebuild."""
+    snapshots = [{"ledger": [{"i": i} for i in range(n)]} for n in range(1, 12)]
+    store = _state_store(tmp_path)
+    try:
+        for version, snapshot in enumerate(snapshots, 1):
+            _commit_state(store, version, snapshot)
+        # Mark every row a patch: nothing is left to reconstruct from.
+        store.connection.execute("UPDATE states SET form = 'patch' WHERE run_id='r'")
+        with pytest.raises(ValueError, match="STATE_BASE_MISSING"):
+            store._reconstruct_state("r", len(snapshots))
+        with pytest.raises(ValueError, match="STATE_VERSION_MISSING"):
+            store._reconstruct_state("r", 9999)
+    finally:
+        store.close()
+
+
+# ---- Phase 3: event patch storage (STH-009..STH-013) ------------------------
+
+
+def _phase3_store(tmp_path):
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    store.create_run({"id": "r", "study_id": "s"})
+    return store
+
+
+def _commit(store, version, *, event_extra=None, state=None):
+    event = {
+        "event_id": f"e{version}",
+        "invocation_id": f"i{version}",
+        "run_id": "r",
+        "kind": "process_completed",
+        "phase": version,
+        "state_version": version,
+    }
+    event.update(event_extra or {})
+    store.commit_process_result(
+        event,
+        {
+            "run_id": "r",
+            "state_version": version,
+            "payload": _json_bytes(state if state is not None else {"v": version}),
+        },
+        [],
+    )
+    return event
+
+
+def test_events_store_as_patches_and_reconstruct_exactly(tmp_path) -> None:
+    """An accumulating event ledger is patched, and reads are byte-exact."""
+    store = _phase3_store(tmp_path)
+    try:
+        committed = []
+        ledger: list[dict] = []
+        for version in range(1, 25):
+            ledger = [*ledger, {"n": version, "text": "y" * 200}]
+            committed.append(_commit(store, version, event_extra={"context": {"ledger": ledger}}))
+        forms = [form for _rowid, _ref, form in store._event_rows("r")]
+        assert "patch" in forms, "an accumulating ledger must patch"
+
+        read = store.list_events("r")
+        assert read == committed
+        # Identity is unaffected by storage form (STH-011).
+        stored_hashes = [
+            row[0]
+            for row in store.connection.execute(
+                "SELECT event_hash FROM events WHERE run_id = 'r' ORDER BY rowid"
+            )
+        ]
+        assert stored_hashes == [
+            hashlib.sha256(store._event_bytes(event)).hexdigest() for event in committed
+        ]
+    finally:
+        store.close()
+
+
+def test_event_patch_is_declined_when_it_would_be_larger(tmp_path) -> None:
+    """STH-009: unrelated neighbours must not cause a storage regression."""
+    store = _phase3_store(tmp_path)
+    try:
+        for version in range(1, 12):
+            # Every event carries a wholly different payload, so a diff cannot
+            # be smaller than the value itself.
+            _commit(
+                store,
+                version,
+                event_extra={"context": {f"k{version}": "z" * 300 * version}},
+            )
+        forms = [form for _rowid, _ref, form in store._event_rows("r")]
+        assert set(forms) == {"base"}, forms
+    finally:
+        store.close()
+
+
+def test_events_read_correctly_across_mixed_formats(tmp_path) -> None:
+    """STH-008/STH-013: rows predating the encoding are read as whole payloads."""
+    store = _phase3_store(tmp_path)
+    try:
+        ledger: list[dict] = []
+        for version in range(1, 16):
+            ledger = [*ledger, {"n": version, "text": "y" * 200}]
+            _commit(store, version, event_extra={"context": {"ledger": ledger}})
+        expected = store.list_events("r")
+        # Simulate pre-migration rows: a NULL form must be read as a base.
+        store.connection.execute(
+            "UPDATE events SET form = NULL WHERE form = 'base' AND run_id = 'r'"
+        )
+        store.connection.commit()
+        assert store.list_events("r") == expected
+    finally:
+        store.close()
+
+
+def test_excluded_event_fields_do_not_corrupt_the_patch_chain(tmp_path) -> None:
+    """STH-013: projection happens after reconstruction, not before."""
+    store = _phase3_store(tmp_path)
+    try:
+        ledger: list[dict] = []
+        for version in range(1, 20):
+            ledger = [*ledger, {"n": version, "text": "y" * 200}]
+            _commit(
+                store,
+                version,
+                event_extra={"context": {"ledger": ledger}, "keep": version},
+            )
+        full = store.list_events("r")
+        projected = store.list_events("r", exclude_fields=("context",))
+        assert [event["keep"] for event in projected] == [event["keep"] for event in full]
+        assert all("context" not in event for event in projected)
+    finally:
+        store.close()
+
+
+def test_patched_snapshots_do_not_share_nested_values(tmp_path) -> None:
+    """A patch leaves unchanged fields as the same objects; yields must not."""
+    store = _phase3_store(tmp_path)
+    try:
+        big = ["x" * 100 for _ in range(200)]
+        for version in (1, 2):
+            _commit(
+                store,
+                version,
+                state={"shared": [1, 2, 3], "big": big, "tick": version},
+            )
+        forms = [form for _version, _ref, form in store._state_rows("r")]
+        assert "patch" in forms, "test needs a patched row to be meaningful"
+        seen = []
+        for _version, snapshot in store.iter_state_history("r"):
+            snapshot["shared"].append(99)
+            seen.append(snapshot)
+        assert seen[0]["shared"] == [1, 2, 3, 99]
+        assert seen[1]["shared"] == [1, 2, 3, 99]
+    finally:
+        store.close()
+
+
+def _commit_growing(store, version, ledger):
+    store.commit_process_result(
+        {
+            "event_id": f"e{version}",
+            "invocation_id": f"i{version}",
+            "run_id": "r",
+            "kind": "process_completed",
+            "phase": version,
+            "state_version": version,
+            "context": {"ledger": ledger},
+        },
+        {
+            "run_id": "r",
+            "state_version": version,
+            "payload": _json_bytes({"ledger": ledger}),
+        },
+        [],
+    )
+
+
+def test_patch_chain_survives_a_cold_predecessor_cache(tmp_path) -> None:
+    """Reopening mid-chain must reconstruct, not guess, the predecessor."""
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    store.create_run({"id": "r", "study_id": "s"})
+    ledger: list[dict] = []
+    for version in range(1, 21):
+        ledger = [*ledger, {"n": version, "text": "y" * 200}]
+        _commit_growing(store, version, ledger)
+    store.close()
+
+    reopened = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    try:
+        for version in range(21, 41):
+            ledger = [*ledger, {"n": version, "text": "y" * 200}]
+            _commit_growing(reopened, version, ledger)
+        events = reopened.list_events("r")
+        assert [event["phase"] for event in events] == list(range(1, 41))
+        assert all(len(e["context"]["ledger"]) == e["phase"] for e in events)
+        assert all(
+            len(state["ledger"]) == version for version, state in reopened.iter_state_history("r")
+        )
+    finally:
+        reopened.close()
+
+
+def test_patch_chain_is_correct_when_another_writer_advances_it(tmp_path) -> None:
+    """A cached predecessor must be ignored once it is no longer the tail."""
+    from genesis.persistence import PersistenceCoordinator
+
+    first = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    first.create_run({"id": "r", "study_id": "s"})
+    ledger: list[dict] = []
+    for version in range(1, 16):
+        ledger = [*ledger, {"n": version, "text": "y" * 200}]
+        _commit_growing(first, version, ledger)
+
+    second = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    try:
+        # The second writer advances the chain, so the first writer's cached
+        # predecessor is stale and must not be used as a patch base.
+        ledger = [*ledger, {"n": 16, "text": "y" * 200}]
+        _commit_growing(second, 16, ledger)
+        ledger = [*ledger, {"n": 17, "text": "y" * 200}]
+        _commit_growing(first, 17, ledger)
+
+        events = first.list_events("r")
+        assert [event["phase"] for event in events] == list(range(1, 18))
+        assert all(len(e["context"]["ledger"]) == e["phase"] for e in events)
+    finally:
+        second.close()
+        first.close()
+
+
+# ---- encoder: values that collide under == but differ in JSON --------------
+
+
+def test_patch_encoding_distinguishes_booleans_from_the_integers_they_equal() -> None:
+    """STH-007/STH-011: identity digests bytes, so `1` -> `true` is a change.
+
+    Python holds ``True == 1`` and ``1 == 1.0``; JSON writes three different
+    byte strings. Treating such a transition as unchanged drops it from the
+    patch and the reconstructed record differs from the committed one in
+    exactly the bytes its identity is taken from.
+    """
+    from genesis.state_encoding import apply_patch, canonical_bytes, encode_patch
+
+    transitions = [
+        ({"a": 1}, {"a": True}),
+        ({"a": 0}, {"a": False}),
+        ({"a": True}, {"a": 1}),
+        ({"a": 1}, {"a": 1.0}),
+        ({"a": 1.0}, {"a": 1}),
+        ({"a": [1, 2]}, {"a": [True, 2]}),
+        ({"a": {"b": 1}}, {"a": {"b": True}}),
+        # An append whose retained prefix changed type is not an append.
+        ({"a": [1, 2]}, {"a": [1.0, 2, 3]}),
+    ]
+    for previous, current in transitions:
+        rebuilt = apply_patch(previous, encode_patch(previous, current))
+        assert rebuilt == current, (previous, current, rebuilt)
+        assert canonical_bytes(rebuilt) == canonical_bytes(current), (previous, current)
+
+
+def test_patch_encoding_round_trips_arbitrary_nested_values() -> None:
+    """Every transition must rebuild by value and by bytes, not most of them."""
+    import random
+
+    from genesis.state_encoding import apply_patch, canonical_bytes, encode_patch
+
+    # Deliberately weighted towards values that compare equal across JSON types.
+    ambiguous = [0, 1, 0.0, 1.0, True, False, 2, 2.0]
+    random.seed(11)
+
+    def value(depth: int = 0):
+        roll = random.random()
+        if depth > 3 or roll < 0.45:
+            return random.choice([*ambiguous, "a", None, "x" * 10])
+        if roll < 0.75:
+            return [value(depth + 1) for _ in range(random.randint(0, 4))]
+        return {f"k{i}": value(depth + 1) for i in range(random.randint(0, 4))}
+
+    def mutate(item, depth: int = 0):
+        if isinstance(item, dict):
+            out = {
+                key: (mutate(sub, depth + 1) if random.random() < 0.6 else sub)
+                for key, sub in item.items()
+            }
+            if random.random() < 0.2:
+                out[f"n{random.randint(0, 9)}"] = value(depth + 1)
+            if out and random.random() < 0.2:
+                out.pop(random.choice(list(out)))
+            return out
+        if isinstance(item, list):
+            out = [mutate(sub, depth + 1) if random.random() < 0.5 else sub for sub in item]
+            if random.random() < 0.5:
+                out.extend(value(depth + 1) for _ in range(random.randint(1, 3)))
+            return out
+        return value(depth)
+
+    for _ in range(2000):
+        previous = {f"f{i}": value() for i in range(random.randint(0, 4))}
+        current = mutate(previous)
+        rebuilt = apply_patch(previous, encode_patch(previous, current))
+        assert rebuilt == current
+        assert canonical_bytes(rebuilt) == canonical_bytes(current)
+
+
+def test_a_failing_commit_surfaces_its_own_error_not_the_rollback_s(tmp_path) -> None:
+    """A failing COMMIT ends the transaction; rolling back then must not mask it."""
+    import sqlite3
+
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    try:
+        store.create_run({"id": "r", "study_id": "s"})
+
+        class FailingCommit:
+            """Ends the transaction and then fails, as a real I/O error does."""
+
+            def __init__(self, connection):
+                self._connection = connection
+                self._armed = True
+
+            def execute(self, sql, *args, **kwargs):
+                if sql.strip() == "COMMIT" and self._armed:
+                    self._armed = False
+                    self._connection.execute("ROLLBACK")
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._connection.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        real = store.connection
+        store.connection = FailingCommit(real)
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            store.append_run_collection("r", "events", {"x": 1})
+        store.connection = real
+    finally:
+        store.close()
+
+
+def test_duckdb_and_python_emit_groups_in_the_same_order() -> None:
+    """Enabling DuckDB must not reorder outcome rows.
+
+    Outcome rows are exported to outcomes.json/csv/parquet and each exported
+    file is hashed into the bundle's integrity manifest, so a different row
+    order means the same run exports different digests depending on an
+    environment variable.
+    """
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+
+    from genesis.analysis import AnalysisEngine, OutcomePlan, duckdb_aggregate
+
+    cases = [
+        [{"phase": 3, "x": 1}, {"phase": 1, "x": 2}, {"phase": 2, "x": 3}, {"phase": 1, "x": 4}],
+        [{"g": "b", "x": 1}, {"g": "a", "x": 2}, {"g": "b", "x": None}],
+        [{"g": None, "x": 1}, {"g": "a", "x": 2}],
+        [{"phase": 2, "x": 1.5}, {"phase": 1, "x": None}, {"phase": 1, "x": 2}],
+    ]
+    for rows in cases:
+        key = next(name for name in rows[0] if name != "x")
+        for op in ("sum", "count", "mean"):
+            plan = OutcomePlan(id="o", source="rows", select="x", aggregation=op, group_by=key)
+            in_process = AnalysisEngine().evaluate(plan, {"rows": rows})
+            through_duckdb = duckdb_aggregate(rows, select="x", op=op, group_by=key)
+            assert through_duckdb == in_process, (op, rows, through_duckdb, in_process)
+
+
+def test_empirically_seeded_follow_graph_survives_the_first_round(tmp_path) -> None:
+    """An empirical initialization wraps its asset; consumers must unwrap it.
+
+    ``follows`` is seeded as ``{origin, data_source, rows}``. Read as if it were
+    the graph itself, that envelope iterates to its own keys -- ``"imported"``
+    becomes ``['i','m','p',...]`` -- and because the writing process sets the
+    field outright, one unwrapped read destroyed the graph in round 0 and it
+    never recovered, leaving the recommender with nothing usable.
+    """
+    import json as _json
+
+    # demos/ is local experiment scaffolding and is absent from a clean
+    # checkout, so this regression runs only where the demo executors exist.
+    demo_executors = pytest.importorskip("demos.demo_executors")
+    from genesis.persistence import PersistenceCoordinator
+    from genesis.runtime import (
+        CallableExecutor,
+        ContextEngine,
+        ExecutorRegistry,
+        RunController,
+        Scheduler,
+        StateStore,
+    )
+    from genesis.service import _load_empirical_data
+
+    graph = {"u1": ["w3"], "u2": ["w3"], "u3": ["w4"]}
+    asset = tmp_path / "initial-follows.json"
+    asset.write_text(_json.dumps(graph))
+    envelope = _load_empirical_data(asset, "data/initial-follows.json")
+    assert set(envelope) == {"origin", "data_source", "rows"}
+
+    store = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    try:
+        store.create_run({"id": "r", "study_id": "s"})
+        RunController(
+            Scheduler(
+                [
+                    {
+                        "id": "update-follow-relation",
+                        "context_policy": "p",
+                        "actors": [],
+                        "state_effects": [{"field": "follows", "op": "set"}],
+                        "trigger": {"type": "phase", "phase": 0, "repeat": True},
+                    }
+                ]
+            ),
+            ExecutorRegistry(
+                {
+                    "update-follow-relation": CallableExecutor(
+                        demo_executors.update_follow_relation, "computational"
+                    )
+                }
+            ),
+            ContextEngine({"p": {"allow": ["follows", "actions"]}}),
+            state_store=StateStore(
+                {"follows": dict, "actions": list},
+                {"follows": envelope, "actions": []},
+            ),
+            persistence=store,
+        ).run("r", phase_start=0, phase_end=2)
+
+        latest = store.latest_json_state("r")
+        follows = (latest[1] if latest else {}).get("follows")
+        assert follows == graph, follows
+    finally:
+        store.close()
+
+
+# ---- CTX-001..009: element-level context scoping ---------------------------
+
+
+def _scoped_context(policy, actors=("w1",)):
+    from genesis.runtime import ContextEngine, ProcessInvocation
+
+    state = {
+        "reflection": [{"actor": a, "note": f"n-{a}"} for a in ("w1", "w2", "u1", "u2")],
+        "follows": {"w1": ["w2"], "u1": ["w1", "w2"]},
+        "exposure-detail": {"u1": [{"article": "a1"}], "u2": [{"article": "a2"}]},
+        "titles": [{"article_id": "a1"}, {"article_id": "a2"}],
+    }
+    invocation = ProcessInvocation(
+        invocation_id="i", run_id="r", process_id="p", actor_ids=tuple(actors), phase=1
+    )
+    return ContextEngine({"p": policy}).build("p", invocation, state).data
+
+
+def _seen(context):
+    return [row["actor"] for row in context.get("reflection", ())]
+
+
+def test_context_scope_expresses_own_selected_and_union(tmp_path) -> None:
+    """CTX-002: one selector shape covers every visibility pattern."""
+    own = {"field": "actor", "in": ["actor.ids"]}
+    others = {"field": "actor", "in": ["state.follows.${actor}"]}
+    both = {"field": "actor", "in": ["actor.ids", "state.follows.${actor}"]}
+
+    assert _seen(_scoped_context({"allow": ["reflection"], "scope": {"reflection": own}})) == ["w1"]
+    # CTX-003: self is never implicit -- w1 follows w2, and only w2 comes back.
+    assert _seen(_scoped_context({"allow": ["reflection"], "scope": {"reflection": others}})) == [
+        "w2"
+    ]
+    assert _seen(_scoped_context({"allow": ["reflection"], "scope": {"reflection": both}})) == [
+        "w1",
+        "w2",
+    ]
+    # CTX-009: absent scope is today's behaviour.
+    assert _seen(_scoped_context({"allow": ["reflection"]})) == ["w1", "w2", "u1", "u2"]
+
+
+def test_context_scope_handles_multi_actor_keys_and_missing_relations() -> None:
+    """CTX-004/006: union over acting actors; an absent relation is empty, not an error."""
+    own = {"field": "actor", "in": ["actor.ids"]}
+    assert _seen(
+        _scoped_context(
+            {"allow": ["reflection"], "scope": {"reflection": own}}, actors=("w1", "u2")
+        )
+    ) == ["w1", "u2"]
+
+    by_key = {"field": "__key__", "in": ["actor.ids"]}
+    context = _scoped_context(
+        {"allow": ["exposure-detail"], "scope": {"exposure-detail": by_key}}, actors=("u1",)
+    )
+    assert list(context["exposure-detail"]) == ["u1"]
+
+    missing = {"field": "actor", "in": ["state.nowhere.${actor}"]}
+    assert _seen(_scoped_context({"allow": ["reflection"], "scope": {"reflection": missing}})) == []
+
+
+def test_context_scope_is_applied_before_the_cardinality_cap() -> None:
+    """CTX-005: capping first would return a subset of an arbitrary prefix."""
+    context = _scoped_context(
+        {
+            "allow": ["reflection"],
+            "scope": {
+                "reflection": {"field": "actor", "in": ["actor.ids", "state.follows.${actor}"]}
+            },
+            "cardinality": {"reflection": 1},
+        }
+    )
+    # Scoped to w1 and w2, then capped to one: the first *entitled* row.
+    assert _seen(context) == ["w1"]
+    # Unscoped fields are untouched.
+    full = _scoped_context(
+        {
+            "allow": ["reflection", "titles"],
+            "scope": {"reflection": {"field": "actor", "in": ["actor.ids"]}},
+        }
+    )
+    assert len(full["titles"]) == 2
+
+
+def test_malformed_context_scope_fails_compilation(tmp_path) -> None:
+    """CTX-008: a scope a run would depend on must be rejected at compile time."""
+    from genesis.compiler import _validate_context_scope
+    from genesis.specification.models import DomainSpec
+
+    def errors_for(scope):
+        domain = DomainSpec(
+            schema_version="1.0",
+            study_id="s",
+            states=[{"id": "reflection", "value_type": "array", "initial": []}],
+            visibility=[{"id": "p", "allow": ["reflection"], "scope": scope}],
+        )
+        return [item["message"] for item in _validate_context_scope(domain)]
+
+    assert any(
+        "does not allow" in m for m in errors_for({"absent": {"field": "a", "in": ["actor.ids"]}})
+    )
+    assert any("'field'" in m for m in errors_for({"reflection": {"in": ["actor.ids"]}}))
+    assert any("'in'" in m for m in errors_for({"reflection": {"field": "actor"}}))
+    assert any(
+        "non-empty strings" in m for m in errors_for({"reflection": {"field": "actor", "in": [""]}})
+    )
+    assert errors_for({"reflection": {"field": "actor", "in": ["actor.ids"]}}) == []
+
+
+def test_unbounded_context_is_reported_at_compilation() -> None:
+    """CTX-008: handing a whole collection to every actor is a declared choice."""
+    from genesis.compiler import _advise_unbounded_context
+    from genesis.specification.models import DomainSpec
+
+    def advisories(policy):
+        domain = DomainSpec(
+            schema_version="1.0",
+            study_id="s",
+            states=[
+                {"id": "reflection", "value_type": "array", "initial": []},
+                {"id": "headline", "value_type": "string", "initial": ""},
+            ],
+            visibility=[policy],
+        )
+        return [item["path"] for item in _advise_unbounded_context(domain)]
+
+    assert advisories({"id": "p", "allow": ["reflection"]}) == [
+        "domain.visibility.p.allow/reflection"
+    ]
+    # A scalar is not a collection, and any of scope/cardinality/aggregate settles it.
+    assert advisories({"id": "p", "allow": ["headline"]}) == []
+    assert (
+        advisories(
+            {
+                "id": "p",
+                "allow": ["reflection"],
+                "scope": {"reflection": {"field": "actor", "in": ["actor.ids"]}},
+            }
+        )
+        == []
+    )
+    assert advisories({"id": "p", "allow": ["reflection"], "cardinality": {"reflection": 5}}) == []
+
+
+# ---- OUT-001..OUT-005: streaming outcome evaluation -------------------------
+
+
+def test_outcome_sources_are_walked_once_per_relation_not_once_per_outcome() -> None:
+    """OUT-002: eleven outcomes over one relation cost one pass, not eleven."""
+    from genesis.analysis import AnalysisEngine, OutcomePlan
+
+    walks = 0
+
+    def events():
+        nonlocal walks
+        walks += 1
+        for index in range(10):
+            yield {"value": index, "group": index % 2, "time": index}
+
+    plans = [
+        OutcomePlan(id=f"o{n}", source="events", select="value", aggregation="sum")
+        for n in range(11)
+    ]
+    results = AnalysisEngine().evaluate_many(plans, {"events": events})
+    assert walks == 1, walks
+    assert all(rows == [{"value_sum": 45, "value_missing": 0}] for rows in results)
+
+
+def test_streaming_never_holds_the_source() -> None:
+    """OUT-003: accumulator state is bounded by the output, not the input."""
+    import tracemalloc
+
+    from genesis.analysis import AnalysisEngine, OutcomePlan
+
+    def events():
+        for index in range(20000):
+            yield {"value": index, "group": index % 4, "payload": "x" * 200}
+
+    plan = OutcomePlan(id="o", source="events", select="value", aggregation="sum", group_by="group")
+    tracemalloc.start()
+    try:
+        rows = AnalysisEngine().evaluate_many([plan], {"events": events})[0]
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(rows) == 4
+    # 20,000 rows of ~200 bytes is ~4 MB of input; four groups of counters is not.
+    assert peak < 1_000_000, peak
+
+
+def test_group_rows_keep_first_appearance_order() -> None:
+    """OUT-006: outcome files and their integrity digests depend on this order."""
+    from genesis.analysis import AnalysisEngine, OutcomePlan
+
+    rows = [
+        {"group": "c", "value": 1},
+        {"group": "a", "value": 2},
+        {"group": "b", "value": 3},
+        {"group": "a", "value": 4},
+    ]
+    plan = OutcomePlan(id="o", source="events", select="value", aggregation="sum", group_by="group")
+    evaluated = AnalysisEngine().evaluate(plan, {"events": rows})
+    assert [row["group"] for row in evaluated] == ["c", "a", "b"]
+
+
+def test_hash_join_matches_the_nested_loop_and_scales_linearly() -> None:
+    """OUT-005: same rows in the same order, without the quadratic."""
+    import random
+    import time
+
+    from genesis.service import _hash_join
+
+    left = [{"k": index % 3, "l": index} for index in range(6)]
+    right = [{"k": index % 3, "r": index} for index in range(6)]
+
+    def nested(left_rows, right_rows, on):
+        merged = []
+        for left_row in left_rows:
+            for right_row in right_rows:
+                if left_row.get(on) == right_row.get(on):
+                    merged.append({**left_row, **right_row})
+        return merged
+
+    assert _hash_join(left, right, "k") == nested(left, right, "k")
+
+    # An unhashable key cannot index, but it can still compare equal: {} == {}
+    # is true and the nested loop matched such rows, so they must not vanish.
+    for keys in ([{}], [[1]], [{"x": 1}], [(1,)], [None]):
+        both = [{"k": keys[0], "l": 1}]
+        other = [{"k": keys[0], "r": 2}]
+        assert _hash_join(both, other, "k") == nested(both, other, "k"), keys
+
+    mixed_keys = [1, "a", None, {}, {"x": 1}, [1], (1,), True, 0]
+    random.seed(5)
+    for _ in range(300):
+        left_rows = [
+            {"k": random.choice(mixed_keys), "l": index} for index in range(random.randint(0, 5))
+        ]
+        right_rows = [
+            {"k": random.choice(mixed_keys), "r": index} for index in range(random.randint(0, 5))
+        ]
+        assert _hash_join(left_rows, right_rows, "k") == nested(left_rows, right_rows, "k")
+
+    # Complexity, asserted with a margin noise cannot cross rather than a
+    # ratio between two timings: 120,000 rows a side is 1.4e10 comparisons for
+    # a nested loop -- hours -- and one pass each for a hash join.
+    rows = [{"k": index, "v": index} for index in range(120_000)]
+    start = time.perf_counter()
+    joined = _hash_join(rows, rows, "k")
+    duration = time.perf_counter() - start
+    assert len(joined) == 120_000
+    assert duration < 30, duration
+
+
+def test_artifacts_are_read_one_at_a_time(tmp_path) -> None:
+    """The payloads were read into a list, then parsed into a second list."""
+    import json as _json
+
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    try:
+        store.create_run({"id": "r", "study_id": "s"})
+        for version in range(1, 6):
+            store.commit_process_result(
+                {
+                    "event_id": f"e{version}",
+                    "run_id": "r",
+                    "kind": "process_completed",
+                    "state_version": version,
+                },
+                {"run_id": "r", "state_version": version, "payload": _json_bytes({"v": version})},
+                [
+                    {
+                        "artifact_id": f"a{version}",
+                        "run_id": "r",
+                        "payload": _json.dumps({"n": version, "bulk": "x" * 500}).encode(),
+                    }
+                ],
+            )
+        # The iterator yields the same rows the list form returned.
+        assert list(store.iter_artifacts("r")) == store.list_artifacts("r")
+        # And it is lazy: taking one row must not have read the rest.
+        reads = 0
+        original = PersistenceCoordinator._read_object
+
+        def counting(self, digest):
+            nonlocal reads
+            reads += 1
+            return original(self, digest)
+
+        PersistenceCoordinator._read_object = counting
+        try:
+            first = next(iter(store.iter_artifacts("r")))
+        finally:
+            PersistenceCoordinator._read_object = original
+        assert first["artifact_id"] == "a1"
+        assert reads == 1, reads
+    finally:
+        store.close()
+
+
+def test_round_snapshots_are_produced_one_at_a_time(tmp_path) -> None:
+    """Only each round's winning snapshot is read, and none is held."""
+    from genesis.persistence import PersistenceCoordinator
+    from genesis.service import GenesisService
+
+    workspace = tmp_path / "workspace"
+    service = GenesisService(workspace)
+    try:
+        store: PersistenceCoordinator = service.persistence
+        store.create_run({"id": "r", "study_id": "s"})
+        ledger: list[int] = []
+        for version in range(1, 13):
+            ledger = [*ledger, version]
+            store.commit_process_result(
+                {
+                    "event_id": f"e{version}",
+                    "run_id": "r",
+                    "kind": "process_completed",
+                    "phase": (version - 1) // 4,
+                    "state_version": version,
+                },
+                {
+                    "run_id": "r",
+                    "state_version": version,
+                    "payload": _json_bytes({"ledger": ledger}),
+                },
+                [],
+            )
+        run = {**service.get_run("r"), "status": "completed"}
+        annotations = [
+            {"state_version": version, "phase": (version - 1) // 4, "kind": "process_completed"}
+            for version in range(1, 13)
+        ]
+        rows = list(service._iter_round_annotated_state("r", run, annotations))
+        # Three rounds of four commits: the final snapshot of each.
+        assert [row["state_version"] for row in rows] == [4, 8, 12]
+        assert [len(row["ledger"]) for row in rows] == [4, 8, 12]
+        # The list wrapper must agree with the iterator exactly.
+        assert service._round_annotated_state("r", run, annotations) == rows
+    finally:
+        service.close()
+
+
+def test_cardinality_can_keep_the_most_recent_entries() -> None:
+    """A bare cap keeps the oldest N, which is wrong for an append-ordered field."""
+    from genesis.runtime import ContextEngine, ProcessInvocation
+
+    state = {
+        "analytics": [{"n": index, "round": index} for index in range(1, 9)],
+        "detail": {f"u{index}": [index] for index in range(1, 6)},
+    }
+
+    def seen(policy, field="analytics"):
+        invocation = ProcessInvocation(
+            invocation_id="i", run_id="r", process_id="p", actor_ids=("a1",), phase=1
+        )
+        data = ContextEngine({"p": policy}).build("p", invocation, state).data
+        value = data.get(field, ())
+        return [row["n"] for row in value] if field == "analytics" else list(value)
+
+    allow = {"allow": ["analytics"]}
+    # The integer form is unchanged.
+    assert seen({**allow, "cardinality": {"analytics": 3}}) == [1, 2, 3]
+    assert seen({**allow, "cardinality": {"analytics": {"limit": 3, "keep": "first"}}}) == [1, 2, 3]
+    # The most recent three, still in source order.
+    assert seen({**allow, "cardinality": {"analytics": {"limit": 3, "keep": "last"}}}) == [6, 7, 8]
+    assert seen(
+        {**allow, "cardinality": {"analytics": {"limit": 3, "keep": "last", "by": "round"}}}
+    ) == [6, 7, 8]
+    assert seen({**allow, "cardinality": {"analytics": {"limit": 0, "keep": "last"}}}) == []
+    by_key = {"limit": 2, "keep": "last", "by": "__key__"}
+    assert seen({"allow": ["detail"], "cardinality": {"detail": by_key}}, field="detail") == [
+        "u4",
+        "u5",
+    ]
+
+    for malformed in ({"limit": 3, "keep": "middle"}, {"limit": -1}, {"limit": 3, "by": ""}):
+        with pytest.raises(ValueError):
+            seen({**allow, "cardinality": {"analytics": malformed}})
+
+
+def test_empirically_seeded_fields_are_flagged_at_compilation() -> None:
+    """The shape change that destroyed a follow graph should not be silent."""
+    from genesis.compiler import _advise_empirical_envelope
+    from genesis.specification.models import DomainSpec, OpennessSpec
+
+    openness = OpennessSpec(
+        schema_version="1.0",
+        study_id="s",
+        processes=[
+            {
+                "id": "update-follows",
+                "executor": {"mode": "computational"},
+                "context_policy": "p",
+                "state_effects": [{"field": "follows", "op": "set"}],
+            }
+        ],
+    )
+    seeded = DomainSpec(
+        schema_version="1.0",
+        study_id="s",
+        states=[{"id": "follows", "value_type": "object", "initial": {}}],
+        initialization={
+            "mode": "empirical",
+            "state_field": "follows",
+            "data_source": "data/initial-follows.json",
+        },
+    )
+    advisories = _advise_empirical_envelope(seeded, openness)
+    assert [item["code"] for item in advisories] == ["EMPIRICAL_ENVELOPE"]
+    assert "update-follows" in advisories[0]["message"]
+    assert "unwrap" in advisories[0]["message"]
+
+    bare = DomainSpec(
+        schema_version="1.0",
+        study_id="s",
+        states=[{"id": "follows", "value_type": "object", "initial": {}}],
+    )
+    assert _advise_empirical_envelope(bare, openness) == []
+
+
+def test_a_purge_during_artifact_iteration_says_so(tmp_path) -> None:
+    """Streaming releases the lock between rows; retention deletes artifacts.
+
+    The list form read every payload under one lock hold, so a purge could not
+    land mid-read. It can now, and reporting it as a missing object sends the
+    reader looking for a corrupt store instead of a concurrent purge.
+    """
+    import json as _json
+
+    from genesis.persistence import PersistenceCoordinator
+
+    def populated():
+        store = PersistenceCoordinator(tmp_path / f"{id(object())}.sqlite", tmp_path / "objects")
+        store.create_run({"id": "r", "study_id": "s"})
+        for version in range(1, 6):
+            store.commit_process_result(
+                {
+                    "event_id": f"e{version}",
+                    "run_id": "r",
+                    "kind": "process_completed",
+                    "state_version": version,
+                },
+                {"run_id": "r", "state_version": version, "payload": _json_bytes({"v": version})},
+                [
+                    {
+                        "artifact_id": f"a{version}",
+                        "run_id": "r",
+                        "payload": _json.dumps({"n": version, "response": "raw"}).encode(),
+                    }
+                ],
+            )
+        return store
+
+    store = populated()
+    try:
+        walk = store.iter_artifacts("r")
+        next(walk)
+        assert store.retention_purge("r") == 5
+        with pytest.raises(ValueError, match="ARTIFACT_PURGED_DURING_READ"):
+            list(walk)
+    finally:
+        store.close()
+
+    # A genuinely unreadable object still reports itself as one.
+    store = populated()
+    try:
+        walk = store.iter_artifacts("r")
+        next(walk)
+        (digest,) = store.connection.execute(
+            "SELECT payload_ref FROM artifacts WHERE artifact_id = 'a3'"
+        ).fetchone()
+        (tmp_path / "objects" / digest[:2] / digest[2:]).unlink()
+        with pytest.raises(ValueError, match="integrity check failed"):
+            list(walk)
+    finally:
+        store.close()
+
+
+def test_mistyped_context_declarations_are_refused_not_ignored() -> None:
+    """A silently-ignored key here produces a plausible but wrong view.
+
+    ``{"limit": 50, "kep": "last"}`` reads as "the fifty most recent" and, with
+    the typo ignored, delivers the fifty oldest. Both return fifty rows, so
+    nothing about the result says the declaration did not take effect.
+    """
+    from genesis.compiler import _validate_context_scope
+    from genesis.runtime import ContextEngine, ProcessInvocation
+    from genesis.specification.models import DomainSpec
+
+    state = {"a": [{"actor": "w1", "n": index} for index in range(1, 6)]}
+
+    def build(policy):
+        invocation = ProcessInvocation(
+            invocation_id="i", run_id="r", process_id="p", actor_ids=("w1",), phase=1
+        )
+        return ContextEngine({"p": policy}).build("p", invocation, state).data
+
+    with pytest.raises(ValueError, match="unknown keys"):
+        build({"allow": ["a"], "cardinality": {"a": {"limit": 2, "kep": "last"}}})
+    with pytest.raises(ValueError, match="unknown keys"):
+        build({"allow": ["a"], "scope": {"a": {"field": "actor", "in": ["actor.ids"], "wen": 1}}})
+    # The correct spellings still work.
+    assert [
+        row["n"]
+        for row in build({"allow": ["a"], "cardinality": {"a": {"limit": 2, "keep": "last"}}})["a"]
+    ] == [4, 5]
+
+    # And both are caught at compilation, not only during a run.
+    def errors_for(policy):
+        domain = DomainSpec(
+            schema_version="1.0",
+            study_id="s",
+            states=[{"id": "a", "value_type": "array", "initial": []}],
+            visibility=[{"id": "p", "allow": ["a"], **policy}],
+        )
+        return [item["message"] for item in _validate_context_scope(domain)]
+
+    mistyped_cap = {"cardinality": {"a": {"limit": 2, "kep": 1}}}
+    assert any("unknown keys" in m for m in errors_for(mistyped_cap))
+    assert any(
+        "unknown keys" in m
+        for m in errors_for({"scope": {"a": {"field": "actor", "in": ["actor.ids"], "wen": 1}}})
+    )
+    assert errors_for({"cardinality": {"a": {"limit": 2, "keep": "last"}}}) == []
+
+
+# ---- answer pool: local generative stand-in --------------------------------
+
+
+def _pool_request(prompt, *, context="ctx", process="create-article"):
+    from genesis.providers import ProviderRequest
+
+    return ProviderRequest(model="m", prompt=prompt, context_hash=context, process_id=process)
+
+
+def test_answer_pool_is_deterministic_and_follows_the_context() -> None:
+    """The pool must vary with the context, or it cannot test that scoping lands.
+
+    A canned answer does not read the context, but keying the *choice* on the
+    context hash means a policy change that alters what an actor sees produces a
+    different answer -- which is what makes "the context reached the model"
+    observable rather than assumed.
+    """
+    from genesis.providers import AnswerPoolProvider
+
+    pool = {"create-article": [{"creator": "w1", "phase": 0, "n": index} for index in range(8)]}
+    provider = AnswerPoolProvider(pool, seed=3)
+    prompt = "creator id: w1\nround (phase + 1): 2"
+
+    first = provider.generate(_pool_request(prompt, context="A"))
+    assert first.text == provider.generate(_pool_request(prompt, context="A")).text
+
+    # Compared as mappings over many contexts, not as one pair: with eight
+    # answers two draws coincide often enough that a single inequality would be
+    # a coin flip.
+    def drawn(engine):
+        return {
+            key: engine.generate(_pool_request(prompt, context=key)).text
+            for key in (f"ctx-{index}" for index in range(20))
+        }
+
+    same_seed = drawn(AnswerPoolProvider(pool, seed=3))
+    assert drawn(provider) == same_seed
+    assert len(set(same_seed.values())) > 1, "the context must change the answer"
+    assert drawn(AnswerPoolProvider(pool, seed=4)) != same_seed
+    # It never claims to be a model.
+    assert first.provider == "answer-pool"
+    assert first.metadata["answer_pool"] is True
+
+
+def test_answer_pool_echoes_the_acting_identity() -> None:
+    """A pooled answer must not attribute itself to the actor it was recorded for."""
+    from genesis.providers import AnswerPoolProvider
+
+    pool = {"create-article": [{"creator": "w1", "phase": 0, "title": "t"}]}
+    provider = AnswerPoolProvider(
+        pool,
+        seed=1,
+        echo={"creator": r"creator id: (\S+)", "phase": r"round \(phase \+ 1\): (\d+)"},
+    )
+    answer = provider.generate(_pool_request("creator id: w4\nround (phase + 1): 3")).parsed
+    assert answer["creator"] == "w4"
+    # A recorded integer stays an integer.
+    assert answer["phase"] == 3 and isinstance(answer["phase"], int)
+
+
+def test_answer_pool_answers_a_process_it_has_never_seen() -> None:
+    """Replay refuses an unknown invocation; the pool must not stop a run dead."""
+    from genesis.providers import AnswerPoolProvider
+
+    provider = AnswerPoolProvider({"create-article": [{"a": 1}]}, seed=0)
+    answer = provider.generate(_pool_request("p", process="a-process-added-later"))
+    assert answer.parsed == {"a": 1}
+
+    with pytest.raises(ValueError, match="ANSWER_POOL"):
+        AnswerPoolProvider({}, seed=0)
+
+
+def test_answer_pool_profile_requires_a_pool_and_rejects_a_credential_shape(tmp_path) -> None:
+    """A pooled profile is declared, so a pooled run is a property of the record."""
+    from genesis.service import GenesisService
+
+    service = GenesisService(tmp_path / "workspace")
+    try:
+        with pytest.raises(ValueError, match="ANSWER_POOL"):
+            service.create_model_profile({"id": "no-pool", "provider": "answer-pool", "model": "m"})
+        with pytest.raises(ValueError, match="ANSWER_POOL"):
+            service.create_model_profile(
+                {
+                    "id": "bad-seed",
+                    "provider": "answer-pool",
+                    "model": "m",
+                    "pool": "p.json",
+                    "seed": "later",
+                }
+            )
+        stored = service.create_model_profile(
+            {"id": "pooled", "provider": "answer-pool", "model": "m", "pool": "p.json", "seed": 5}
+        )
+        assert stored["provider"] == "answer-pool"
+        assert "api_key_env" not in stored and "base_url" not in stored
+    finally:
+        service.close()
+
+
+# ---- Codex review of 7cf400b: verified findings, fail-first ----------------
+
+
+def test_streamed_parquet_widens_types_instead_of_truncating(tmp_path) -> None:
+    """H1: a column integral for its first batch must not truncate later fractions."""
+    import pyarrow.parquet as pq
+
+    from genesis.analysis import AnalysisExporter
+
+    rows = [{"v": index} for index in range(512)] + [{"v": 7.5} for _ in range(88)]
+    path = AnalysisExporter.stream_rows_to_parquet(rows, tmp_path / "s.parquet")
+    values = pq.read_table(path).column("v").to_pylist()
+    assert values[-88:] == [7.5] * 88
+    assert values[:3] == [0.0, 1.0, 2.0]
+
+
+def test_streamed_parquet_keeps_late_and_late_filled_columns(tmp_path) -> None:
+    """M2: a valid run exports every column; a refused write leaves no file."""
+    import pyarrow.parquet as pq
+
+    from genesis.analysis import AnalysisExporter
+
+    late = [{"a": index} for index in range(512)] + [{"a": 1, "b": 2}]
+    table = pq.read_table(AnalysisExporter.stream_rows_to_parquet(late, tmp_path / "late.parquet"))
+    assert table.column("b").to_pylist()[-1] == 2
+    assert table.column("b").to_pylist()[0] is None
+
+    null_first = [{"a": index, "b": None} for index in range(512)] + [{"a": 1, "b": 5}]
+    table = pq.read_table(
+        AnalysisExporter.stream_rows_to_parquet(null_first, tmp_path / "null.parquet")
+    )
+    assert table.column("b").to_pylist()[-1] == 5
+
+    incompatible = [{"a": index} for index in range(512)] + [{"a": "text"}]
+    target = tmp_path / "bad.parquet"
+    with pytest.raises(ValueError, match="PARQUET_SCHEMA"):
+        AnalysisExporter.stream_rows_to_parquet(incompatible, target)
+    assert not list(tmp_path.glob("bad.parquet*"))
+
+
+def test_streamed_parquet_accepts_a_row_factory(tmp_path) -> None:
+    """Two passes need a re-iterable source; a factory keeps the history off-heap."""
+    import pyarrow.parquet as pq
+
+    from genesis.analysis import AnalysisExporter
+
+    rows = [{"v": index} for index in range(600)] + [{"v": 0.5}]
+    path = AnalysisExporter.stream_rows_to_parquet(lambda: iter(rows), tmp_path / "f.parquet")
+    assert pq.read_table(path).column("v").to_pylist()[-1] == 0.5
+
+
+def test_state_delta_is_kept_whenever_the_plan_can_reach_it() -> None:
+    """H2: declaring any dataset must not blind outcomes that read state_delta."""
+    from genesis.service import GenesisService
+
+    unused = GenesisService._unused_event_fields
+    state_only = {"id": "s", "source": {"kind": "state"}}
+    assert (
+        unused(
+            {
+                "datasets": [state_only],
+                "outcomes": [
+                    {
+                        "id": "o",
+                        "source": "events",
+                        "aggregation": {"type": "count", "field": "state_delta"},
+                    }
+                ],
+            }
+        )
+        == ()
+    )
+    reaches = [
+        {"fields": [{"name": "tier", "op": "copy", "field": "state_delta.tier"}]},
+        {"where": [{"field": "state_delta.tier", "op": "eq", "value": "premium"}]},
+        {"deduplicate_on": ["state_delta.id"]},
+    ]
+    for extra in reaches:
+        dataset = {"id": "d", "source": {"kind": "events", "path": "records"}, **extra}
+        assert unused({"datasets": [dataset], "outcomes": []}) == (), extra
+    # Nothing can reach it: it is still dropped.
+    assert unused(
+        {
+            "datasets": [{"id": "d", "source": {"kind": "events", "path": "records"}}],
+            "outcomes": [
+                {"id": "o", "source": "d", "aggregation": {"type": "sum", "field": "score"}}
+            ],
+        }
+    ) == ("state_delta",)
+
+
+def test_keep_last_never_returns_fewer_rows_than_exist() -> None:
+    """H5: a cap larger than the collection must keep all of it, from either end."""
+    from genesis.runtime import _cap_cardinality
+
+    for size in range(0, 12):
+        for limit in range(0, 15):
+            items = list(range(size))
+            expected = min(size, limit)
+            last = _cap_cardinality(items, {"limit": limit, "keep": "last"})
+            first = _cap_cardinality(items, {"limit": limit, "keep": "first"})
+            by = _cap_cardinality(
+                [{"r": index} for index in items], {"limit": limit, "keep": "last", "by": "r"}
+            )
+            assert len(last) == len(first) == len(by) == expected, (size, limit)
+            assert last == items[size - expected :]
+
+
+def test_final_state_snapshot_is_the_last_commit_whatever_the_collapse_order(tmp_path) -> None:
+    """H6: collapsed round rows must yield the same datasets as the full history.
+
+    Compared against main's pipeline -- every committed version, in version
+    order, annotated with its round -- for both snapshot kinds, over random
+    phase sequences including interleaved rounds and unfinished runs.
+    """
+    import json as _json
+    import random
+
+    from genesis.outcome_plan import materialize_datasets
+    from genesis.service import _INCOMPLETE_ROUND, GenesisService
+
+    random.seed(21)
+    for trial in range(120):
+        service = GenesisService(tmp_path / f"ws-{trial}")
+        try:
+            store = service.persistence
+            store.create_run({"id": "r", "study_id": "s"})
+            count = random.randint(1, 8)
+            phases = [random.choice([0, 1, 2, None]) for _ in range(count)]
+            if all(phase is None for phase in phases):
+                phases[0] = 0
+            for version, phase in enumerate(phases, start=1):
+                store.commit_process_result(
+                    {
+                        "event_id": f"e{version}",
+                        "run_id": "r",
+                        "kind": "process_completed",
+                        "state_version": version,
+                        **({"phase": phase} if phase is not None else {}),
+                    },
+                    {
+                        "run_id": "r",
+                        "state_version": version,
+                        "payload": _json.dumps({"x": version * 100}, sort_keys=True).encode(),
+                    },
+                    [],
+                )
+            status = random.choice(["completed", "created"])
+            run = {**service.get_run("r"), "status": status}
+            annotations = [
+                {
+                    "event_id": f"e{version}",
+                    "state_version": version,
+                    "phase": phase,
+                    "kind": "process_completed",
+                }
+                for version, phase in enumerate(phases, start=1)
+            ]
+            version_phase = {
+                version: phase
+                for version, phase in enumerate(phases, start=1)
+                if isinstance(phase, int)
+            }
+            incomplete = (
+                {max(version_phase.values())} if status != "completed" and version_phase else set()
+            )
+            full_history = []
+            for version, snapshot in store.iter_state_history("r"):
+                row = dict(snapshot)
+                row["state_version"] = version
+                phase = version_phase.get(version)
+                row["_round"] = _INCOMPLETE_ROUND if phase in incomplete else phase
+                full_history.append(row)
+            collapsed = list(service._iter_round_annotated_state("r", run, annotations))
+            for snapshot in ("final", "each_completed_round"):
+                plan = {
+                    "datasets": [{"id": "d", "source": {"kind": "state", "snapshot": snapshot}}]
+                }
+                want = materialize_datasets(plan, {"state": full_history})["d"]
+                got = materialize_datasets(plan, {"state": collapsed})["d"]
+                assert got == want, (trial, phases, status, snapshot, got, want)
+        finally:
+            service.close()
+
+
+def test_mean_matches_statistics_mean_by_type_and_bytes() -> None:
+    """M3: the streaming engine changed mean's type (3 -> 3.0) and its last bit."""
+    import json as _json
+    import random
+    import statistics
+
+    from genesis.analysis import AnalysisEngine, OutcomePlan
+
+    random.seed(9)
+    makers = [
+        lambda: random.randint(-20, 20),
+        lambda: random.uniform(-1e3, 1e3),
+        lambda: random.choice([True, False, 1, 2.5, -3]),
+    ]
+    for _ in range(1500):
+        make = random.choice(makers)
+        values = [make() for _ in range(random.randint(1, 9))]
+        missing = random.randint(0, 3)
+        rows = [{"v": value} for value in values] + [{"v": None} for _ in range(missing)]
+        for missingness in ("exclude", "zero"):
+            plan = OutcomePlan(
+                id="o", source="e", select="v", aggregation="mean", missingness=missingness
+            )
+            got = AnalysisEngine().evaluate(plan, {"e": rows})[0]["v_mean"]
+            pool = values + ([0] * missing if missingness == "zero" else [])
+            want = statistics.mean(pool)
+            assert type(got) is type(want), (values, missingness, got, want)
+            assert _json.dumps(got) == _json.dumps(want), (values, missingness, got, want)
+        distribution = OutcomePlan(id="d", source="e", select="v", operation="distribution")
+        got = AnalysisEngine().evaluate(distribution, {"e": rows})[0]["v_mean"]
+        numeric = [value for value in values if isinstance(value, int | float)]
+        want = statistics.mean(numeric) if numeric else None
+        assert type(got) is type(want) and _json.dumps(got) == _json.dumps(want), (
+            values,
+            got,
+            want,
+        )
+
+
+def test_state_history_refuses_to_rebuild_on_a_missing_object(tmp_path) -> None:
+    """M4: a lost base must fail, not silently become {} under every later patch."""
+    import json as _json
+
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(tmp_path / "db.sqlite", tmp_path / "objects")
+    try:
+        store.create_run({"id": "r", "study_id": "s"})
+        bulk = ["x" * 100 for _ in range(50)]
+        for version in (1, 2, 3):
+            store.commit_process_result(
+                {"event_id": f"e{version}", "run_id": "r", "kind": "k", "state_version": version},
+                {
+                    "run_id": "r",
+                    "state_version": version,
+                    "payload": _json.dumps(
+                        {"bulk": bulk, "tick": version}, sort_keys=True
+                    ).encode(),
+                },
+                [],
+            )
+        rows = store._state_rows("r")
+        assert [form for _v, _r, form in rows][1:] == ["patch", "patch"]
+        digest = rows[0][1]
+        (tmp_path / "objects" / digest[:2] / digest[2:]).unlink()
+        with pytest.raises(ValueError):
+            list(store.iter_state_history("r"))
+    finally:
+        store.close()
+
+
+def test_selector_paths_must_name_a_real_root_and_state_field() -> None:
+    """M5: 'stait.follows' compiled cleanly and selected nothing, silently."""
+    from genesis.compiler import _advise_unbounded_context, _validate_context_scope
+    from genesis.specification.models import DomainSpec
+
+    def errors_for(selector):
+        domain = DomainSpec(
+            schema_version="1.0",
+            study_id="s",
+            states=[
+                {"id": "a", "value_type": "array", "initial": []},
+                {"id": "follows", "value_type": "object", "initial": {}},
+            ],
+            visibility=[
+                {"id": "c", "allow": ["a"], "scope": {"a": {"field": "actor", "in": [selector]}}}
+            ],
+        )
+        return _validate_context_scope(domain)
+
+    for wrong in ("stait.follows", "actor.idz", "state.nowhere.${actor}", "follows"):
+        assert errors_for(wrong), wrong
+    for right in ("actor.ids", "state.follows", "state.follows.${actor}"):
+        assert errors_for(right) == [], right
+
+    namespaced = DomainSpec(
+        schema_version="1.0",
+        study_id="s",
+        states=[{"id": "follows", "value_type": "object", "initial": {}}],
+        visibility=[{"id": "c", "allow": ["state.follows"]}],
+    )
+    assert [item["path"] for item in _advise_unbounded_context(namespaced)] == [
+        "domain.visibility.c.allow/state.follows"
+    ]
+
+
+def test_duckdb_path_matches_the_in_process_engine_by_bytes() -> None:
+    """M6 and beyond: key order, key type, float sums and means all diverged."""
+    import json as _json
+    import random
+
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+
+    from genesis.analysis import AnalysisEngine, OutcomePlan, duckdb_aggregate
+
+    random.seed(4)
+    keys = [1, 2, 1.5, 2.5, "a", "b", True]
+    values = [
+        lambda: random.randint(-9, 9),
+        lambda: random.uniform(-100, 100),
+        lambda: random.choice([random.randint(-9, 9), random.uniform(-9, 9)]),
+    ]
+    for _ in range(400):
+        key_pool = random.choice([keys[:2], keys[2:4], keys[:4], keys[4:6]])
+        make = random.choice(values)
+        rows = [{"g": random.choice(key_pool), "x": make()} for _ in range(random.randint(1, 10))]
+        for op in ("sum", "count", "mean"):
+            for group_by in (None, "g"):
+                plan = OutcomePlan(
+                    id="o", source="r", select="x", aggregation=op, group_by=group_by
+                )
+                in_process = AnalysisEngine().evaluate(plan, {"r": rows})
+                through_duckdb = duckdb_aggregate(rows, select="x", op=op, group_by=group_by)
+                assert _json.dumps(through_duckdb) == _json.dumps(in_process), (op, group_by, rows)
+
+
+def _review_package(workspace, *, scope=None, cardinality=None, datasets=None, outcomes=None):
+    import yaml
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    source = workspace / "pkg"
+    source.mkdir(exist_ok=True)
+    base = {"schema_version": "1.0", "study_id": "review"}
+    policy = {"id": "c", "allow": ["topic"]}
+    if scope is not None:
+        policy["scope"] = scope
+    if cardinality is not None:
+        policy["cardinality"] = cardinality
+    files = {
+        "study": {**base, "title": "review"},
+        "openness": {
+            **base,
+            "processes": [
+                {
+                    "id": "stamp",
+                    "executor": {
+                        "mode": "computational",
+                        "parameters": {"entry_point": "tests.review_executors:stamp"},
+                    },
+                    "context_policy": "c",
+                    "actors": {"ids": ["a1", "a2"]},
+                    "trigger": {"type": "phase", "phase": 0, "repeat": True},
+                    "state_effects": [
+                        {"field": "topic", "op": "set"},
+                        {"field": "profile", "op": "set"},
+                    ],
+                }
+            ],
+        },
+        "theory": {**base, "theory_family": "exploratory"},
+        "domain": {
+            **base,
+            "visibility": [policy],
+            "states": [
+                {"id": "topic", "value_type": "string", "initial": ""},
+                {"id": "profile", "value_type": "object", "initial": {}},
+            ],
+        },
+        "protocol": {**base, "time_model": {"type": "rounds", "start": 0, "end": 2}},
+        "outcomes": {**base, "datasets": datasets or [], "outcomes": outcomes or []},
+        "models": {**base, "models": []},
+    }
+    for name, value in files.items():
+        (source / f"{name}.yaml").write_text(yaml.safe_dump(value, sort_keys=False))
+    return source
+
+
+def test_analysis_keeps_the_context_a_dataset_declares(tmp_path) -> None:
+    """H3: 'no analysis path reads context' was assumed, never enforced."""
+    from genesis.service import GenesisService
+
+    workspace = tmp_path / "ws"
+    datasets = [
+        {
+            "id": "ev",
+            "source": {"kind": "events"},
+            "fields": [{"name": "ctx_topic", "op": "copy", "field": "context.topic"}],
+        }
+    ]
+    outcomes = [
+        {
+            "id": "ctx",
+            "source": "ev",
+            "grouping": [],
+            "aggregation": {"op": "count", "field": "ctx_topic"},
+        }
+    ]
+    package = _review_package(workspace, datasets=datasets, outcomes=outcomes)
+    service = GenesisService(workspace)
+    try:
+        build = service.compile_study(package, "builds/b")
+        service.create_run({"id": "r", "study_id": "review", "build": build["path"]})
+        service.execute_run("r")
+        stamped = [event for event in service.trace_run("r") if event.get("process_id") == "stamp"]
+        assert stamped and all("topic" in (event.get("context") or {}) for event in stamped)
+        (row,) = service.evaluate_outcomes("r")
+        assert row["ctx_topic_count"] == len(stamped), row
+        assert row["ctx_topic_missing"] == 0, row
+        assert all(item.get("ctx_topic") is not None for item in service._dataset_rows("r", "ev"))
+    finally:
+        service.close()
+
+
+def test_malformed_context_declarations_are_reported_by_code(tmp_path) -> None:
+    """H4: a malformed scope crashed the compiler with KeyError('code')."""
+    from genesis.compiler import ValidationIssue
+    from genesis.service import GenesisService
+
+    cases = (
+        ({"scope": {"topic.idds": {"field": "x", "in": ["actor.ids"]}}}, "CONTEXT_SCOPE_INVALID"),
+        ({"scope": {"topic": {"field": "x", "in": ["stait.follows"]}}}, "CONTEXT_SCOPE_INVALID"),
+        ({"cardinality": {"topic": {"limit": 2, "kep": "last"}}}, "CONTEXT_CARDINALITY_INVALID"),
+    )
+    for index, (declaration, code) in enumerate(cases):
+        workspace = tmp_path / f"ws-{index}"
+        package = _review_package(workspace, **declaration)
+        service = GenesisService(workspace)
+        try:
+            with pytest.raises(ValidationIssue) as caught:
+                service.compile_study(package, "builds/b")
+            issue = caught.value
+            records = next(
+                (getattr(issue, name) for name in ("records", "issues") if hasattr(issue, name)),
+                [],
+            )
+            codes = {getattr(record, "code", None) for record in records}
+            assert code in codes or code in str(issue), (declaration, codes, str(issue))
+        finally:
+            service.close()
+
+
+def test_answer_pool_echo_patterns_must_capture(tmp_path) -> None:
+    """Low: a capture-less echo raised IndexError on every pooled answer."""
+    from genesis.providers import AnswerPoolProvider
+    from genesis.service import GenesisService
+
+    for pattern in (r"creator id: \S+", r"creator id: ("):
+        with pytest.raises(ValueError, match="ANSWER_POOL"):
+            AnswerPoolProvider({"x": [{"creator": "w1"}]}, echo={"creator": pattern})
+    service = GenesisService(tmp_path / "ws")
+    try:
+        with pytest.raises(ValueError, match="ANSWER_POOL"):
+            service.create_model_profile(
+                {
+                    "id": "pooled",
+                    "provider": "answer-pool",
+                    "model": "m",
+                    "pool": "p.json",
+                    "echo": {"creator": r"creator id: \S+"},
+                }
+            )
+    finally:
+        service.close()
+
+
+def test_pooled_profile_identity_follows_the_pool(tmp_path) -> None:
+    """Low: two different pools resolved to the same recorded identity."""
+    import json as _json
+
+    from genesis.service import GenesisService
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "a.json").write_text('{"x": [{"n": 1}]}')
+    (workspace / "b.json").write_text('{"x": [{"n": 2}]}')
+    service = GenesisService(workspace)
+    try:
+        base = {"provider": "answer-pool", "model": "m", "seed": 1, "echo": {}}
+        identities = {
+            service._profile_identity({**base, "pool": "a.json"}),
+            service._profile_identity({**base, "pool": "b.json"}),
+            service._profile_identity({**base, "pool": "a.json", "seed": 2}),
+        }
+        assert len(identities) == 3
+        live = {
+            "provider": "openai-compatible",
+            "base_url": "https://example.test",
+            "model": "m",
+            "timeout": 60,
+        }
+        recorded_before = hashlib.sha256(
+            _json.dumps(
+                {
+                    "base_url": "https://example.test",
+                    "model": "m",
+                    "timeout": 60,
+                    "provider": "openai-compatible",
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
+        assert service._profile_identity(live) == recorded_before
+    finally:
+        service.close()
+
+
+def test_run_level_artifacts_are_projected_like_stored_ones(tmp_path) -> None:
+    """Low: projection depended on where an artifact happened to be stored."""
+    from genesis.service import GenesisService
+
+    service = GenesisService(tmp_path / "ws")
+    try:
+        service.persistence.create_run({"id": "r", "study_id": "s"})
+        service.persistence.append_run_collection(
+            "r",
+            "artifacts",
+            {"artifact_id": "legacy", "payload": {"outputs": {"a": 1}, "raw_response": "raw"}},
+        )
+        (projected,) = [
+            item
+            for item in service.artifacts_for_run("r", evidence=False)
+            if item.get("artifact_id") == "legacy"
+        ]
+        assert "raw_response" not in projected["payload"]
+        (whole,) = [
+            item for item in service.artifacts_for_run("r") if item.get("artifact_id") == "legacy"
+        ]
+        assert whole["payload"]["raw_response"] == "raw"
+    finally:
+        service.close()
+
+
+def test_outcome_evaluation_hands_relations_over_without_listing_them(
+    tmp_path, monkeypatch
+) -> None:
+    """M1: both evaluation branches listed whole relations before using them.
+
+    The dataset branch listed the ledger, every artifact and every round
+    snapshot before materialising any dataset. The legacy branch listed every
+    artifact row -- each carrying its outputs -- before synthesising flat rows;
+    on an accumulating study that was 342 MB at 40 rounds.
+    """
+    import genesis.service as service_module
+    from genesis.service import GenesisService
+
+    seen: dict[str, object] = {}
+    real_materialize = service_module.materialize_datasets
+
+    def spy_materialize(plan, sources):
+        seen["dataset_sources"] = {
+            name: callable(value)
+            for name, value in sources.items()
+            if name in ("events", "artifacts", "state")
+        }
+        return real_materialize(plan, sources)
+
+    real_legacy = GenesisService._legacy_derived_rows
+
+    def spy_legacy(event_rows, artifact_rows):
+        seen["legacy_artifacts_listed"] = isinstance(artifact_rows, list)
+        return real_legacy(event_rows, artifact_rows)
+
+    monkeypatch.setattr(service_module, "materialize_datasets", spy_materialize)
+    monkeypatch.setattr(GenesisService, "_legacy_derived_rows", staticmethod(spy_legacy))
+
+    shapes = {
+        "datasets": dict(
+            datasets=[{"id": "fin", "source": {"kind": "state", "snapshot": "final"}}],
+            outcomes=[
+                {
+                    "id": "n",
+                    "source": "fin",
+                    "grouping": [],
+                    "aggregation": {"op": "count", "field": "topic"},
+                }
+            ],
+        ),
+        "legacy": dict(
+            datasets=[],
+            outcomes=[
+                {
+                    "id": "n",
+                    "source": "events",
+                    "grouping": [],
+                    "aggregation": {"op": "count", "field": "phase"},
+                }
+            ],
+        ),
+    }
+    for label, declaration in shapes.items():
+        workspace = tmp_path / label
+        package = _review_package(workspace, **declaration)
+        service = GenesisService(workspace)
+        try:
+            build = service.compile_study(package, "builds/b")
+            service.create_run({"id": "r", "study_id": "review", "build": build["path"]})
+            service.execute_run("r")
+            assert service.evaluate_outcomes("r")
+        finally:
+            service.close()
+
+    assert seen["dataset_sources"] == {"events": True, "artifacts": True, "state": True}
+    assert seen["legacy_artifacts_listed"] is False

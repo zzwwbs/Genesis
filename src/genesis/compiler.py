@@ -17,7 +17,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from .execution_manifest import build_package_closure
-from .runtime import STATE_VALUE_TYPES, edge_delays
+from .runtime import STATE_VALUE_TYPES, _cap_rule, _resolve_path, edge_delays
 from .schema_validation import PackageSchemaCatalog, SchemaValidationError
 from .specification.models import (
     DomainSpec,
@@ -90,6 +90,210 @@ def _resolve_context_policies(domain: DomainSpec) -> list[dict[str, Any]]:
             merged["available_when"] = {**availability_map, **existing}
         policies.append(merged)
     return policies
+
+
+def _validate_context_scope(domain: DomainSpec) -> list[dict[str, str]]:
+    """Reject malformed scopes and caps before a run can depend on them (CTX-008).
+
+    Every entry carries a code. The compiler builds its validation records by
+    code, and an entry without one crashed it with a KeyError instead of being
+    reported -- so no malformed declaration was ever actually refused.
+    """
+    errors: list[dict[str, str]] = []
+    state_ids = {str(state.id) for state in domain.states}
+
+    def fail(code: str, path: str, message: str) -> None:
+        errors.append({"code": code, "severity": "error", "path": path, "message": message})
+
+    for policy in domain.visibility:
+        raw = policy.model_dump(mode="json") if hasattr(policy, "model_dump") else policy
+        if not isinstance(raw, dict):
+            continue
+        policy_id = str(raw.get("id", ""))
+        allowed = {str(item) for item in (raw.get("allow") or ())}
+        # A malformed cap otherwise fails during a run rather than at
+        # compilation, which is where every other declaration is checked.
+        cardinality = raw.get("cardinality") or {}
+        if isinstance(cardinality, dict):
+            for path, cap in cardinality.items():
+                try:
+                    _cap_rule(cap)
+                except ValueError as exc:
+                    fail(
+                        "CONTEXT_CARDINALITY_INVALID",
+                        f"domain.visibility.{policy_id}.cardinality.{path}",
+                        str(exc),
+                    )
+        scope = raw.get("scope") or {}
+        if not isinstance(scope, dict):
+            fail(
+                "CONTEXT_SCOPE_INVALID",
+                f"domain.visibility.{policy_id}.scope",
+                "scope must be a mapping",
+            )
+            continue
+        for path, rule in scope.items():
+            where = f"domain.visibility.{policy_id}.scope.{path}"
+            if str(path) not in allowed:
+                fail(
+                    "CONTEXT_SCOPE_INVALID",
+                    where,
+                    f"scope names '{path}', which the policy does not allow",
+                )
+            if not isinstance(rule, dict):
+                fail("CONTEXT_SCOPE_INVALID", where, "scope rule must be a mapping")
+                continue
+            unknown = set(rule) - {"field", "in"}
+            if unknown:
+                fail(
+                    "CONTEXT_SCOPE_INVALID",
+                    where,
+                    f"scope rule has unknown keys: {', '.join(sorted(unknown))}",
+                )
+            field = rule.get("field")
+            if not isinstance(field, str) or not field:
+                fail("CONTEXT_SCOPE_INVALID", where, "scope rule requires a non-empty 'field'")
+            selectors = rule.get("in")
+            if selectors is None:
+                fail("CONTEXT_SCOPE_INVALID", where, "scope rule requires 'in'")
+                continue
+            if isinstance(selectors, str):
+                selectors = [selectors]
+            if not isinstance(selectors, list | tuple) or not selectors:
+                fail(
+                    "CONTEXT_SCOPE_INVALID",
+                    where,
+                    "'in' must be a selector path or a non-empty list",
+                )
+                continue
+            for selector in selectors:
+                problem = _selector_problem(selector, state_ids)
+                if problem:
+                    fail("CONTEXT_SCOPE_INVALID", where, problem)
+    return errors
+
+
+def _selector_problem(selector: Any, state_ids: set[str]) -> str | None:
+    """Why a scope selector cannot resolve to anything, or None if it can.
+
+    Checked by name, not only by syntax. ``stait.follows`` is a well-formed
+    path; it resolves to nothing at run time and would hand every actor an
+    empty view without any error.
+    """
+    if not isinstance(selector, str) or not selector:
+        return "selector paths must be non-empty strings"
+    try:
+        _resolve_path({}, selector.replace("${actor}", "actor"))
+    except ValueError as exc:
+        return f"selector '{selector}': {exc}"
+    parts = selector.split(".")
+    if parts[0] == "actor":
+        if selector != "actor.ids":
+            return f"selector '{selector}': the actor namespace offers only 'actor.ids'"
+        return None
+    if parts[0] == "state":
+        named = parts[1] if len(parts) > 1 else ""
+        if named not in state_ids:
+            return f"selector '{selector}': '{named}' is not a declared state field"
+        return None
+    return f"selector '{selector}': must start with 'actor.ids' or 'state.<field>'"
+
+
+def _advise_unbounded_context(domain: DomainSpec) -> list[dict[str, Any]]:
+    """Flag collection fields a policy hands over whole (CTX-008).
+
+    Not an error: an unbounded view can be exactly the design. But it is the one
+    thing that makes context grow with population rather than with anything the
+    study declares, so the choice should be explicit rather than a default.
+
+    ``state.follows`` names the same field as ``follows``; the namespace is
+    resolved rather than letting the namespaced spelling escape the advisory.
+    """
+    collections = {
+        str(state.id)
+        for state in domain.states
+        if str(getattr(state, "value_type", "")) in {"array", "object"}
+    }
+    advisories: list[dict[str, Any]] = []
+    for policy in domain.visibility:
+        raw = policy.model_dump(mode="json") if hasattr(policy, "model_dump") else policy
+        if not isinstance(raw, dict):
+            continue
+        policy_id = str(raw.get("id", ""))
+        scope = raw.get("scope") or {}
+        cardinality = raw.get("cardinality") or {}
+        aggregate = raw.get("aggregate") or {}
+        for path in raw.get("allow") or ():
+            name = str(path)
+            parts = name.split(".")
+            field = parts[1] if parts[0] == "state" and len(parts) > 1 else parts[0]
+            if field not in collections:
+                continue
+            if name in scope or name in cardinality or name in aggregate:
+                continue
+            advisories.append(
+                {
+                    "code": "CONTEXT_UNBOUNDED",
+                    "severity": "warning",
+                    "path": f"domain.visibility.{policy_id}.allow/{name}",
+                    "message": (
+                        f"policy '{policy_id}' hands over the whole of '{name}' to every actor; "
+                        "declare a scope, a cardinality cap or an aggregate, or record that an "
+                        "unbounded view is intended"
+                    ),
+                }
+            )
+    return advisories
+
+
+def _advise_empirical_envelope(domain: DomainSpec, openness: OpennessSpec) -> list[dict[str, Any]]:
+    """Warn that an empirically seeded field arrives wrapped, not bare.
+
+    An ``empirical`` initialization stores the loaded asset as
+    ``{origin, data_source, rows}``. ``value_type: object`` admits both that
+    envelope and the bare table, so nothing tells an author that consumers must
+    unwrap it. One process that read the envelope as if it were the table --
+    iterating it to its own keys -- overwrote a study's follow graph with
+    character lists in the first round, and it never recovered.
+    """
+    initialization = getattr(domain, "initialization", None)
+    if initialization is None:
+        return []
+    raw = (
+        initialization.model_dump(mode="json")
+        if hasattr(initialization, "model_dump")
+        else initialization
+    )
+    if not isinstance(raw, dict) or str(raw.get("mode", "")) != "empirical":
+        return []
+    field = str(raw.get("state_field", "population"))
+
+    def effect_field(effect: Any) -> str:
+        if isinstance(effect, Mapping):
+            return str(effect.get("field", ""))
+        return str(getattr(effect, "field", "") or "")
+
+    writers = sorted(
+        {
+            str(process.id)
+            for process in openness.processes
+            for effect in (process.state_effects or ())
+            if effect_field(effect) == field
+        }
+    )
+    return [
+        {
+            "code": "EMPIRICAL_ENVELOPE",
+            "severity": "warning",
+            "path": f"domain.initialization/{field}",
+            "message": (
+                f"'{field}' is seeded empirically, so it holds "
+                "{origin, data_source, rows} rather than the loaded table; every "
+                "reader must unwrap it"
+                + (f" (written by: {', '.join(writers)})" if writers else "")
+            ),
+        }
+    ]
 
 
 def _schema_catalog(source: Path) -> dict[str, Any]:
@@ -649,6 +853,9 @@ class StudyCompiler:
                         ),
                     }
                 )
+        errors.extend(_validate_context_scope(domain))
+        warnings.extend(_advise_unbounded_context(domain))
+        warnings.extend(_advise_empirical_envelope(domain, openness))
         return errors, warnings
 
     def _compile_theory_execution(self, loaded: dict[str, Any]) -> Any:

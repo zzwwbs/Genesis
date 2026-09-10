@@ -350,6 +350,7 @@ class VisibilitySpec(StrictModel):
     id: StableId
     allow: list[str] = Field(default_factory=list)
     redact: list[str] = Field(default_factory=list)
+    scope: dict[str, Any] = Field(default_factory=dict)
     cardinality: dict[str, Any] = Field(default_factory=dict)
     aggregate: dict[str, Any] = Field(default_factory=dict)
     available_when: dict[str, Any] = Field(default_factory=dict)

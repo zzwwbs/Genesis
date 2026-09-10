@@ -415,6 +415,7 @@ class ContextEngine:
         visibility = definition.get("visibility", {}) if isinstance(definition, Mapping) else {}
         availability = definition.get("availability", {}) if isinstance(definition, Mapping) else {}
         cardinality = definition.get("cardinality", {}) if isinstance(definition, Mapping) else {}
+        scope = definition.get("scope", {}) if isinstance(definition, Mapping) else {}
         aggregate = definition.get("aggregate", {}) if isinstance(definition, Mapping) else {}
         source_root = {
             "state": state,
@@ -473,6 +474,8 @@ class ContextEngine:
                     for instance_id, record in value.items()
                     if instance_id in source_ids
                 }
+            if path in scope:
+                value = _apply_scope(value, scope[path], invocation, state)
             if path in cardinality:
                 value = _cap_cardinality(value, cardinality[path])
             if path in aggregate:
@@ -558,15 +561,163 @@ class ContextEngine:
         return True
 
 
-def _cap_cardinality(value: Any, limit: Any) -> Any:
-    """Deterministically truncate a list/dict to its declared cardinality cap."""
+# Names the mapping key itself as the scoping field, for relations stored as
+# {actor_id: rows} rather than as a list of actor-tagged rows.
+SCOPE_KEY_FIELD = "__key__"
+
+
+def _scope_selector(
+    paths: Any, invocation: ProcessInvocation, state: Mapping[str, Any]
+) -> set[Any]:
+    """The set of identities a scoped field is filtered against (CTX-002).
+
+    Each declared path resolves against the invocation and state. ``${actor}``
+    expands to each acting actor in turn and the results are unioned, so a
+    relation keyed by actor works for a multi-actor invocation (CTX-006).
+    Nothing is added implicitly: a policy that wants the actor's own rows names
+    ``actor.ids`` (CTX-003).
+    """
+    if isinstance(paths, str):
+        paths = [paths]
+    if not isinstance(paths, list | tuple):
+        raise ValueError("CONTEXT_SCOPE: 'in' must be a path or a list of paths")
+    namespace = {"actor": {"ids": list(invocation.actor_ids)}, "state": _plain(state)}
+    selector: set[Any] = set()
+    for raw in paths:
+        if not isinstance(raw, str):
+            raise ValueError("CONTEXT_SCOPE: selector paths must be strings")
+        expansions = (
+            [raw.replace("${actor}", str(actor)) for actor in invocation.actor_ids]
+            if "${actor}" in raw
+            else [raw]
+        )
+        for path in expansions:
+            # An unresolved relation is the empty set, a visible outcome, not an
+            # error: a study may legitimately have no relation yet (CTX-004).
+            resolved = _resolve_path(namespace, path)
+            if resolved is None:
+                continue
+            collection = isinstance(resolved, list | tuple | set | frozenset)
+            if collection and not isinstance(resolved, str):
+                selector.update(resolved)
+            else:
+                selector.add(resolved)
+    return selector
+
+
+def _apply_scope(
+    value: Any, rule: Any, invocation: ProcessInvocation, state: Mapping[str, Any]
+) -> Any:
+    """Keep only the elements this actor is entitled to see (CTX-001).
+
+    Source order is preserved and nothing is deduplicated: the projection is
+    recorded evidence and its digest must be stable (CTX-007).
+    """
+    if not isinstance(rule, Mapping):
+        raise ValueError("CONTEXT_SCOPE: scope rule must be a mapping")
+    unknown = set(rule) - {"field", "in"}
+    if unknown:
+        raise ValueError(
+            f"CONTEXT_SCOPE: scope rule has unknown keys: {', '.join(sorted(unknown))}; "
+            "expected field, in"
+        )
+    field = rule.get("field")
+    if not isinstance(field, str) or not field:
+        raise ValueError("CONTEXT_SCOPE: scope rule requires a 'field'")
+    if "in" not in rule:
+        raise ValueError("CONTEXT_SCOPE: scope rule requires 'in'")
+    selector = _scope_selector(rule["in"], invocation, state)
+    if isinstance(value, list | tuple):
+        kept = [item for item in value if isinstance(item, Mapping) and item.get(field) in selector]
+        return type(value)(kept) if isinstance(value, tuple) else kept
+    if isinstance(value, Mapping):
+        if field == SCOPE_KEY_FIELD:
+            return {key: item for key, item in value.items() if key in selector}
+        return {
+            key: item
+            for key, item in value.items()
+            if isinstance(item, Mapping) and item.get(field) in selector
+        }
+    return value
+
+
+def _cap_rule(rule: Any) -> tuple[int, str, str | None]:
+    """Read a cardinality cap as (limit, which end, ordering field).
+
+    A bare integer keeps the first N, which is what the cap has always done. It
+    is the wrong default for an append-ordered field -- it pins every actor to
+    the oldest entries and hides everything recent -- so a cap may now say which
+    end it wants, and optionally which field orders the elements.
+    """
+    limit: Any = rule
+    keep = "first"
+    by: str | None = None
+    if isinstance(rule, Mapping):
+        # Unknown keys are rejected, as the package models reject them. A
+        # mistyped "keep" would otherwise leave the cap silently taking the
+        # oldest entries while the declaration reads as if it takes the newest,
+        # and both produce a plausible number of rows.
+        unknown = set(rule) - {"limit", "keep", "by"}
+        if unknown:
+            raise ValueError(
+                f"cardinality cap has unknown keys: {', '.join(sorted(unknown))}; "
+                "expected limit, keep, by"
+            )
+        limit = rule.get("limit")
+        keep = str(rule.get("keep", "first"))
+        raw_by = rule.get("by")
+        if raw_by is not None:
+            if not isinstance(raw_by, str) or not raw_by:
+                raise ValueError("cardinality 'by' must be a non-empty field name")
+            by = raw_by
+        if keep not in {"first", "last"}:
+            raise ValueError("cardinality 'keep' must be 'first' or 'last'")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
         raise ValueError("cardinality cap must be a non-negative integer")
+    return limit, keep, by
+
+
+def _cap_cardinality(value: Any, rule: Any) -> Any:
+    """Deterministically truncate a list/dict to its declared cardinality cap.
+
+    Whichever elements are kept, they are returned in source order: the cap
+    decides *which* an actor sees, never the order they see them in.
+    """
+    limit, keep, by = _cap_rule(rule)
     if isinstance(value, list):
-        return value[:limit]
+        entries: list[Any] = list(value)
+    elif isinstance(value, dict):
+        entries = list(value.items())
+    else:
+        return value
+    positions = list(range(len(entries)))
+    if by is not None:
+
+        def ordering(position: int) -> tuple[Any, int]:
+            entry = entries[position]
+            if isinstance(value, dict):
+                key, item = entry
+                if by == SCOPE_KEY_FIELD:
+                    return (key, position)
+                entry = item
+            field = entry.get(by) if isinstance(entry, Mapping) else None
+            # A missing ordering value sorts before present ones rather than
+            # raising, and position breaks ties so the result is stable.
+            return ((field is not None, field), position)
+
+        try:
+            positions.sort(key=ordering)
+        except TypeError as exc:
+            raise ValueError(f"cardinality 'by' field '{by}' does not order") from exc
+    # Clamped: a cap larger than the collection keeps all of it. Unclamped, the
+    # start went negative and sliced from the end, so a field just past half its
+    # cap kept almost nothing.
+    start = max(0, len(positions) - limit)
+    chosen = positions[:limit] if keep == "first" else positions[start:]
+    kept = set(chosen)
     if isinstance(value, dict):
-        return dict(list(value.items())[:limit])
-    return value
+        return {key: item for position, (key, item) in enumerate(entries) if position in kept}
+    return [item for position, item in enumerate(entries) if position in kept]
 
 
 def _aggregate_value(value: Any, rule: Any) -> Any:
@@ -1616,16 +1767,19 @@ class RunController:
                 phase = event.get("phase")
                 if isinstance(version, int) and isinstance(phase, int):
                     version_phase[version] = phase
-            history = self.persistence.list_state_history(run_id)
-            ordered: list[tuple[int, dict[str, Any]]] = [
-                (version, snapshot) for version, snapshot in history
-            ]
-            initial_snapshot = ordered[0][1] if ordered else {}
-            # Each phase's ring entry is the FINAL state committed in that
-            # phase (the state the next phase starts with). Take the last
-            # version per phase, then key it as the start of the next phase.
+            # STH-004: only the first snapshot and the FINAL snapshot of each
+            # phase are needed, so the history is consumed one version at a time
+            # rather than held whole — it is quadratic in population x horizon.
+            initial_snapshot: dict[str, Any] = {}
             phase_final: dict[int, dict[str, Any]] = {}
-            for version, snapshot in ordered:
+            first = True
+            iterate = getattr(
+                self.persistence, "iter_state_history", self.persistence.list_state_history
+            )
+            for version, snapshot in iterate(run_id):
+                if first:
+                    initial_snapshot = dict(snapshot)
+                    first = False
                 phase = version_phase.get(version)
                 if phase is None:
                     continue
