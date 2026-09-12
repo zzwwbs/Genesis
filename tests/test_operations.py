@@ -211,25 +211,38 @@ def test_retention_policy_purges_raw_responses_from_exports(tmp_path: Path) -> N
         assert result["status"] == "completed"
         preview = service.export_preview("ret-run")
         assert preview["sensitive"]["raw_responses"] >= 1
-        # Durable purge removes raw-response artifact payloads, keeps the rest.
+        # Durable purge redacts the raw provider bodies of the declaring process in
+        # place (M10): raw-response fields are replaced, while the run's declared
+        # outputs -- here the parsed text itself -- remain, so artifacts are not
+        # deleted merely for containing the word "response".
+        before = len(service.persistence.list_artifacts("ret-run"))
         enforced = service.retention_enforce("ret-run")
         assert enforced["policy"] == "purge"
         assert enforced["purged_rows"] >= 1
+        assert enforced["processes"] == ["compose"]
         remaining = service.persistence.list_artifacts("ret-run")
-        assert all(b'"response"' not in artifact["payload"] for artifact in remaining)
-        # The sensitive bytes are gone from durable object storage too.
-        sensitive = b"top-secret-raw-response"
-        objects_root = service.persistence.object_store.root
-        for path in objects_root.rglob("*"):
-            if path.is_file():
-                assert sensitive not in path.read_bytes()
+        assert len(remaining) == before
+
+        def raw_fields(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {"raw_response", "parsed_response"}:
+                        yield item
+                    else:
+                        yield from raw_fields(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from raw_fields(item)
+
+        stored = [_json.loads(artifact["payload"]) for artifact in remaining]
+        assert any(True for _ in raw_fields(stored))
+        assert all(item == "<purged-by-retention>" for item in raw_fields(stored))
         # Events (the immutable ledger) are untouched.
         assert service.trace_run("ret-run")
         service.export_run("ret-run", "exports/ret")
-        artifacts_json = json.loads((service.workspace / "exports/ret/artifacts.json").read_text())
-        assert "top-secret-raw-response" not in _json.dumps(artifacts_json)
-        events_json = json.loads((service.workspace / "exports/ret/events.json").read_text())
-        assert "top-secret-raw-response" not in _json.dumps(events_json)
+        for name in ("artifacts.json", "events.json"):
+            exported = json.loads((service.workspace / "exports/ret" / name).read_text())
+            assert all(item == "<purged-by-retention>" for item in raw_fields(exported))
     finally:
         svc.OpenAICompatibleProvider = original_provider
         service.close()

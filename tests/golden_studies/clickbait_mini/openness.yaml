@@ -89,6 +89,8 @@ processes:
     inputs: [article-body, title-selection]
     outputs: [{artifact_type: user-action, schema_ref: user-action}]
   - id: update-relations
+    information_timing:
+      mode: sequential
     actors: {source: population.users, id_field: id}
     trigger: {phase: 1, repeat: true}
     dependencies: {after: [interpret-article]}

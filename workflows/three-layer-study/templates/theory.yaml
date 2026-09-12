@@ -1,2 +1,54 @@
 schema_version: '1.0'
 study_id: '{{study_id}}'
+# Layer 2 states the theoretical mechanism and binds it to executable structure.
+#
+# theory_family: variation-selection-retention
+#
+# constructs:
+# - id: variation
+#   theory_role: generator
+#   description: The range of strategies actors can produce in a round.
+#
+# process_mappings:            # every required function of the theory family must
+# - process: formulate-strategy    # be implemented by exactly one declared process
+#   theory_function: variation
+#
+# relations:                   # 'from'/'to' name CONSTRUCT ids
+# - from: variation
+#   to: selection
+#   relation: constrains
+#   execution: {kind: precedence, producer_process: formulate-strategy,
+#               consumer_process: settle}
+#
+# feedback:                    # a closed loop the runtime actually injects.
+#                              # UNLIKE relations, these are NOT construct ids:
+#                              #   from = a LAYER 3 state, artifact or attribute id
+#                              #   to   = the LAYER 1 PROCESS that consumes it
+# - id: settled-outcome-to-publication
+#   from: reputation
+#   to: formulate-strategy
+#   relation: A creator's settled outcome feeds the next round's decision.
+#   execution:
+#     kind: feedback_context
+#     reason: Round-r outcomes are readable when the actor decides in round r+1.
+#     producer_process: settle
+#     consumer_process: formulate-strategy
+#     lag_rounds: 1
+#     source: {kind: state, id: reputation}
+#       # source.kind MUST be 'state': only a prior-round state snapshot is
+#       # executable as feedback. An artifact is not; if the value lives in an
+#       # artifact, declare the state the producing process writes it into and
+#       # source that instead.
+#     context_slot: prior-outcome
+#     initial: {policy: declared_default, value: {}}
+#       # The consumer's context policy must allow 'feedback.<context_slot>' (or
+#       # 'feedback'), or the injected value would never reach the actor.
+#
+# delays:
+# - process: settle
+#   rounds: 1
+#   execution: {kind: annotation, reason: Settlement resolves after publication.}
+#
+# observables:
+# - id: strategy-shift
+#   definition: Change in declared strategy between consecutive rounds.

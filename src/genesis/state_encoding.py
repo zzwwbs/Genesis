@@ -15,6 +15,7 @@ commits, because a commit's identity digests those bytes (STH-007).
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -59,6 +60,10 @@ def identical(left: Any, right: Any) -> bool:
     """
     if type(left) is not type(right):
         return False
+    if isinstance(left, float):
+        # ``-0.0 == 0.0`` too, but JSON writes ``-0.0`` and ``0.0``: the sign is
+        # part of the committed bytes, so a transition between them is a change.
+        return left == right and math.copysign(1.0, left) == math.copysign(1.0, right)
     if isinstance(left, dict):
         return left.keys() == right.keys() and all(
             identical(value, right[key]) for key, value in left.items()

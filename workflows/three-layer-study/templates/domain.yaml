@@ -1,2 +1,92 @@
 schema_version: '1.0'
 study_id: '{{study_id}}'
+# Layer 3 declares what exists in the substantive setting. Every key below is a
+# list of mappings with the fields shown; a descriptive sentence is never a valid
+# entry. Identifiers are lowercase-hyphenated and must be unique within their list.
+#
+# actors:
+# - id: creator
+#   theory_role: variation-source
+#   description: Publishes items and adapts after observing outcomes.
+#
+# attributes:
+# - id: activity-tier
+#   value_type: string
+#   description: Baseline posting frequency assigned at initialization.
+#
+# states:                      # persistent runtime state; a process may only
+# - id: reputation             # write a state declared here
+#   value_type: object
+#   initial: {}
+#   persistence: run
+#
+# artifacts:                   # things processes produce and others may read
+# - id: item
+#   artifact_type: item
+#   schema_ref: item-schema
+#   owner: creator
+#   visibility: item-context   # names a visibility (context policy) id below
+#   lifecycle_scope: run
+#
+# mechanisms:                  # 'implements' must name a THEORY FUNCTION declared
+# - id: sanction               # in Layer 2, or a process id declared in Layer 1 --
+#   implements: selection      # never a construct name
+#   description: Reduces payoff for items meeting the sanction rule.
+#
+# institutions:
+# - id: platform-policy
+#   type: rule
+#
+# initialization:
+#   mode: empirical            # 'empirical' REQUIRES the data asset to exist
+#   data_source: data/population-block-01.json
+#       # a FILE PATH relative to the package root, including the extension --
+#       # not a bare asset name. If no such file is in the package, ask the
+#       # researcher for it rather than naming one.
+#   state_field: population
+#   origin: researcher-constructed
+#
+# visibility:                  # context policies: who may see what, and how much
+# - id: item-context
+#   allow:                     # the paths this policy may project. A path must be
+#   - items                    # allowed before scope/cardinality/project/
+#   - reputation               # available_when may name it.
+#   - leaderboard
+#   - inputs                   # 'inputs' exposes the process's declared inputs
+#   - feedback.prior-outcome   # a theory feedback slot, named in full
+#   redact: []                 # paths removed even when allowed
+#
+#   # scope, cardinality, available_when and project are MAPPINGS KEYED BY AN
+#   # ALLOWED PATH -- never a flat rule, and never a list.
+#   scope:                     # restrict a field to a selector
+#     reputation: {field: __key__, in: actor.ids}
+#     items: {field: creator, in: actor.ids}
+#       # field: '__key__' matches the record's key; otherwise a field name.
+#       # in: actor.ids | state.<field> | '*' | a literal list.
+#   cardinality:               # how many records survive; keep: first | last
+#     items: {limit: 1, keep: last, by: phase}
+#   available_when:            # time- or condition-gate one allowed path
+#     leaderboard:
+#       all:
+#       - {path: condition.visibility, op: eq, value: high}
+#       - {path: protocol.phase, op: gte, value: 1}
+#   project:                   # hand over only part of each record
+#     leaderboard: {drop: [reason]}     # or {keep: [title, clicks]}
+#
+# availability:                # a path-level gate outside any one policy
+# - path: state.leaderboard
+#   available_when: {path: condition.visibility, op: eq, value: high}
+#
+# updates:                     # which state each declared effect may change
+# - state: reputation
+#   op: put
+#   declared_by: settle
+#
+# persistence:
+# - object: reputation
+#   policy: run
+#
+# PREDICATE GRAMMAR (used by available_when here and by trigger/when in Layer 1):
+#   {path: <dotted path>, op: eq|ne|gt|gte|lt|lte|in|truthy, value: <literal>}
+#   compose with {all: [...]}, {any: [...]}, {not: {...}} -- one combinator only.
+#   Paths outside state use a namespace: condition.<factor_id>, protocol.phase.

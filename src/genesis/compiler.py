@@ -16,8 +16,11 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
-from .execution_manifest import build_package_closure
-from .runtime import STATE_VALUE_TYPES, _cap_rule, _resolve_path, edge_delays
+from .execution_manifest import _exclusion_reason, build_package_closure
+from .information_timing import _predicate_paths, model_effect_problems, timing_diagnostics
+from .measurement import measurement_diagnostics
+from .providers import split_prompt_roles
+from .runtime import STATE_VALUE_TYPES, _cap_rule, _project_rule, _resolve_path, edge_delays
 from .schema_validation import PackageSchemaCatalog, SchemaValidationError
 from .specification.models import (
     DomainSpec,
@@ -43,6 +46,16 @@ CANONICAL: dict[str, type[StrictModel]] = {
     "outcomes": OutcomesSpec,
     "models": ModelsSpec,
 }
+
+
+def _source_file_for(path: str) -> str:
+    """The canonical file a diagnostic path belongs to.
+
+    Compiler paths come in both spellings ('/protocol' and
+    'openness.processes.x'); both name their section first.
+    """
+    first = str(path).lstrip("/").replace(".", "/").split("/", 1)[0]
+    return f"{first}.yaml" if first in CANONICAL else "package"
 
 
 @dataclass(frozen=True)
@@ -124,6 +137,26 @@ def _validate_context_scope(domain: DomainSpec) -> list[dict[str, str]]:
                         f"domain.visibility.{policy_id}.cardinality.{path}",
                         str(exc),
                     )
+        project = raw.get("project") or {}
+        if not isinstance(project, dict):
+            fail(
+                "CONTEXT_PROJECT_INVALID",
+                f"domain.visibility.{policy_id}.project",
+                "project must be a mapping",
+            )
+            project = {}
+        for path, rule in project.items():
+            where = f"domain.visibility.{policy_id}.project.{path}"
+            if str(path) not in allowed:
+                fail(
+                    "CONTEXT_PROJECT_INVALID",
+                    where,
+                    f"project names '{path}', which the policy does not allow",
+                )
+            try:
+                _project_rule(rule)
+            except ValueError as exc:
+                fail("CONTEXT_PROJECT_INVALID", where, str(exc))
         scope = raw.get("scope") or {}
         if not isinstance(scope, dict):
             fail(
@@ -153,6 +186,11 @@ def _validate_context_scope(domain: DomainSpec) -> list[dict[str, str]]:
             field = rule.get("field")
             if not isinstance(field, str) or not field:
                 fail("CONTEXT_SCOPE_INVALID", where, "scope rule requires a non-empty 'field'")
+            else:
+                try:
+                    _resolve_path({}, field)
+                except ValueError as exc:
+                    fail("CONTEXT_SCOPE_INVALID", where, f"scope field '{field}': {exc}")
             selectors = rule.get("in")
             if selectors is None:
                 fail("CONTEXT_SCOPE_INVALID", where, "scope rule requires 'in'")
@@ -171,6 +209,131 @@ def _validate_context_scope(domain: DomainSpec) -> list[dict[str, str]]:
                 if problem:
                     fail("CONTEXT_SCOPE_INVALID", where, problem)
     return errors
+
+
+def _policy_allows(domain: DomainSpec) -> list[tuple[str, str]]:
+    """Every (policy id, allowed path) a domain declares."""
+    found: list[tuple[str, str]] = []
+    for policy in domain.visibility:
+        raw = policy.model_dump(mode="json") if hasattr(policy, "model_dump") else policy
+        if not isinstance(raw, dict):
+            continue
+        found.extend((str(raw.get("id", "")), str(path)) for path in raw.get("allow") or ())
+    return found
+
+
+def _validate_condition_factors(loaded: dict[str, Any]) -> list[dict[str, str]]:
+    """Refuse a ``condition.<factor>`` path naming no declared factor.
+
+    Such a predicate resolves to nothing and is therefore false in every round
+    and every cell -- so the gate it guards never opens, silently. The study
+    still runs and still reports, and the treatment simply never arrives: the
+    result reads as "no effect" rather than as a broken package.
+    """
+    protocol = loaded["protocol"]
+    declared = {str(factor.id) for factor in protocol.factors}
+    for condition in protocol.conditions:
+        if isinstance(condition, Mapping):
+            declared.update(str(key) for key in (condition.get("factors") or {}))
+    errors: list[dict[str, str]] = []
+
+    def _check(predicate: Any, where: str) -> None:
+        for path in _predicate_paths(predicate):
+            parts = str(path).split(".")
+            if parts[0] != "condition" or len(parts) < 2 or parts[1] in declared:
+                continue
+            known = ", ".join(sorted(declared)) or "none"
+            errors.append(
+                {
+                    "code": "CONDITION_FACTOR_UNKNOWN",
+                    "severity": "error",
+                    "dependency_section": "protocol",
+                    "path": where,
+                    "message": (
+                        f"reads '{path}', but the protocol declares no factor "
+                        f"'{parts[1]}' (declared: {known}); the predicate would be "
+                        "false in every condition"
+                    ),
+                }
+            )
+
+    for process in loaded["openness"].processes:
+        trigger = process.trigger if isinstance(process.trigger, dict) else {}
+        if trigger.get("type") == "condition":
+            _check(trigger.get("predicate"), f"openness.processes.{process.id}.trigger")
+        for index, use in enumerate(process.measurement_use):
+            _check(use.when, f"openness.processes.{process.id}.measurement_use.{index}.when")
+    domain = loaded["domain"]
+    for policy in domain.visibility:
+        for path, rule in (policy.available_when or {}).items():
+            _check(rule, f"domain.visibility.{policy.id}.available_when.{path}")
+    for entry in domain.availability:
+        _check(entry.available_when, f"domain.availability.{entry.path}.available_when")
+    return errors
+
+
+def _validate_context_exchanges(domain: DomainSpec, openness: OpennessSpec) -> list[dict[str, str]]:
+    """Refuse an exchanges path that names no process, or names one unusably.
+
+    An allowed path that resolves to nothing is dropped in silence at run time,
+    so a typo would hand the actor no history for the whole run while the
+    package reads as if it had one.
+    """
+    process_ids = {str(process.id) for process in openness.processes}
+    errors: list[dict[str, str]] = []
+    for policy_id, path in _policy_allows(domain):
+        parts = path.split(".")
+        if parts[0] != "exchanges":
+            continue
+        where = f"domain.visibility.{policy_id}.allow/{path}"
+        if len(parts) != 2 or not parts[1]:
+            errors.append(
+                {
+                    "code": "CONTEXT_EXCHANGES_INVALID",
+                    "severity": "error",
+                    "path": where,
+                    "message": "an exchanges path names one process: exchanges.<process id>",
+                }
+            )
+        elif parts[1] not in process_ids:
+            errors.append(
+                {
+                    "code": "CONTEXT_EXCHANGES_INVALID",
+                    "severity": "error",
+                    "path": where,
+                    "message": (
+                        f"'{parts[1]}' is not a declared process, so this path would hand the "
+                        "actor no history at all"
+                    ),
+                }
+            )
+    return errors
+
+
+def _advise_unbounded_exchanges(domain: DomainSpec) -> list[dict[str, Any]]:
+    """Flag an exchanges path with no cap: it grows with every round."""
+    advisories: list[dict[str, Any]] = []
+    for policy in domain.visibility:
+        raw = policy.model_dump(mode="json") if hasattr(policy, "model_dump") else policy
+        if not isinstance(raw, dict):
+            continue
+        cardinality = raw.get("cardinality") or {}
+        for path in raw.get("allow") or ():
+            name = str(path)
+            if name.split(".")[0] != "exchanges" or name in cardinality:
+                continue
+            advisories.append(
+                {
+                    "code": "CONTEXT_UNBOUNDED",
+                    "severity": "warning",
+                    "path": f"domain.visibility.{raw.get('id', '')}.allow/{name}",
+                    "message": (
+                        f"'{name}' grows by one exchange every round it runs; declare a "
+                        "cardinality cap, or record that an unbounded history is intended"
+                    ),
+                }
+            )
+    return advisories
 
 
 def _selector_problem(selector: Any, state_ids: set[str]) -> str | None:
@@ -305,6 +468,10 @@ def _schema_catalog(source: Path) -> dict[str, Any]:
     for path in sorted(schema_dir.glob("*")):
         if not path.is_file() or path.suffix not in {".yaml", ".yml", ".json"}:
             continue
+        # The closure's exclusion rule applies here too: a credential-like file in
+        # schemas/ must not be parsed into the build's schemas.json (H2).
+        if _exclusion_reason(Path("schemas") / path.name) is not None:
+            continue
         try:
             value = yaml.safe_load(path.read_text())
         except yaml.YAMLError as exc:
@@ -327,6 +494,7 @@ def _data_manifest(source: Path) -> dict[str, str]:
     return {
         path.relative_to(data_dir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(data_dir.rglob("*"))
+        if _exclusion_reason(Path("data") / path.relative_to(data_dir)) is None
         if path.is_file()
     }
 
@@ -399,6 +567,20 @@ class StudyCompiler:
                         "message": f"duplicate ID in {label}",
                     }
                 )
+        protocol = loaded["protocol"]
+        if protocol.factors and protocol.conditions:
+            # expand_protocol_conditions refuses this at run time, so a package
+            # that compiled cleanly could only fail once a run was attempted.
+            errors.append(
+                {
+                    "code": "PROTOCOL_CONDITIONS_AMBIGUOUS",
+                    "path": "/protocol",
+                    "message": (
+                        "protocol declares both factors and explicit conditions; "
+                        "declare one or the other"
+                    ),
+                }
+            )
         graph: dict[str, set[str]] = {p: set() for p in process_ids}
         for process in openness.processes:
             if process.id in seen:
@@ -429,11 +611,18 @@ class StudyCompiler:
                     }
                 )
             if process.prompt_ref and not self._prompt_exists(process.prompt_ref):
+                variants = self._prompt_variants(process.prompt_ref)
+                message = (
+                    f"prompt '{process.prompt_ref}' must be prompts/{process.prompt_ref}.txt: "
+                    f"prompts are plain-text templates (found {', '.join(variants)})"
+                    if variants
+                    else f"prompt '{process.prompt_ref}' is not present in prompts/"
+                )
                 errors.append(
                     {
                         "code": "REF_PROMPT",
                         "path": f"openness.processes.{process.id}.prompt_ref",
-                        "message": f"prompt '{process.prompt_ref}' is not present in prompts/",
+                        "message": message,
                     }
                 )
             for output in process.outputs:
@@ -854,8 +1043,88 @@ class StudyCompiler:
                     }
                 )
         errors.extend(_validate_context_scope(domain))
+        errors.extend(_validate_context_exchanges(domain, openness))
+        # A trigger reads state fields bare, beside "condition" and "protocol".
+        # A path written "state.<field>" resolves to nothing there, so the
+        # trigger was silently false in every round.
+        for process in openness.processes:
+            trigger = process.trigger if isinstance(process.trigger, dict) else {}
+            if trigger.get("type") != "condition":
+                continue
+            for path in _predicate_paths(trigger.get("predicate")):
+                if path.split(".")[0] == "state":
+                    errors.append(
+                        {
+                            "code": "TRIGGER_PATH_INVALID",
+                            "severity": "error",
+                            "path": f"openness.processes.{process.id}.trigger",
+                            "message": (
+                                f"trigger reads '{path}', but a trigger reads state fields "
+                                f"directly: name '{path.split('.', 1)[1]}'"
+                            ),
+                        }
+                    )
+        errors.extend(_validate_condition_factors(loaded))
+        warnings.extend(_advise_unbounded_exchanges(domain))
         warnings.extend(_advise_unbounded_context(domain))
         warnings.extend(_advise_empirical_envelope(domain, openness))
+        timing_policies: dict[str, Mapping[str, Any]] = {
+            name: {"allow": []} for name in ("private", "public", "none")
+        }
+        timing_policies.update(
+            {str(policy.get("id")): policy for policy in _resolve_context_policies(domain)}
+        )
+        timing_errors, timing_warnings = timing_diagnostics(
+            [process.model_dump(mode="json") for process in openness.processes], timing_policies
+        )
+        errors.extend(timing_errors)
+        warnings.extend(timing_warnings)
+        # A malformed role template would otherwise raise at the first model
+        # call, after the run has started and that call has been paid for.
+        for prompt_path in sorted((self.source / "prompts").glob("*.txt")):
+            if _exclusion_reason(Path("prompts") / prompt_path.name) is not None:
+                continue
+            try:
+                split_prompt_roles(prompt_path.read_text())
+            except ValueError as exc:
+                errors.append(
+                    {
+                        "code": "PROMPT_TEMPLATE_INVALID",
+                        "severity": "error",
+                        "path": f"prompts/{prompt_path.name}",
+                        "message": str(exc),
+                    }
+                )
+        # Feedback bindings are merged into processes after validation, so the
+        # state a slot carries is passed in rather than read from the process.
+        feedback_reads: dict[str, set[str]] = {}
+        for binding in getattr(loaded["theory"], "feedback", None) or []:
+            execution = getattr(binding, "execution", None)
+            source = getattr(execution, "source", None) if execution is not None else None
+            consumer = (
+                getattr(execution, "consumer_process", None) if execution is not None else None
+            )
+            if isinstance(source, dict) and str(source.get("kind")) == "state" and source.get("id"):
+                target = str(consumer or getattr(binding, "target", ""))
+                feedback_reads.setdefault(target, set()).add(str(source["id"]))
+        measurement_errors, measurement_warnings = measurement_diagnostics(
+            [process.model_dump(mode="json") for process in openness.processes],
+            timing_policies,
+            feedback_reads,
+        )
+        errors.extend(measurement_errors)
+        warnings.extend(measurement_warnings)
+        state_types = {str(state.id): str(state.value_type) for state in domain.states}
+        for process in openness.processes:
+            for problem in model_effect_problems(process.model_dump(mode="json"), state_types):
+                errors.append(
+                    {
+                        "code": "STATE_EFFECT_INVALID",
+                        "severity": "error",
+                        "path": f"openness.processes.{process.id}.state_effects",
+                        "message": f"process '{process.id}': {problem}",
+                    }
+                )
         return errors, warnings
 
     def _compile_theory_execution(self, loaded: dict[str, Any]) -> Any:
@@ -887,9 +1156,20 @@ class StudyCompiler:
         )
 
     def _prompt_exists(self, prompt_ref: str) -> bool:
+        # Prompts are plain-text templates, and only prompts/<ref>.txt is compiled
+        # into prompt_templates.json. Accepting other suffixes here let a package
+        # compile while its template silently went missing (H1).
+        path = self.source / "prompts" / f"{prompt_ref}.txt"
+        return path.is_file() and _exclusion_reason(Path("prompts") / path.name) is None
+
+    def _prompt_variants(self, prompt_ref: str) -> list[str]:
+        """Prompt files for ``prompt_ref`` that are not the compiled ``.txt`` form."""
         prompt_dir = self.source / "prompts"
-        suffixes = ("", ".yaml", ".yml", ".json", ".txt")
-        return any((prompt_dir / f"{prompt_ref}{suffix}").is_file() for suffix in suffixes)
+        return [
+            f"prompts/{prompt_ref}{suffix}"
+            for suffix in ("", ".yaml", ".yml", ".json")
+            if (prompt_dir / f"{prompt_ref}{suffix}").is_file()
+        ]
 
     def _schema_exists(self, schema_ref: str) -> bool:
         schema_dir = self.source / "schemas"
@@ -973,7 +1253,9 @@ class StudyCompiler:
                     ValidationRecord(
                         e["code"],
                         e.get("severity", "error"),
-                        "openness.yaml",
+                        # Hard-coding openness.yaml blamed one layer for every
+                        # compile error, including errors in the others.
+                        _source_file_for(e.get("path", "/")),
                         e.get("path", "/"),
                         tuple(e.get("related_ids", ())),
                         e["message"],
@@ -1107,6 +1389,7 @@ class StudyCompiler:
             "prompt_templates.json": {
                 path.stem: path.read_text()
                 for path in sorted((self.source / "prompts").glob("*.txt"))
+                if _exclusion_reason(Path("prompts") / path.name) is None
             },
             "process_graph.json": process_graph,
             "context_policies.json": _resolve_context_policies(loaded["domain"]),
@@ -1156,19 +1439,23 @@ class StudyCompiler:
         # Export and replay later read this closure, never the editable package.
         package_closure = build_package_closure(self.source)
         manifest["package_closure_digest"] = package_closure.digest
+        if package_closure.excluded:
+            manifest["package_files_excluded"] = [
+                {"path": path, "reason": reason} for path, reason in package_closure.excluded
+            ]
         files["package_closure.json"] = package_closure.manifest
         files["build_manifest.json"] = manifest
         integrity = {}
-        data_dir = self.source / "data"
-        if data_dir.is_dir():
-            for asset in sorted(data_dir.rglob("*")):
-                if not asset.is_file():
-                    continue
-                relative = asset.relative_to(data_dir)
-                destination = temp / "data" / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(asset.read_bytes())
-                destination.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        # Only data the closure admits is embedded, so a file excluded from the
+        # closure (an .env, an unsupported type) never reaches the build either.
+        for asset in package_closure.manifest["assets"]:
+            asset_path = Path(asset["path"])
+            if not asset_path.parts or asset_path.parts[0] != "data":
+                continue
+            destination = temp / asset_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((self.source / asset_path).read_bytes())
+            destination.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
         # Preserve original package asset bytes inside the build's closure dir.
         closure_root = self.source
         for asset in package_closure.manifest["assets"]:

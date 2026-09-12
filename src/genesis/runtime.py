@@ -7,11 +7,26 @@ import hashlib
 import json
 import random
 import re
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
+from functools import partial
 from itertools import product
 from types import MappingProxyType
 from typing import Any, cast
+
+from genesis.information_timing import (
+    COMPOSABLE_OPS,
+    MODEL_CALL_MODES,
+    batch_dependencies,
+    can_ready_others,
+    executor_mode,
+    timing_of,
+)
+
+# measurement imports runtime lazily, inside its functions, so this does not cycle.
+from genesis.measurement import gated_input_refs
 
 _ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 
@@ -155,6 +170,12 @@ def expand_actor_instances(
         return [()]
     if isinstance(actors, list | tuple):
         ids = [_check_id(str(actor), "actor_id") for actor in actors]
+        if len(ids) != len(set(ids)):
+            # Two identical groups share an invocation id, so the run aborted
+            # part-way with an idempotency failure -- and a resumed run dropped
+            # the duplicate instead, making a compiled declaration mean one
+            # thing before a pause and another after it.
+            raise ValueError("actors list contains duplicate actor ids")
         return [(actor_id,) for actor_id in ids] or [()]
     if not isinstance(actors, Mapping):
         raise ValueError("actors must be a list or actor selector")
@@ -218,6 +239,29 @@ def _validate_predicate(predicate: Any) -> None:
     _resolve_path({}, str(predicate.get("path", "")))
     if predicate.get("op", "eq") not in {"eq", "ne", "gt", "gte", "lt", "lte", "in", "truthy"}:
         raise ValueError(f"unsupported condition operator: {predicate.get('op')}")
+
+
+def _validate_condition(condition: Any) -> None:
+    """Validate a predicate or an ``all``/``any``/``not`` composition of predicates."""
+    if not isinstance(condition, Mapping):
+        raise ValueError("condition predicate must be a mapping")
+    combinators = sorted({"all", "any", "not"} & set(condition))
+    if len(combinators) > 1:
+        # Only the first was ever evaluated, so the rest read as a condition
+        # that was being applied and was not.
+        raise ValueError(f"condition declares {', '.join(combinators)} together; use one")
+    for key in ("all", "any"):
+        if key in condition:
+            children = condition[key]
+            if not isinstance(children, list | tuple) or not children:
+                raise ValueError(f"condition {key} requires a non-empty list")
+            for child in children:
+                _validate_condition(child)
+            return
+    if "not" in condition:
+        _validate_condition(condition["not"])
+        return
+    _validate_predicate(condition)
 
 
 def _evaluate_condition(condition: Mapping[str, Any], state: Mapping[str, Any]) -> bool:
@@ -314,6 +358,9 @@ class ProcessInvocation:
     condition: Mapping[str, Any] = field(default_factory=dict)
     event_history: tuple[Mapping[str, Any], ...] = ()
     feedback_slots: Mapping[str, Any] = field(default_factory=dict)
+    # This actor's own earlier exchanges with a process, per process id: what it
+    # was given and what it answered. A policy admits them by name.
+    exchanges: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def temporal_position(self) -> tuple[int | float, int | float]:
@@ -336,6 +383,7 @@ class ProcessInvocation:
         )
         object.__setattr__(self, "executor_binding", _freeze(dict(self.executor_binding)))
         object.__setattr__(self, "condition", _freeze(dict(self.condition)))
+        object.__setattr__(self, "exchanges", _freeze(dict(self.exchanges)))
         object.__setattr__(
             self,
             "event_history",
@@ -417,6 +465,7 @@ class ContextEngine:
         cardinality = definition.get("cardinality", {}) if isinstance(definition, Mapping) else {}
         scope = definition.get("scope", {}) if isinstance(definition, Mapping) else {}
         aggregate = definition.get("aggregate", {}) if isinstance(definition, Mapping) else {}
+        project = definition.get("project", {}) if isinstance(definition, Mapping) else {}
         source_root = {
             "state": state,
             "inputs": invocation.inputs,
@@ -424,6 +473,7 @@ class ContextEngine:
             "actor": {"ids": invocation.actor_ids},
             "events": invocation.event_history,
             "feedback": invocation.feedback_slots,
+            "exchanges": invocation.exchanges,
         }
         exposures: dict[str, dict[str, Any]] = {}
         for path in allowed or ():
@@ -478,6 +528,9 @@ class ContextEngine:
                 value = _apply_scope(value, scope[path], invocation, state)
             if path in cardinality:
                 value = _cap_cardinality(value, cardinality[path])
+            # After the cap, so a cap may order by a field the projection drops.
+            if path in project:
+                value = _project_value(value, path, project[path])
             if path in aggregate:
                 value = _aggregate_value(value, aggregate[path])
             target_parts = parts
@@ -556,7 +609,10 @@ class ContextEngine:
                 raise ValueError("context availability predicate must be a mapping")
             namespace = _invocation_namespace(invocation)
             namespace["events"] = _plain(invocation.event_history)
-            if not _evaluate_predicate(predicate, namespace):
+            # all/any/not are accepted everywhere else a predicate is written,
+            # and the timing and measurement analyses already read them here;
+            # evaluating only a bare predicate raised on a valid declaration.
+            if not _evaluate_condition(predicate, namespace):
                 return False
         return True
 
@@ -594,15 +650,167 @@ def _scope_selector(
         for path in expansions:
             # An unresolved relation is the empty set, a visible outcome, not an
             # error: a study may legitimately have no relation yet (CTX-004).
-            resolved = _resolve_path(namespace, path)
-            if resolved is None:
-                continue
-            collection = isinstance(resolved, list | tuple | set | frozenset)
-            if collection and not isinstance(resolved, str):
-                selector.update(resolved)
-            else:
-                selector.add(resolved)
+            # ``*`` maps over a collection, so a selector can name a field of
+            # every element -- the authors of the articles in an actor's feed --
+            # rather than only a field that already holds the identity list.
+            for resolved in _resolve_selector_values(namespace, path):
+                collection = isinstance(resolved, list | tuple | set | frozenset)
+                for item in resolved if collection else (resolved,):
+                    if not isinstance(item, str | int | float | bool):
+                        # Silently skipping would hand every actor an empty view
+                        # for the whole run, which reads as a finding rather than
+                        # as the mis-declaration it is.
+                        raise ValueError(
+                            f"CONTEXT_SCOPE: selector '{path}' resolved to "
+                            f"{type(item).__name__}, which cannot identify a record; name a "
+                            "path that resolves to identities"
+                        )
+                    selector.add(item)
     return selector
+
+
+def _resolve_selector_values(source: Any, path: str) -> list[Any]:
+    """Every value a selector path reaches; ``*`` expands list items or mapping values."""
+    nodes: list[Any] = [source]
+    for part in path.split("."):
+        following: list[Any] = []
+        for node in nodes:
+            if part == "*":
+                if isinstance(node, Mapping):
+                    following.extend(node.values())
+                elif isinstance(node, list | tuple | set | frozenset):
+                    following.extend(node)
+            elif isinstance(node, Mapping):
+                if part in node:
+                    following.append(node[part])
+            elif isinstance(node, list | tuple) and part.isdigit() and int(part) < len(node):
+                following.append(node[int(part)])
+            elif isinstance(node, list | tuple | set | frozenset):
+                # A field named over a collection reads it from each element, so
+                # a relation stored as {actor: [rows]} resolves as readily as one
+                # stored as a list of rows.
+                following.extend(
+                    entry[part] for entry in node if isinstance(entry, Mapping) and part in entry
+                )
+        nodes = following
+    return [node for node in nodes if node is not None]
+
+
+def _field_value(item: Any, field: str) -> Any:
+    """A record's value at a dotted field path, or None."""
+    if not isinstance(item, Mapping):
+        return None
+    if "." not in field:
+        return item.get(field)
+    return _resolve_path(item, field)
+
+
+def _kept_paths(record: Mapping[str, Any], paths: frozenset[str]) -> dict[str, Any]:
+    """The named paths of a record, nested as they were, in the record's own order."""
+    heads: dict[str, set[str]] = {}
+    whole: set[str] = set()
+    for path in paths:
+        head, _, rest = path.partition(".")
+        if rest:
+            heads.setdefault(head, set()).add(rest)
+        else:
+            whole.add(head)
+    kept: dict[str, Any] = {}
+    for name, item in record.items():
+        if name in whole:
+            kept[name] = _plain(item)
+        elif name in heads and isinstance(item, Mapping):
+            nested = _kept_paths(item, frozenset(heads[name]))
+            if nested:
+                kept[name] = nested
+    return kept
+
+
+def _dropped_paths(record: Mapping[str, Any], paths: frozenset[str]) -> dict[str, Any]:
+    """A record without the named paths, nested paths included."""
+    heads: dict[str, set[str]] = {}
+    whole: set[str] = set()
+    for path in paths:
+        head, _, rest = path.partition(".")
+        if rest:
+            heads.setdefault(head, set()).add(rest)
+        else:
+            whole.add(head)
+    result: dict[str, Any] = {}
+    for name, item in record.items():
+        if name in whole:
+            continue
+        if name in heads and isinstance(item, Mapping):
+            result[name] = _dropped_paths(item, frozenset(heads[name]))
+        else:
+            result[name] = _plain(item)
+    return result
+
+
+def _project_value(value: Any, path: str, rule: Any) -> Any:
+    """Keep or drop named fields of the records a context path hands over.
+
+    A name may be a dotted path into a record, because the records a policy
+    hands over are nested: the case this exists for -- an article without its
+    author's private strategy text -- is exactly a nested field, and comparing
+    only top-level names let such a projection compile and do nothing.
+
+    What counts as a record is declared, not guessed. ``applies_to: records``
+    (the default) projects a list's items or a mapping's values;
+    ``applies_to: record`` projects the value itself. Guessing from the value's
+    shape silently dropped whole rows when a mapping held lists rather than
+    records. Projection never adds a field and preserves order, so the recorded
+    context digest stays stable.
+    """
+    keep, drop, applies_to = _project_rule(rule)
+
+    def project(record: Any, where: str) -> Any:
+        if not isinstance(record, Mapping):
+            raise ValueError(
+                f"CONTEXT_PROJECT: '{path}' declares a projection, but {where} is "
+                f"{type(record).__name__}, not a record"
+            )
+        if keep is not None:
+            return _kept_paths(record, keep)
+        return _dropped_paths(record, drop)
+
+    if applies_to == "record":
+        return project(value, "the value")
+    if isinstance(value, list | tuple):
+        return [project(item, "an element") for item in value]
+    if isinstance(value, Mapping):
+        return {key: project(item, f"the entry '{key}'") for key, item in value.items()}
+    raise ValueError(
+        f"CONTEXT_PROJECT: '{path}' declares a projection over records, but the value is "
+        f"{type(value).__name__}; declare applies_to: record to project it directly"
+    )
+
+
+def _project_rule(rule: Any) -> tuple[frozenset[str] | None, frozenset[str], str]:
+    """Read a projection rule as (fields to keep or None, fields to drop, target)."""
+    if not isinstance(rule, Mapping):
+        raise ValueError("projection rule must be a mapping with exactly one of keep or drop")
+    applies_to = str(rule.get("applies_to", "records"))
+    if applies_to not in {"records", "record"}:
+        raise ValueError("projection 'applies_to' must be 'records' or 'record'")
+    selectors = {name: value for name, value in rule.items() if name != "applies_to"}
+    if len(selectors) != 1 or not set(selectors) <= {"keep", "drop"}:
+        raise ValueError("projection rule must be a mapping with exactly one of keep or drop")
+    ((mode, names),) = selectors.items()
+    if (
+        not isinstance(names, list | tuple)
+        or not names
+        or not all(isinstance(name, str) and name for name in names)
+    ):
+        raise ValueError(f"projection '{mode}' must be a non-empty list of field names")
+    for name in names:
+        if name.startswith(".") or name.endswith(".") or ".." in name:
+            raise ValueError(
+                f"projection '{mode}' name '{name}' is not a field or a dotted path into one"
+            )
+    if mode == "keep":
+        return frozenset(names), frozenset(), applies_to
+    return None, frozenset(names), applies_to
 
 
 def _apply_scope(
@@ -627,17 +835,27 @@ def _apply_scope(
     if "in" not in rule:
         raise ValueError("CONTEXT_SCOPE: scope rule requires 'in'")
     selector = _scope_selector(rule["in"], invocation, state)
+
+    def entitled(item: Any) -> bool:
+        found = _field_value(item, field)
+        if isinstance(found, list | tuple | set | frozenset):
+            # A record may name several identities -- an article with two
+            # authors. Requiring a scalar dropped every such record and handed
+            # the actor an empty view with nothing to say why.
+            return any(
+                isinstance(entry, str | int | float | bool) and entry in selector for entry in found
+            )
+        if found is None or isinstance(found, Mapping):
+            return False
+        return isinstance(found, str | int | float | bool) and found in selector
+
     if isinstance(value, list | tuple):
-        kept = [item for item in value if isinstance(item, Mapping) and item.get(field) in selector]
+        kept = [item for item in value if entitled(item)]
         return type(value)(kept) if isinstance(value, tuple) else kept
     if isinstance(value, Mapping):
         if field == SCOPE_KEY_FIELD:
             return {key: item for key, item in value.items() if key in selector}
-        return {
-            key: item
-            for key, item in value.items()
-            if isinstance(item, Mapping) and item.get(field) in selector
-        }
+        return {key: item for key, item in value.items() if entitled(item)}
     return value
 
 
@@ -786,12 +1004,44 @@ class StateStore:
                 if field not in declared or field not in self.schema:
                     raise PermissionError("state effect is not declared in the state model")
                 op, value = effect.get("op", "set"), effect.get("value")
+                key = effect.get("key")
                 if op == "set":
                     candidate[field] = value
                 elif op == "increment":
-                    candidate[field] = candidate.get(field, 0) + value
+                    current = candidate.get(field, 0)
+                    if (
+                        not isinstance(current, int | float)
+                        or not isinstance(value, int | float)
+                        or isinstance(current, bool)
+                        or isinstance(value, bool)
+                    ):
+                        # Unchecked, "x" + "y" and ["a"] + ["b"] were recorded as
+                        # successful increments of a string and a list.
+                        raise TypeError("increment requires a numeric field and value")
+                    candidate[field] = current + value
+                elif op == "append" and key is not None:
+                    current = candidate.get(field) or {}
+                    if not isinstance(current, Mapping):
+                        raise TypeError("keyed append requires a mapping state field")
+                    entries = current.get(str(key)) or []
+                    if not isinstance(entries, list):
+                        raise TypeError("keyed append requires a list under the key")
+                    candidate[field] = {**current, str(key): [*entries, value]}
                 elif op == "append":
-                    candidate[field] = candidate.get(field, []) + [value]
+                    candidate[field] = list(candidate.get(field) or []) + [value]
+                elif op == "put":
+                    current = candidate.get(field) or {}
+                    if key is None or not isinstance(current, Mapping):
+                        raise TypeError("put requires a key and a mapping state field")
+                    candidate[field] = {**current, str(key): value}
+                elif op in {"add-relation", "remove-relation"}:
+                    current = candidate.get(field) or []
+                    if not isinstance(current, list) or not isinstance(value, Mapping):
+                        raise TypeError(f"{op} requires a list state field and a mapping value")
+                    if op == "remove-relation":
+                        candidate[field] = [item for item in current if item != value]
+                    elif value not in current:
+                        candidate[field] = [*current, dict(value)]
                 elif op == "remove":
                     current = candidate.get(field)
                     if isinstance(current, list):
@@ -928,8 +1178,12 @@ class ArtifactStore:
         *,
         actor_ids: tuple[str, ...] = (),
         phase: int | float | None = None,
+        visible: frozenset[str] | None = None,
     ) -> dict[str, Any]:
         """Resolve declared artifact/process references to immutable instances.
+
+        ``visible`` limits resolution to instances that already existed at some
+        moment -- the start of a simultaneous batch (CON-008).
 
         Instances outside their declared ``lifecycle_scope`` are excluded.
         When same-actor instances exist for a reference, they take precedence;
@@ -946,6 +1200,7 @@ class ArtifactStore:
                     or metadata.get("producer_process") == reference
                 )
                 and self._in_scope(metadata, phase)
+                and (visible is None or instance_id in visible)
             ]
             if actor_ids:
                 matching = [
@@ -1049,6 +1304,101 @@ def _invocation_namespace(invocation: ProcessInvocation) -> dict[str, Any]:
     return namespace
 
 
+def _resolve_optional(source: Any, path: str) -> tuple[bool, Any]:
+    """``(found, value)`` at a dotted path, telling a missing key from a null value."""
+    value: Any = source
+    for part in path.split("."):
+        if isinstance(value, Mapping) and part in value:
+            value = value[part]
+        elif isinstance(value, list | tuple) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            return False, None
+    return True, value
+
+
+def model_call_effects(
+    process: Mapping[str, Any], outputs: Mapping[str, Any], actor_ids: Sequence[str]
+) -> list[dict[str, Any]]:
+    """The state effects a model call's declarations derive from its outputs.
+
+    A model returns outputs only, so each declared effect names the output it
+    reads (``from``, defaulting to the field name, dotted into the output) and
+    the operation that applies it. An output the model did not return writes
+    nothing. ``key: actor`` writes under the acting actor, which is what lets
+    simultaneous siblings share one mapping without overwriting each other.
+    """
+    effects: list[dict[str, Any]] = []
+    plain_outputs = _plain(outputs)
+    for declaration in process.get("state_effects") or ():
+        if isinstance(declaration, str):
+            if declaration in plain_outputs:
+                effects.append(
+                    {"field": declaration, "op": "set", "value": plain_outputs[declaration]}
+                )
+            continue
+        if not isinstance(declaration, Mapping) or not declaration.get("field"):
+            continue
+        field_name = str(declaration["field"])
+        # A model that returned the field as null did declare a value; only an
+        # output it did not return at all writes nothing.
+        present, value = _resolve_optional(plain_outputs, str(declaration.get("from", field_name)))
+        if not present:
+            continue
+        effect: dict[str, Any] = {
+            "field": field_name,
+            "op": str(declaration.get("op", "set")),
+            "value": value,
+        }
+        if declaration.get("key") == "actor":
+            if len(actor_ids) != 1:
+                raise ValueError(
+                    f"STATE_EFFECT_KEY: '{process.get('id')}' writes '{field_name}' under the "
+                    f"acting actor, which requires one actor per invocation, not {len(actor_ids)}"
+                )
+            effect["key"] = str(actor_ids[0])
+        effects.append(effect)
+    return effects
+
+
+def _redacted_outputs(outputs: Any, trace: Mapping[str, Any]) -> dict[str, Any]:
+    """Outputs as the trace policy allows them to be retained."""
+    kept = dict(_plain(outputs)) if isinstance(outputs, Mapping) else {}
+    if trace.get("record_raw_response", True) is False and "response" in kept:
+        kept["response"] = "<raw-response-not-recorded>"
+    return kept
+
+
+def _exchange_context(context: Any) -> dict[str, Any]:
+    """A recorded context with the exchanges namespace removed.
+
+    An exchange stores the context its invocation was given, and that context
+    may itself carry earlier exchanges. Storing it whole nests each round inside
+    the next, so the namespace grows exponentially in rounds however tightly the
+    cap bounds the count at each level.
+    """
+    plain = _plain(context)
+    if not isinstance(plain, dict):
+        return {}
+    plain.pop("exchanges", None)
+    return plain
+
+
+def _composes_with_siblings(effect: Mapping[str, Any], actor_ids: Sequence[str]) -> bool:
+    """Whether one effect still composes when every sibling computed it from one view.
+
+    A keyed write composes only under the acting actor's own key: under any
+    other key two siblings write the same entry, and the last one silently wins.
+    """
+    op = str(effect.get("op", "set"))
+    if op not in COMPOSABLE_OPS:
+        return False
+    key = effect.get("key")
+    if key is None:
+        return op != "put"
+    return str(key) in {str(actor) for actor in actor_ids}
+
+
 def _result_from_declaration(
     declaration: Mapping[str, Any], *, metadata: Mapping[str, Any]
 ) -> ProcessResult:
@@ -1070,6 +1420,10 @@ class RuleExecutor:
         if not isinstance(rules, list):
             raise ValueError("rule executor requires a rules list")
         self.rules = [dict(rule) for rule in rules]
+        for rule in self.rules:
+            # Checked here rather than at the first invocation: a malformed rule
+            # simply never matched, and the default answered for the study.
+            _validate_condition(rule.get("when"))
         default = parameters.get("default", {})
         if not isinstance(default, Mapping):
             raise ValueError("rule executor default must be a mapping")
@@ -1176,6 +1530,10 @@ class ExecutorRegistry:
             CallableExecutor(executor, mode) if callable(executor) and mode else executor
         )
 
+    def get(self, process_id: str) -> Any:
+        """The executor registered for a process, or ``None``."""
+        return self._executors.get(process_id)
+
     def execute(self, process_id: str, invocation: ProcessInvocation) -> ProcessResult:
         return cast(ProcessResult, self._executors[process_id].execute(invocation))
 
@@ -1228,7 +1586,7 @@ class Scheduler:
             if not isinstance(p.get("after", []), list):
                 raise ValueError("dependencies.after must be a list")
             if isinstance(trigger, Mapping) and trigger.get("type") == "condition":
-                _validate_predicate(trigger.get("predicate"))
+                _validate_condition(trigger.get("predicate"))
             max_attempts = p.get("retry_policy", {}).get("max_attempts", 1)
             if (
                 not isinstance(max_attempts, int)
@@ -1338,6 +1696,34 @@ class Scheduler:
                 self._scheduled.pop(index)
                 return
 
+    def _untriggered(
+        self, process_id: str, phase: int | float, state: Mapping[str, Any] | None
+    ) -> bool:
+        """Whether a repeating, condition-triggered process is not triggered now.
+
+        Read against the same live state the producer's own readiness is read
+        against, and nothing is remembered: the answer is the same however often
+        it is asked, whoever asks, and whether or not the run was interrupted. An
+        earlier version latched the answer for the phase, which made readiness
+        depend on what had been asked before -- so a resumed run, whose scheduler
+        starts empty, scheduled a producer the uninterrupted run had skipped, and
+        merely deciding a concurrency limit could suppress one.
+
+        A condition trigger is deliberately re-read as a round proceeds, so a
+        process can become ready once a sibling writes the state it waits on.
+        This answer therefore means "not triggered at the moment the consumer was
+        considered", not "will not run this round": a producer whose trigger
+        turns true later still runs, after the consumer that did not wait.
+        """
+        if state is None or not self._repeats(process_id):
+            return False
+        if (process_id, phase) in self._completed_occurrences:
+            return False
+        trigger = self.processes.get(process_id, {}).get("trigger", {})
+        if not isinstance(trigger, Mapping) or trigger.get("type") != "condition":
+            return False
+        return not _evaluate_condition(cast(Mapping[str, Any], trigger.get("predicate")), state)
+
     def _repeats(self, process_id: str) -> bool:
         process = self.processes.get(process_id, {})
         trigger = process.get("trigger", {})
@@ -1351,6 +1737,7 @@ class Scheduler:
         dep: str,
         resolved_delays: Mapping[str, int | float],
         phase: int | float,
+        state: Mapping[str, Any] | None = None,
     ) -> bool:
         """Whether one declared dependency edge permits ``pid`` to run at ``phase``.
 
@@ -1366,8 +1753,17 @@ class Scheduler:
         HISTORY, not its latest completion — a repeating producer advances its
         latest completion every round, so ``last + lag <= phase`` could never
         become true and a lag of two or more starved the consumer forever.
+
+        A zero-delay edge on a repeating producer whose condition trigger does
+        not hold this phase is satisfied: the producer will not run this phase,
+        so waiting for it would stop the consumer in every phase it is skipped
+        (a reflection every third round would stop publishing in the others).
+        The trigger is read against the same state that decides whether the
+        producer itself is ready, so the two answers cannot differ.
         """
         delay = resolved_delays.get(str(dep), 0)
+        if delay <= 0 and self._untriggered(str(dep), phase, state):
+            return True
         if dep not in self.completed:
             # A delayed edge inside a dependency cycle bootstraps on the first
             # phase so the cycle can start at all.
@@ -1391,6 +1787,7 @@ class Scheduler:
     ) -> list[ScheduledProcess]:
         out = []
         observed_events = set(self.events) | (events or set())
+        trigger_state = state or {}
         for pid, p in self.processes.items():
             repeat = bool(p.get("repeat", p.get("trigger", {}).get("repeat", False)))
             if (
@@ -1428,13 +1825,17 @@ class Scheduler:
                 continue
             if isinstance(trigger, Mapping) and trigger.get("type") == "condition":
                 predicate = cast(Mapping[str, Any], trigger.get("predicate"))
-                if not _evaluate_predicate(predicate, state or {}):
+                if not _evaluate_condition(predicate, trigger_state):
                     continue
             if any(
-                not self._dependency_satisfied(pid, p, dep, resolved_delays, phase) for dep in deps
+                not self._dependency_satisfied(pid, p, dep, resolved_delays, phase, trigger_state)
+                for dep in deps
             ):
                 continue
             out.append(ScheduledProcess(pid, p.get("phase", 0)))
+        # A scheduling effect reactivates a process that has already run: that is
+        # what an executor asking for another occurrence means, and a study
+        # depends on it (test_schedule_effect_reactivates_completed_process).
         out.extend(item for item in self._scheduled if item.phase <= phase)
         unique = {(item.process_id, item.phase): item for item in out}
         return sorted(unique.values(), key=lambda x: (x.phase, x.process_id))
@@ -1452,6 +1853,78 @@ class Scheduler:
             self._event_consumed[key] = self._event_consumed.get(key, 0) + 1
 
 
+@dataclass(frozen=True)
+class _ExecutorRaised:
+    """An exception the executor raised, carried from execution to commit.
+
+    Wrapped rather than passed bare so an executor that *returns* an exception
+    object is still treated as returning an invalid result, as it always was.
+    """
+
+    error: Exception
+
+
+@dataclass(frozen=True)
+class _RunScope:
+    """Run-level inputs every actor turn is prepared from."""
+
+    run_id: str
+    seed: int
+    seed_identity: str | None
+    experiment_id: str
+    condition_id: str
+    replication: int
+    matching: Mapping[str, Any]
+    condition: Mapping[str, Any]
+    state: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _BatchView:
+    """What every actor in a simultaneous batch sees: the run as the batch began (CON-008)."""
+
+    state: Mapping[str, Any]
+    state_version: int
+    event_history: tuple[Mapping[str, Any], ...]
+    artifact_ids: frozenset[str] | None
+    # Declared simultaneous, as opposed to an undeclared independent batch.
+    simultaneous: bool
+
+
+# The random stream a shuffled process's activation order is drawn from (CON-010).
+ACTIVATION_ORDER_STREAM = "activation-order"
+
+
+def _declared_order(process: Mapping[str, Any]) -> tuple[tuple[str, ...], ...] | None:
+    """The batch order a process declaration alone reproduces, or ``None``.
+
+    Listed ids reproduce it; a shuffled order, or actors drawn from state, do not,
+    so only those batches record their order on their first event.
+    """
+    if timing_of(process)[1] == "shuffled":
+        return None
+    actors = process.get("actors")
+    if isinstance(actors, Mapping) and actors.get("ids") is None:
+        return None
+    try:
+        return tuple(expand_actor_instances(process, {}))
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class _ActorTurn:
+    """One actor group's turn in one process and phase."""
+
+    process_id: str
+    process: Mapping[str, Any]
+    phase: int | float
+    actor_ids: tuple[str, ...]
+    max_attempts: int
+    feedback_slots: dict[str, Any]
+    view: _BatchView | None = None
+
+
 class RunController:
     def __init__(
         self,
@@ -1464,8 +1937,19 @@ class RunController:
         persistence: Any | None = None,
         status_provider: Callable[[], str] | None = None,
         output_schema_validator: Callable[[str, Any], list[str]] | None = None,
+        max_concurrency: Mapping[str, int] | None = None,
+        cancel_event: Any | None = None,
     ):
         self.scheduler, self.registry, self.context_engine = scheduler, registry, context_engine
+        # Per process: how many calls of one batch may run at once (CON-011).
+        self.max_concurrency = dict(max_concurrency or {})
+        # The run's cancel signal, shared with its providers: set when a
+        # concurrent batch fails, so calls still in flight stop (CON-013).
+        self.cancel_event = cancel_event
+        # How each batched process actually ran, and why; and calls that ran but
+        # were not committed because the run stopped mid-batch (CON-013, CON-015).
+        self.execution_decisions: dict[str, dict[str, Any]] = {}
+        self.discarded_calls: dict[str, Any] = {"calls": 0, "unfinished": 0, "usage": {}}
         self.state_store, self.persistence = state_store, persistence
         self.artifact_store = artifact_store
         self.output_schema_validator = output_schema_validator
@@ -1484,10 +1968,43 @@ class RunController:
         self._completed_process_events: list[dict[str, Any]] = []
         self._actor_queues: dict[tuple[str, int | float], list[tuple[str, ...]]] = {}
         self._completed_actor_occurrences: set[tuple[str, int | float, tuple[str, ...]]] = set()
+        # Simultaneous batches (CON-008): the view each open batch reads; for a
+        # resumed run, the view version its already-committed siblings recorded
+        # and each persisted event's state version; and the pre-run state, for a
+        # batch that began before the first commit.
+        self._batch_views: dict[tuple[str, int | float], _BatchView] = {}
+        self._batch_view_versions: dict[tuple[str, int | float], int] = {}
+        self._event_state_versions: dict[str, int] = {}
+        self._initial_state: dict[str, Any] | None = None
+        # Each open batch's full actor order, recorded on its first actor's events;
+        # the orders a resumed run found recorded; and, per process, whether its
+        # batches read from a view.
+        self._batch_orders: dict[tuple[str, int | float], tuple[tuple[str, ...], ...]] = {}
+        self._recorded_batch_orders: dict[tuple[str, int | float], tuple[tuple[str, ...], ...]] = {}
+        self._view_decisions: dict[str, bool] = {}
+        # When each open view was taken (commit-log position), so an undeclared
+        # batch notices another process committing part-way through; for a
+        # resumed run, the latest view version each batch's committed actors
+        # read and the producer of every persisted event.
+        self._view_opened_at: dict[tuple[str, int | float], int] = {}
+        self._batch_view_latest: dict[tuple[str, int | float], int] = {}
+        self._persisted_event_processes: list[tuple[int, str]] = []
         # Round-state ring for state-feedback bindings: snapshot the state at
         # the start of each phase, keyed by phase, so a consumer can read the
         # state as of ``lag`` completed rounds earlier.
         self._round_state_at_phase: dict[int | float, dict[str, Any]] = {}
+        # (process, acting group) -> that group's own exchanges with that process.
+        self._exchange_log: dict[tuple[str, tuple[str, ...]], list[dict[str, Any]]] = {}
+        # The processes some policy asks for exchanges of. Nothing is kept for
+        # any other process: a recorded context per invocation, held for the
+        # whole run, is not a cost to pay for a package that cannot read it.
+        self._exchange_processes: frozenset[str] = frozenset(
+            str(path).split(".")[1]
+            for policy in (getattr(context_engine, "policies", {}) or {}).values()
+            if isinstance(policy, Mapping)
+            for path in policy.get("allow") or ()
+            if str(path).startswith("exchanges.") and len(str(path).split(".")) > 1
+        )
         # The protocol's first phase; the floor for "a round that actually ran".
         self._phase_start: int = 0
         # Ring entry reconstructed from an interrupted round's partial state.
@@ -1591,9 +2108,143 @@ class RunController:
             if call.context is not None
             else [],
         }
+        # The state version the context was built from: for a simultaneous batch,
+        # the version as the batch began (CON-015).
+        record["view_state_version"] = call.state_version
+        batch_order = self._batch_orders.get((call.process_id, call.phase))
+        if (
+            batch_order
+            and call.attempt == 1
+            and tuple(call.actor_ids) == batch_order[0]
+            and _declared_order(process) is None
+        ):
+            # When the declaration alone cannot reproduce the order (shuffled, or
+            # actors drawn from state), the first actor's first attempt records it,
+            # so a resumed run reopens the batch exactly as it began (CON-008, CON-010).
+            record["batch_actors"] = [list(group) for group in batch_order]
+        if isinstance(process.get("information_timing"), Mapping):
+            mode, order = timing_of(process)
+            record["information_timing"] = {"mode": mode, "order": order}
         if call.context is not None and record_context:
             record["context"] = _plain(call.context.data)
         return record
+
+    def _record_exchange(
+        self, turn: _ActorTurn, call: ProcessInvocation, result: ProcessResult, attempt: int
+    ) -> None:
+        """Keep this turn's own exchange, so a later turn can be shown what it did.
+
+        A reflection reads back what it was given and what it answered a few
+        rounds ago. An exchange belongs to the actor group that made it, and is
+        kept only under the same trace policy that governs whether a context is
+        retained at all, so this adds no channel a policy has not admitted.
+        """
+        if turn.process_id not in self._exchange_processes:
+            # Nothing can read this process's exchanges, and keeping every
+            # recorded context for the life of the run is not free.
+            return
+        raw_trace = turn.process.get("trace_policy", {})
+        trace = raw_trace if isinstance(raw_trace, Mapping) else {}
+        entry: dict[str, Any] = {
+            "phase": turn.phase,
+            "attempt": attempt,
+            "outputs": _redacted_outputs(_plain(result.outputs), trace),
+        }
+        if call.context is not None and bool(trace.get("record_context", True)):
+            entry["context"] = _exchange_context(call.context.data)
+        self._exchange_log.setdefault((turn.process_id, tuple(call.actor_ids)), []).append(entry)
+
+    def _exchanges_for(self, turn: _ActorTurn) -> dict[str, list[dict[str, Any]]]:
+        """This turn's own earlier exchanges, per process, oldest first.
+
+        Matched on the whole acting group, not on any member: a group turn is
+        one actor's worth of history, and unioning its members' exchanges would
+        hand each of them the others' -- and count a joint exchange once per
+        member, so a cap of three could hold one exchange three times.
+        """
+        acting = tuple(turn.actor_ids)
+        found: dict[str, list[dict[str, Any]]] = {}
+        for (process_id, actors), entries in self._exchange_log.items():
+            if actors == acting:
+                found.setdefault(process_id, []).extend(entries)
+        return {
+            process_id: sorted(
+                items, key=lambda item: (item.get("phase", 0), item.get("attempt", 1))
+            )
+            for process_id, items in found.items()
+        }
+
+    def _restore_exchange_log(self, run_id: str, completed: list[Mapping[str, Any]]) -> None:
+        """Rebuild each actor's exchange history after a resume.
+
+        Each invocation's context is on its event; its outputs are on the
+        invocation's payload row, under the same id. Without rebuilding both, a
+        resumed run's reflection would see only the rounds since it resumed.
+
+        Only invocations that completed are rebuilt. A skipped invocation
+        records no exchange live, so admitting one here would give a resumed run
+        a history the uninterrupted run never had.
+        """
+        self._exchange_log = {}
+        if not self._exchange_processes:
+            return
+        wanted = [
+            event
+            for event in completed
+            if event.get("kind") == "process_completed"
+            and str(event.get("process_id")) in self._exchange_processes
+        ]
+        if not wanted:
+            return
+        outputs_by_id = self._recorded_invocation_outputs(run_id)
+        log: dict[tuple[str, tuple[str, ...]], list[dict[str, Any]]] = {}
+        for event in sorted(
+            wanted,
+            key=lambda item: (item.get("phase", 0), item.get("commit_order", 0)),
+        ):
+            process_id = str(event.get("process_id"))
+            process = self.scheduler.processes.get(process_id, {})
+            raw_trace = process.get("trace_policy", {}) if isinstance(process, Mapping) else {}
+            trace = raw_trace if isinstance(raw_trace, Mapping) else {}
+            event_id = str(event.get("event_id", ""))
+            entry: dict[str, Any] = {
+                "phase": event.get("phase", 0),
+                "attempt": int(event.get("attempt", 1)),
+                # The payload row redacts a raw response only for generative
+                # processes, so the live redaction is applied again here rather
+                # than trusted; and a retained-but-purged invocation must say so
+                # instead of reading as an actor that answered nothing.
+                "outputs": _redacted_outputs(outputs_by_id.get(event_id, {}), trace),
+            }
+            if event_id not in outputs_by_id:
+                entry["outputs_recorded"] = False
+            if isinstance(event.get("context"), Mapping):
+                entry["context"] = _exchange_context(event["context"])
+            actors = tuple(str(actor) for actor in event.get("actors", ()) or ())
+            log.setdefault((process_id, actors), []).append(entry)
+        self._exchange_log = log
+
+    def _recorded_invocation_outputs(self, run_id: str) -> dict[str, Any]:
+        """Each recorded invocation's outputs, keyed by its event id."""
+        rows = getattr(self.persistence, "iter_artifacts", None) or getattr(
+            self.persistence, "list_artifacts", None
+        )
+        found: dict[str, Any] = {}
+        if rows is None:
+            return found
+        try:
+            for row in rows(run_id):
+                try:
+                    payload = json.loads(row["payload"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, Mapping) and "outputs" in payload:
+                    found[str(row.get("artifact_id", ""))] = payload["outputs"]
+        except ValueError:
+            # A purge during the read leaves the history without outputs, which
+            # each entry then reports; it must not stop the resume itself.
+            return found
+        return found
 
     @staticmethod
     def _consumed_input_records(call: ProcessInvocation) -> Mapping[str, Any]:
@@ -1707,6 +2358,23 @@ class RunController:
             return
         events = self.persistence.list_events(run_id)
         self._persisted_count = len(events)
+        self._event_state_versions = {
+            str(event.get("event_id")): int(event["state_version"])
+            for event in events
+            if event.get("event_id") and isinstance(event.get("state_version"), int)
+        }
+        self._persisted_event_processes = [
+            (int(event["state_version"]), str(event.get("process_id")))
+            for event in events
+            if isinstance(event.get("state_version"), int)
+        ]
+        for event in events:
+            order = event.get("batch_actors")
+            if isinstance(order, list) and event.get("process_id") is not None:
+                self._recorded_batch_orders.setdefault(
+                    (str(event.get("process_id")), event.get("phase", 0)),
+                    tuple(tuple(str(actor) for actor in group) for group in order),
+                )
         if events:
             self._last_event_id = str(events[-1].get("event_id")) or None
         completed = [
@@ -1714,7 +2382,9 @@ class RunController:
             for event in events
             if event.get("kind") in {"process_completed", "process_skipped"}
         ]
+        self._restore_exchange_log(run_id, completed)
         if self.state_store:
+            self._initial_state = self.state_store.snapshot()
             latest = self.persistence.latest_json_state(run_id)
             if latest is not None:
                 version, snapshot = latest
@@ -1854,6 +2524,15 @@ class RunController:
                     }
                 )
                 self._completed_actor_occurrences.add((str(process_id), phase, actors))
+                view_version = event.get("view_state_version")
+                if isinstance(view_version, int) and not isinstance(view_version, bool):
+                    batch_key = (str(process_id), phase)
+                    self._batch_view_versions[batch_key] = min(
+                        view_version, self._batch_view_versions.get(batch_key, view_version)
+                    )
+                    self._batch_view_latest[batch_key] = max(
+                        view_version, self._batch_view_latest.get(batch_key, view_version)
+                    )
                 self._record_state_writes(
                     str(event.get("event_id", "")), phase, event.get("state_delta")
                 )
@@ -1878,8 +2557,15 @@ class RunController:
                     self.scheduler.schedule(str(effect["process_id"]), effect["phase"])
         state_snapshot = self.state_store.snapshot() if self.state_store else {}
         for (process_id, phase), actor_groups in completed_groups.items():
-            expected = set(
-                expand_actor_instances(self.scheduler.processes[process_id], state_snapshot)
+            # A recorded batch order is what the batch was; the current state may
+            # now expand to different actors (CON-008).
+            recorded_order = self._recorded_batch_orders.get((str(process_id), phase))
+            expected = (
+                set(recorded_order)
+                if recorded_order is not None
+                else set(
+                    expand_actor_instances(self.scheduler.processes[process_id], state_snapshot)
+                )
             )
             if expected.issubset(actor_groups):
                 self.scheduler.consume_scheduled(process_id, phase)
@@ -1922,6 +2608,1060 @@ class RunController:
             return True
         return False
 
+    def _prepare_call(self, scope: _RunScope, turn: _ActorTurn, attempt: int) -> ProcessInvocation:
+        """Build one attempt's invocation and its authorized context (CON-004).
+
+        Everything an executor may read is fixed here, on the controller's thread,
+        before the executor runs.
+        """
+        actor_seed_id = "\x1f".join(turn.actor_ids)
+        actor_suffix = f"-{'-'.join(turn.actor_ids)}" if turn.actor_ids else ""
+        view = turn.view
+        # A measurement used only under some conditions or rounds is not resolved
+        # outside them, so the process cannot read it there at all.
+        input_refs = gated_input_refs(
+            turn.process, self.scheduler.processes, phase=turn.phase, condition=scope.condition
+        )
+        resolved_inputs = (
+            self.artifact_store.resolve(
+                list(input_refs),
+                actor_ids=turn.actor_ids,
+                phase=turn.phase,
+                visible=view.artifact_ids if view is not None else None,
+            )
+            if self.artifact_store is not None and isinstance(input_refs, list | tuple)
+            else {}
+        )
+        binding = turn.process.get("executor", {})
+        parameters = binding.get("parameters", {}) if isinstance(binding, Mapping) else {}
+        stream_id = (
+            str(parameters.get("random_stream", "conventional"))
+            if isinstance(parameters, Mapping)
+            else "conventional"
+        )
+        shared_streams = scope.matching.get("shared_streams", [])
+        matching_key = (
+            stream_id
+            if scope.matching.get("enabled") is True
+            and isinstance(shared_streams, list | tuple)
+            and stream_id in shared_streams
+            else None
+        )
+        call = ProcessInvocation(
+            f"{scope.run_id}-{turn.process_id}{actor_suffix}-{turn.phase}",
+            scope.run_id,
+            turn.process_id,
+            actor_ids=turn.actor_ids,
+            phase=turn.phase,
+            state_version=(
+                view.state_version
+                if view is not None
+                else self.state_store.version
+                if self.state_store
+                else 0
+            ),
+            inputs=resolved_inputs,
+            seed=derive_seed(
+                scope.seed,
+                scope.seed_identity or scope.run_id,
+                turn.process_id,
+                actor_seed_id,
+                experiment_id=scope.experiment_id,
+                condition_id=scope.condition_id,
+                replication=scope.replication,
+                matching_key=matching_key,
+            ),
+            attempt=attempt,
+            condition=scope.condition,
+            event_history=(view.event_history if view is not None else tuple(self._event_history)),
+            feedback_slots=turn.feedback_slots,
+            exchanges=self._exchanges_for(turn),
+        )
+        policy_id = turn.process.get("context_policy", "private")
+        call = ProcessInvocation(
+            call.invocation_id,
+            call.run_id,
+            call.process_id,
+            call.actor_ids,
+            call.phase,
+            call.time,
+            call.state_version,
+            call.inputs,
+            self.context_engine.build(
+                policy_id,
+                call,
+                view.state
+                if view is not None
+                else self.state_store.snapshot()
+                if self.state_store is not None
+                else (scope.state or {}),
+            ),
+            call.seed,
+            call.attempt,
+            turn.process.get("executor", {}),
+            call.condition,
+            call.event_history,
+            call.feedback_slots,
+            call.exchanges,
+        )
+        return call
+
+    def _log_dispatch(self, turn: _ActorTurn, call: ProcessInvocation, attempt: int) -> int:
+        """Record that an attempt was dispatched and return its dispatch order."""
+        dispatch_order = len(self.dispatch_log) + 1
+        self.dispatch_log.append(
+            {
+                "order": dispatch_order,
+                "invocation_id": call.invocation_id,
+                "process_id": turn.process_id,
+                "phase": turn.phase,
+                "attempt": attempt,
+            }
+        )
+        return dispatch_order
+
+    def _execute_call(
+        self, turn: _ActorTurn, call: ProcessInvocation
+    ) -> ProcessResult | _ExecutorRaised:
+        """Run the executor: the only part of a turn that reads no store (CON-004).
+
+        An exception is returned rather than raised, so committing a turn handles
+        an executor failure the same way wherever the executor ran.
+        """
+        try:
+            return self.registry.execute(turn.process_id, call)
+        except _ReportedProcessFailure:
+            raise
+        except Exception as exc:
+            return _ExecutorRaised(exc)
+
+    def _commit_attempt(
+        self,
+        turn: _ActorTurn,
+        call: ProcessInvocation,
+        dispatch_order: int,
+        attempt: int,
+        outcome: ProcessResult | _ExecutorRaised,
+    ) -> bool:
+        """Validate and durably record one attempt's outcome (CON-004).
+
+        Returns ``True`` when the turn is finished and ``False`` when another
+        attempt should run. Raises when the run must stop.
+
+        The restore point for a failed commit is the store as it stands when the
+        commit begins. Executors receive only a frozen invocation and cannot reach
+        the controller's stores, so this equals the state before execution; it is
+        also the right point once earlier turns commit while a call is running.
+        """
+        state_before = self.state_store.snapshot() if self.state_store else None
+        state_version_before = self.state_store.version if self.state_store else 0
+        artifact_before = (
+            self.artifact_store.snapshot() if self.artifact_store is not None else None
+        )
+        state_applied = False
+        persistence_committed = False
+        persistence_attempted = False
+        failure_persisted = False
+        executor_returned = False
+        failure_recorded = False
+        try:
+            if isinstance(outcome, _ExecutorRaised):
+                raise outcome.error
+            result = outcome
+            executor_returned = True
+            retry_policy = turn.process.get("retry_policy", {})
+            retry_policy = retry_policy if isinstance(retry_policy, Mapping) else {}
+            if result.status == "failed":
+                failure_policy = str(retry_policy.get("failure_policy", "fail_run"))
+                if failure_policy == "use_declared_fallback" and isinstance(
+                    retry_policy.get("fallback_outputs"), Mapping
+                ):
+                    result = ProcessResult(
+                        outputs=dict(retry_policy["fallback_outputs"]),
+                        metadata={
+                            **_plain(result.metadata),
+                            "fallback": True,
+                            "original_code": result.metadata.get("code"),
+                        },
+                    )
+                elif failure_policy == "skip_with_event":
+                    result = ProcessResult(
+                        status="skipped",
+                        outputs=dict(retry_policy.get("fallback_outputs", {})),
+                        metadata={**_plain(result.metadata), "skipped_fallback": True},
+                    )
+            # F3/SCH-002: every declared artifact output — including a
+            # fallback — must satisfy its declared schema before any
+            # state or artifact commit. This is the common
+            # output-commit boundary, so all executors are covered.
+            if result.status == "succeeded" and self.output_schema_validator is not None:
+                # F1: the schema comes from the executing process's
+                # own output declaration (process.outputs[].schema_ref),
+                # not from a separate domain-artifact id, so a
+                # process-declared schema is always enforced.
+                declared_outputs = turn.process.get("outputs") or []
+                declared_schemas: list[tuple[str, str]] = []
+                for decl in declared_outputs:
+                    if not isinstance(decl, Mapping):
+                        continue
+                    artifact_type = decl.get("artifact_type")
+                    schema_ref = decl.get("schema_ref")
+                    if isinstance(artifact_type, str) and isinstance(schema_ref, str):
+                        declared_schemas.append((artifact_type, schema_ref))
+                schema_errors: list[str] = []
+                for artifact_id, schema_ref in declared_schemas:
+                    if artifact_id not in (result.outputs or {}):
+                        continue
+                    # Normalize frozen mappingproxies to plain
+                    # JSON-able values before schema validation.
+                    schema_value = _plain(result.outputs[artifact_id])
+                    for message in self.output_schema_validator(schema_ref, schema_value):
+                        schema_errors.append(f"{artifact_id}: {message}")
+                if schema_errors:
+                    metadata = dict(_plain(result.metadata))
+                    metadata.update(
+                        {
+                            "code": "OUTPUT_VALIDATION_FAILED",
+                            "schema_valid": False,
+                            "validation_errors": schema_errors,
+                        }
+                    )
+                    result = ProcessResult(
+                        status="failed",
+                        outputs=result.outputs,
+                        metadata=metadata,
+                    )
+            if result.status == "failed":
+                self.failures.append(
+                    {
+                        "invocation_id": call.invocation_id,
+                        "attempt": attempt,
+                        "error": str(
+                            result.metadata.get(
+                                "error", result.metadata.get("code", "process failed")
+                            )
+                        ),
+                        "classification": result.metadata.get("code", "executor_defect"),
+                    }
+                )
+                failure_recorded = True
+                if self.persistence:
+                    persistence_attempted = True
+                    failed_event_id = f"{call.invocation_id}-attempt-{attempt}"
+                    failed_commit_order = len(self.commit_log) + 1
+                    self.persistence.commit_process_result(
+                        {
+                            "event_id": failed_event_id,
+                            "invocation_id": call.invocation_id,
+                            "run_id": call.run_id,
+                            "kind": "process_failed",
+                            "process_id": turn.process_id,
+                            "actors": list(call.actor_ids),
+                            "phase": turn.phase,
+                            "attempt": attempt,
+                            "dispatch_order": dispatch_order,
+                            "commit_order": failed_commit_order,
+                            "metadata": _event_safe_metadata(result.metadata),
+                            **self._trace_meta(turn.process, call),
+                            "state_version": self._persisted_count + 1,
+                            "state_delta": {},
+                        },
+                        {
+                            "run_id": call.run_id,
+                            "state_version": self._persisted_count + 1,
+                            "payload": json.dumps(
+                                self.state_store.snapshot() if self.state_store else {},
+                                sort_keys=True,
+                            ).encode(),
+                        },
+                        [],
+                    )
+                    self._persisted_count += 1
+                    self._sync_persisted_state_version()
+                    self._last_event_id = failed_event_id
+                    self.commit_log.append(
+                        {
+                            "order": failed_commit_order,
+                            "invocation_id": call.invocation_id,
+                            "process_id": turn.process_id,
+                            "phase": turn.phase,
+                            "status": "failed",
+                        }
+                    )
+                self.results.append(result)
+                if attempt == turn.max_attempts:
+                    self.status = "failed"
+                    raise _ReportedProcessFailure(f"process {turn.process_id} failed")
+                return False
+            if result.status == "skipped":
+                if self.persistence:
+                    persistence_attempted = True
+                    skipped_commit_order = len(self.commit_log) + 1
+                    self.persistence.commit_process_result(
+                        {
+                            "event_id": f"{call.invocation_id}-attempt-{attempt}",
+                            "invocation_id": call.invocation_id,
+                            "run_id": call.run_id,
+                            "kind": "process_skipped",
+                            "process_id": turn.process_id,
+                            "actors": list(call.actor_ids),
+                            "phase": turn.phase,
+                            "attempt": attempt,
+                            "dispatch_order": dispatch_order,
+                            "commit_order": skipped_commit_order,
+                            "metadata": _event_safe_metadata(result.metadata),
+                            **self._trace_meta(turn.process, call),
+                            "state_version": self._persisted_count + 1,
+                            "state_delta": {},
+                        },
+                        {
+                            "run_id": call.run_id,
+                            "state_version": self._persisted_count + 1,
+                            "payload": json.dumps(
+                                self.state_store.snapshot() if self.state_store else {},
+                                sort_keys=True,
+                            ).encode(),
+                        },
+                        [],
+                    )
+                    persistence_committed = True
+                    self._persisted_count += 1
+                    self._sync_persisted_state_version()
+                    self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
+                    self.commit_log.append(
+                        {
+                            "order": skipped_commit_order,
+                            "invocation_id": call.invocation_id,
+                            "process_id": turn.process_id,
+                            "phase": turn.phase,
+                            "status": "skipped",
+                        }
+                    )
+                self.results.append(result)
+                return True
+            _validate_scheduling_effects(self.scheduler, result.scheduling_effects)
+            raw_state_effects = turn.process.get("state_effects", [])
+            declared: set[str] = set()
+            for effect_item in raw_state_effects:
+                if isinstance(effect_item, str):
+                    declared.add(effect_item)
+                elif isinstance(effect_item, Mapping) and effect_item.get("field"):
+                    declared.add(str(effect_item["field"]))
+            effects: Any
+            if result.state_effects:
+                effects = result.state_effects
+            elif executor_mode(turn.process) in MODEL_CALL_MODES and not result.metadata.get(
+                "recorded"
+            ):
+                # A model call's declared operations are applied to committed
+                # state, not written whole from its outputs.
+                effects = model_call_effects(turn.process, result.outputs, turn.actor_ids)
+            else:
+                effects = {key: value for key, value in result.outputs.items() if key in declared}
+            # A replayed result carries recorded deltas, which reproduce the
+            # recorded state exactly when applied in commit order.
+            if (
+                turn.view is not None
+                and turn.view.simultaneous
+                and not result.metadata.get("recorded")
+            ):
+                # Every sibling computed its writes from the same view, so a
+                # whole-field write would overwrite those committed before it.
+                if isinstance(effects, Mapping):
+                    whole = sorted(str(key) for key in effects)
+                else:
+                    whole = sorted(
+                        str(effect.get("field"))
+                        for effect in effects
+                        if not _composes_with_siblings(effect, turn.actor_ids)
+                    )
+                if whole:
+                    raise ValueError(
+                        "SIMULTANEOUS_WRITE_CONFLICT: a simultaneous batch may commit only "
+                        f"composable state effects; '{turn.process_id}' wrote whole fields: "
+                        f"{', '.join(whole)}"
+                    )
+            if self.state_store and effects:
+                self.state_store.apply(effects, declared, expected_version=self.state_store.version)
+                state_applied = True
+            declared_artifacts: list[dict[str, Any]] = []
+            if self.artifact_store is not None:
+                for artifact_id, value in result.outputs.items():
+                    if artifact_id not in self.artifact_store.catalog:
+                        continue
+                    catalog = self.artifact_store.catalog[artifact_id]
+                    artifact_instance_id = f"{artifact_id}-{call.invocation_id}-attempt-{attempt}"
+                    producer_event = f"{call.invocation_id}-attempt-{attempt}"
+                    consumed_input_ids = sorted(self._consumed_input_records(call).keys())
+                    self.artifact_store.put(
+                        artifact_id,
+                        value,
+                        owner=catalog.get("owner"),
+                        schema_ref=catalog.get("schema_ref"),
+                        visibility=catalog.get("visibility"),
+                        lifecycle_scope=catalog.get("lifecycle_scope"),
+                        lineage=consumed_input_ids,
+                        instance_id=artifact_instance_id,
+                        actors=call.actor_ids,
+                        producer_process=turn.process_id,
+                        producer_event=producer_event,
+                        phase=turn.phase,
+                    )
+                    declared_artifacts.append(
+                        {
+                            "artifact_id": artifact_instance_id,
+                            "run_id": call.run_id,
+                            "payload": json.dumps(
+                                {
+                                    "value": _plain(value),
+                                    "content_hash": _hash(value),
+                                    "schema_ref": catalog.get("schema_ref"),
+                                    "owner": catalog.get("owner"),
+                                    "visibility": catalog.get("visibility"),
+                                    "lifecycle_scope": catalog.get("lifecycle_scope"),
+                                    "producer_event": producer_event,
+                                    "producer_process": turn.process_id,
+                                    "declared_artifact_id": artifact_id,
+                                    "invocation_id": call.invocation_id,
+                                    "phase": turn.phase,
+                                    "attempt": attempt,
+                                    "actors": list(call.actor_ids),
+                                    "lineage": consumed_input_ids,
+                                },
+                                sort_keys=True,
+                            ).encode(),
+                        }
+                    )
+            if self.persistence:
+                persistence_attempted = True
+                trace = turn.process.get("trace_policy", {})
+                trace = trace if isinstance(trace, Mapping) else {}
+                storage_outputs = dict(_plain(result.outputs))
+                omit_provider_bodies = trace.get("record_raw_response", True) is False
+                storage_metadata = (
+                    _event_safe_metadata(result.metadata)
+                    if omit_provider_bodies
+                    else _plain(result.metadata)
+                )
+                if (
+                    omit_provider_bodies
+                    and (turn.process.get("executor", {}).get("mode") == "generative")
+                    and "response" in storage_outputs
+                ):
+                    storage_outputs["response"] = "<raw-response-not-recorded>"
+                state_after = self.state_store.snapshot() if self.state_store else None
+                state_delta = (
+                    self._state_delta(state_before, state_after)
+                    if self.state_store and state_after is not None
+                    else {}
+                )
+                payload = json.dumps(
+                    {
+                        "outputs": storage_outputs,
+                        "raw_response": storage_metadata.get("raw_response"),
+                        "parsed_response": _plain(storage_metadata.get("parsed_response")),
+                        "provider_attempts": _plain(storage_metadata.get("provider_attempts", [])),
+                        "process_id": turn.process_id,
+                        "invocation_id": call.invocation_id,
+                        "phase": turn.phase,
+                        "attempt": attempt,
+                        "actors": list(call.actor_ids),
+                    },
+                    sort_keys=True,
+                ).encode()
+                state_payload = json.dumps(
+                    state_after if state_after is not None else {},
+                    sort_keys=True,
+                ).encode()
+                persist_version = self._persisted_count + 1
+                self.persistence.commit_process_result(
+                    {
+                        "event_id": f"{call.invocation_id}-attempt-{attempt}",
+                        "invocation_id": call.invocation_id,
+                        "run_id": call.run_id,
+                        "kind": "process_completed",
+                        "process_id": turn.process_id,
+                        "actors": list(call.actor_ids),
+                        "phase": turn.phase,
+                        "attempt": attempt,
+                        "dispatch_order": dispatch_order,
+                        "commit_order": len(self.commit_log) + 1,
+                        "events": _plain(result.events),
+                        "metadata": _event_safe_metadata(result.metadata),
+                        "scheduling_effects": _plain(result.scheduling_effects),
+                        **self._trace_meta(turn.process, call),
+                        "state_version": persist_version,
+                        "state_delta": state_delta,
+                    },
+                    {
+                        "run_id": call.run_id,
+                        "state_version": persist_version,
+                        "payload": state_payload,
+                    },
+                    [
+                        {
+                            "artifact_id": (f"{call.invocation_id}-attempt-{attempt}"),
+                            "run_id": call.run_id,
+                            "payload": payload,
+                        },
+                        *declared_artifacts,
+                    ],
+                )
+                persistence_committed = True
+                self._persisted_count += 1
+                self._sync_persisted_state_version()
+                self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
+            commit_order = len(self.commit_log) + 1
+            self.commit_log.append(
+                {
+                    "order": commit_order,
+                    "invocation_id": call.invocation_id,
+                    "process_id": turn.process_id,
+                    "phase": turn.phase,
+                }
+            )
+            self._completed_process_events.append(
+                {
+                    "event_id": f"{call.invocation_id}-attempt-{attempt}",
+                    "process_id": turn.process_id,
+                    "phase": turn.phase,
+                    "actors": list(call.actor_ids),
+                }
+            )
+            self._record_exchange(turn, call, result, attempt)
+            if state_applied:
+                self._record_state_writes(
+                    f"{call.invocation_id}-attempt-{attempt}", turn.phase, effects
+                )
+            self.results.append(result)
+            for emitted in result.events:
+                self._event_history.append(
+                    {
+                        **_plain(emitted),
+                        "producer_event": (f"{call.invocation_id}-attempt-{attempt}"),
+                        "producer_process": turn.process_id,
+                        "actor_ids": list(call.actor_ids),
+                        "phase": turn.phase,
+                    }
+                )
+                event_name = emitted.get("type") or emitted.get("kind") or emitted.get("event")
+                if event_name:
+                    self.scheduler.signal_event(str(event_name))
+            for effect in result.scheduling_effects:
+                effect_type = effect.get("type")
+                if effect_type == "signal_event" and effect.get("event"):
+                    self.scheduler.signal_event(str(effect["event"]))
+                elif effect_type == "schedule":
+                    target = effect.get("process_id")
+                    scheduled_phase = effect.get("phase")
+                    self.scheduler.schedule(str(target), cast(int | float, scheduled_phase))
+            return True
+        except _ReportedProcessFailure:
+            raise
+        except Exception as exc:
+            if state_applied and not persistence_committed and self.state_store:
+                self.state_store.restore(state_before or {}, state_version_before)
+            if (
+                artifact_before is not None
+                and not persistence_committed
+                and self.artifact_store is not None
+            ):
+                self.artifact_store.restore(artifact_before)
+            if not failure_recorded:
+                failure = {
+                    "invocation_id": call.invocation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                }
+                if not executor_returned:
+                    failure["classification"] = "executor_exception"
+                self.failures.append(failure)
+                failure_recorded = True
+            if not persistence_attempted and self.persistence:
+                failed_commit_order = len(self.commit_log) + 1
+                classification = "executor_exception" if not executor_returned else "invalid_output"
+                try:
+                    persistence_attempted = True
+                    self.persistence.commit_process_result(
+                        {
+                            "event_id": f"{call.invocation_id}-attempt-{attempt}",
+                            "invocation_id": call.invocation_id,
+                            "run_id": call.run_id,
+                            "kind": "process_failed",
+                            "process_id": turn.process_id,
+                            "actors": list(call.actor_ids),
+                            "phase": turn.phase,
+                            "attempt": attempt,
+                            "dispatch_order": dispatch_order,
+                            "commit_order": failed_commit_order,
+                            "classification": classification,
+                            "error": str(exc),
+                            **self._trace_meta(turn.process, call),
+                            "state_version": self._persisted_count + 1,
+                            "state_delta": {},
+                        },
+                        {
+                            "run_id": call.run_id,
+                            "state_version": self._persisted_count + 1,
+                            "payload": json.dumps(
+                                self.state_store.snapshot() if self.state_store else {},
+                                sort_keys=True,
+                            ).encode(),
+                        },
+                        [],
+                    )
+                except Exception:
+                    self.status = "failed"
+                    raise
+                self._persisted_count += 1
+                self._sync_persisted_state_version()
+                self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
+                failure_persisted = True
+                self.commit_log.append(
+                    {
+                        "order": failed_commit_order,
+                        "invocation_id": call.invocation_id,
+                        "process_id": turn.process_id,
+                        "phase": turn.phase,
+                        "status": "failed",
+                    }
+                )
+            if attempt == turn.max_attempts:
+                self.status = "failed"
+                raise
+            if persistence_attempted and not persistence_committed and not failure_persisted:
+                self.status = "failed"
+                raise
+        return False
+
+    def _activation_order(
+        self,
+        scope: _RunScope,
+        process_id: str,
+        phase: int | float,
+        groups: list[tuple[str, ...]],
+    ) -> list[tuple[str, ...]]:
+        """The seeded per-phase order of a shuffled process's actors (CON-010).
+
+        Drawn from its own stream, so it never perturbs an executor's seed, and
+        shared across matched conditions when that stream is shared, so order is
+        not a confound between paired runs. A resumed run redraws the same order.
+        """
+        shared = scope.matching.get("shared_streams", [])
+        matching_key = (
+            ACTIVATION_ORDER_STREAM
+            if scope.matching.get("enabled") is True
+            and isinstance(shared, list | tuple)
+            and ACTIVATION_ORDER_STREAM in shared
+            else None
+        )
+        ordered = list(groups)
+        random.Random(
+            derive_seed(
+                scope.seed,
+                scope.seed_identity or scope.run_id,
+                process_id,
+                f"{ACTIVATION_ORDER_STREAM}@{phase}",
+                experiment_id=scope.experiment_id,
+                condition_id=scope.condition_id,
+                replication=scope.replication,
+                matching_key=matching_key,
+            )
+        ).shuffle(ordered)
+        return ordered
+
+    def _scheduling_stable(
+        self,
+        process_id: str,
+        phase: int | float,
+        state: Mapping[str, Any],
+        executed_this_phase: set[str],
+    ) -> bool:
+        """Whether the scheduler would keep choosing this batch for every remaining actor.
+
+        The serial loop re-evaluates readiness before each actor and consumes one
+        scheduled entry per turn, so a scheduled entry can be what keeps a process
+        ready or ahead of another. The choice cannot change part-way through when
+        no entry of this process remains to consume and it is still the first
+        ready process (CON-012).
+        """
+        if any(
+            entry.process_id == process_id and entry.phase <= phase
+            for entry in self.scheduler._scheduled
+        ):
+            return False
+        ready = [
+            entry
+            for entry in self.scheduler.ready(phase, state=state)
+            if entry.process_id == process_id or entry.process_id not in executed_this_phase
+        ]
+        return bool(ready) and ready[0].process_id == process_id
+
+    def _batch_limit(
+        self,
+        process_id: str,
+        batch_key: tuple[str, int | float],
+        scheduling_stable: Callable[[], bool] | None = None,
+    ) -> int:
+        """How many of a batch's calls may run at once, recording why (CON-011).
+
+        Only a batch prepared from a view, run by an executor that touches nothing
+        but its invocation, may run concurrently: its actors cannot see one
+        another's results, so running them together records the same run as
+        running them one at a time.
+        """
+        view = self._batch_views.get(batch_key)
+        if view is None and not self._batch_orders.get(batch_key):
+            if len(self._actor_queues.get(batch_key) or ()) <= 1:
+                return 1
+        requested = int(self.max_concurrency.get(process_id, 1))
+        if not getattr(self.registry.get(process_id), "concurrent_safe", False):
+            limit, reason = 1, "its executor is not a concurrency-safe model call"
+        elif view is None:
+            limit, reason = (
+                1,
+                "a later actor can see an earlier actor's result from the same batch, "
+                "and its timing is sequential",
+            )
+        elif not view.simultaneous and can_ready_others(
+            self.scheduler.processes[process_id], self.scheduler.processes
+        ):
+            limit, reason = (
+                1,
+                "its commits can make another process ready part-way through the batch",
+            )
+        elif (
+            requested > 1
+            and not view.simultaneous
+            and scheduling_stable is not None
+            and not scheduling_stable()
+        ):
+            # A simultaneous batch is forced to finish, so only an undeclared
+            # batch's turns depend on the scheduler's choice.
+            limit, reason = 1, "its scheduling can change part-way through the batch"
+        elif requested <= 1:
+            limit, reason = 1, "max_concurrency is 1"
+        else:
+            limit = requested
+            reason = "simultaneous" if view.simultaneous else "batch-independent"
+        self.execution_decisions.setdefault(
+            process_id,
+            {"max_concurrency": requested, "concurrent": limit > 1, "reason": reason},
+        )
+        return limit
+
+    def _run_batch_concurrently(
+        self,
+        scope: _RunScope,
+        batch_key: tuple[str, int | float],
+        template: _ActorTurn,
+        limit: int,
+        max_events: int | None,
+        executed: list[str],
+    ) -> bool:
+        """Run a batch's remaining calls concurrently, committing in actor order (CON-012).
+
+        Calls are prepared on this thread from the batch view and only executed on
+        workers; each result is committed here once every earlier actor's has been,
+        so dispatch and commit orders, state and records match a one-at-a-time run.
+        Returns ``False`` when the run must stop -- paused, cancelled or out of its
+        event budget -- leaving unfinished actors queued for a resume (CON-014).
+        """
+        queue = self._actor_queues[batch_key]
+        pending: deque[tuple[_ActorTurn, ProcessInvocation, Future[Any]]] = deque()
+        prepare_error: Exception | None = None
+        stopped_cleanly = False
+        first_turn = True
+        pool = ThreadPoolExecutor(
+            max_workers=limit, thread_name_prefix=f"genesis-{template.process_id}"
+        )
+        try:
+            while pending or (queue and prepare_error is None):
+                # Poll before submitting more work, as the serial loop polls before
+                # preparing each actor.
+                if self._poll_external_status():
+                    stopped_cleanly = True
+                    return False
+                # Never more calls in flight than the limit (backpressure), nor more
+                # than the event budget can still commit.
+                budget = None if max_events is None else max_events - self._event_count
+                while (
+                    prepare_error is None
+                    and queue
+                    and len(pending) < limit
+                    and (budget is None or len(pending) < budget)
+                ):
+                    turn = replace(template, actor_ids=queue.pop(0))
+                    try:
+                        call = self._prepare_call(scope, turn, 1)
+                    except Exception as exc:
+                        # A serial run commits every earlier actor before this one
+                        # fails to prepare, so those are committed first. The actor
+                        # stays queued, so a pause before the error is raised does
+                        # not silently drop it.
+                        queue.insert(0, turn.actor_ids)
+                        prepare_error = exc
+                        break
+                    pending.append((turn, call, pool.submit(self._execute_call, turn, call)))
+                if not pending:
+                    if prepare_error is not None:
+                        break
+                    # Defensive: the batch starts with budget left and stops once
+                    # it is spent, so this is not expected to be reached.
+                    self.status = "completed"
+                    stopped_cleanly = True
+                    return False
+                turn, call, future = pending.popleft()
+                if not first_turn:
+                    # The serial loop consumes one scheduled entry per actor turn;
+                    # the first was consumed before this batch began.
+                    self.scheduler.consume_scheduled(turn.process_id, turn.phase)
+                first_turn = False
+                self._commit_turn(scope, turn, call, future.result())
+                executed.append(turn.process_id)
+                self._event_count += 1
+                if max_events is not None and self._event_count >= max_events:
+                    self.status = "completed"
+                    stopped_cleanly = True
+                    return False
+            if prepare_error is not None:
+                raise prepare_error
+            stopped_cleanly = True
+            return True
+        finally:
+            if not stopped_cleanly and self.cancel_event is not None:
+                # The run is failing: stop calls still in flight instead of letting
+                # them run on, and spend, after their results can no longer be used.
+                self.cancel_event.set()
+            self._discard_pending(pending, queue)
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _commit_turn(
+        self,
+        scope: _RunScope,
+        turn: _ActorTurn,
+        call: ProcessInvocation,
+        outcome: ProcessResult | _ExecutorRaised,
+    ) -> None:
+        """Commit one actor's executed attempt, then any retries, in serial order."""
+        attempt = 1
+        while True:
+            dispatch_order = self._log_dispatch(turn, call, attempt)
+            if self._commit_attempt(turn, call, dispatch_order, attempt, outcome):
+                return
+            attempt += 1
+            if attempt > turn.max_attempts:
+                return
+            call = self._prepare_call(scope, turn, attempt)
+            outcome = self._execute_call(turn, call)
+
+    def _discard_pending(
+        self,
+        pending: deque[tuple[_ActorTurn, ProcessInvocation, Future[Any]]],
+        queue: list[tuple[str, ...]],
+    ) -> None:
+        """Requeue actors whose calls will not be committed, and account for them.
+
+        A call that already ran was paid for even though its result is dropped, so
+        its usage is kept (CON-013). A call still running when the batch stopped is
+        counted, but its usage is not yet known.
+        """
+        if not pending:
+            return
+        queue[0:0] = [turn.actor_ids for turn, _call, _future in pending]
+        usage = self.discarded_calls["usage"]
+        for _turn, _call, future in pending:
+            if future.cancel():
+                continue
+            self.discarded_calls["calls"] += 1
+            if not future.done():
+                self.discarded_calls["unfinished"] += 1
+                continue
+            try:
+                outcome = future.result()
+            except BaseException:
+                continue
+            if isinstance(outcome, ProcessResult):
+                for key, value in dict(outcome.metadata.get("usage") or {}).items():
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        usage[key] = usage.get(key, 0) + value
+        pending.clear()
+
+    def _reads_from_view(self, process_id: str, process: Mapping[str, Any]) -> bool:
+        """Whether a process's batches are prepared from a batch view (CON-008).
+
+        A simultaneous batch always is. So is an undeclared batch in which nothing
+        its own actors write can reach a sibling through anything the package
+        declares: the view is then identical to live reads for every declared
+        channel, and it also closes the channels a package does not declare. A
+        declared sequential batch, and an undeclared dependent one, read live.
+        """
+        decided = self._view_decisions.get(process_id)
+        if decided is None:
+            mode, _order = timing_of(process)
+            if mode is not None:
+                decided = mode == "simultaneous"
+            else:
+                policy = self.context_engine.policies.get(
+                    str(process.get("context_policy", "private"))
+                )
+                decided = not batch_dependencies(process, policy)
+            self._view_decisions[process_id] = decided
+        return decided
+
+    def _reopen_interrupted_batches(self, scope: _RunScope) -> None:
+        """Reopen batches a pause interrupted, exactly as they began (CON-008, CON-010).
+
+        The queue is the recorded actor order less the actors already committed --
+        not re-derived from the current state, which those actors changed, nor
+        re-shuffled. A batch that reads from a view gets its view back, and so
+        runs to completion without its trigger being re-evaluated.
+        """
+        candidates = dict(self._recorded_batch_orders)
+        for process_id, phase, _actors in list(self._completed_actor_occurrences):
+            batch_key = (process_id, phase)
+            process = self.scheduler.processes.get(process_id)
+            if batch_key in candidates or process is None:
+                continue
+            declared = _declared_order(process)
+            if declared is not None and len(declared) > 1:
+                candidates[batch_key] = declared
+        for batch_key, order in candidates.items():
+            process_id, phase = batch_key
+            process = self.scheduler.processes.get(process_id)
+            if process is None or batch_key in self._actor_queues:
+                continue
+            remaining = [
+                group
+                for group in order
+                if (process_id, phase, group) not in self._completed_actor_occurrences
+            ]
+            if not remaining:
+                # Every recorded actor committed: the batch is done, even if the
+                # current state would now expand to a different actor list.
+                self.scheduler.consume_scheduled(process_id, phase)
+                self._complete_occurrence(process_id, phase)
+                continue
+            if (process_id, phase) in self.scheduler._completed_occurrences:
+                continue
+            self._actor_queues[batch_key] = remaining
+            self._batch_orders[batch_key] = order
+            if len(order) > 1 and self._reads_from_view(process_id, process):
+                mode, _order = timing_of(process)
+                self._batch_views[batch_key] = self._open_batch_view(
+                    scope, batch_key, simultaneous=mode == "simultaneous"
+                )
+
+    def _complete_occurrence(self, process_id: str, phase: int | float) -> None:
+        """Complete a process occurrence once, however many paths reach its end."""
+        if (process_id, phase) not in self.scheduler._completed_occurrences:
+            self.scheduler.complete(process_id, phase)
+
+    def _recorded_view_version(
+        self, batch_key: tuple[str, int | float], *, simultaneous: bool
+    ) -> int | None:
+        """The view version a resumed batch must be rebuilt at, if any (consumed once).
+
+        A simultaneous batch's actors all read the view as the batch began. An
+        undeclared batch's view follows other processes' commits, so its remaining
+        actors read what its last committed actor read -- or the run as it now
+        stands, if another process committed after that.
+        """
+        earliest = self._batch_view_versions.pop(batch_key, None)
+        latest = self._batch_view_latest.pop(batch_key, None)
+        if simultaneous:
+            return earliest
+        if latest is None:
+            return None
+        if any(
+            version > latest and producer != batch_key[0]
+            for version, producer in self._persisted_event_processes
+        ):
+            return None
+        return latest
+
+    def _foreign_commit_since_view(self, batch_key: tuple[str, int | float]) -> bool:
+        """Whether another process committed since this batch's view was taken."""
+        start = self._view_opened_at.get(batch_key, len(self.commit_log))
+        return any(entry.get("process_id") != batch_key[0] for entry in self.commit_log[start:])
+
+    def _open_batch_view(
+        self, scope: _RunScope, batch_key: tuple[str, int | float], *, simultaneous: bool
+    ) -> _BatchView:
+        """Fix what a batch's actors see when it reads from a view (CON-008).
+
+        Normally the run as it stands when the batch begins. When a resumed run
+        re-enters a batch whose first siblings already committed, the view is
+        rebuilt as of the version they recorded, so the remaining actors see
+        exactly what the first ones saw.
+        """
+        self._view_opened_at[batch_key] = len(self.commit_log)
+        current = self.state_store.version if self.state_store else 0
+        recorded = self._recorded_view_version(batch_key, simultaneous=simultaneous)
+        if recorded is None or recorded >= current:
+            return _BatchView(
+                state=self.state_store.snapshot() if self.state_store else dict(scope.state or {}),
+                state_version=current,
+                event_history=tuple(self._event_history),
+                artifact_ids=(
+                    frozenset(self.artifact_store._metadata)
+                    if self.artifact_store is not None
+                    else None
+                ),
+                simultaneous=simultaneous,
+            )
+        # Only persisted events carry a known version; anything this session
+        # committed is later than the recorded view, so it is excluded.
+        versions = self._event_state_versions
+
+        def before_view(event_id: Any) -> bool:
+            version = versions.get(str(event_id))
+            return version is not None and version <= recorded
+
+        return _BatchView(
+            state=self._state_at_version(scope, recorded),
+            state_version=recorded,
+            event_history=tuple(
+                entry for entry in self._event_history if before_view(entry.get("producer_event"))
+            ),
+            artifact_ids=(
+                frozenset(
+                    instance_id
+                    for instance_id, metadata in self.artifact_store._metadata.items()
+                    # An artifact with no producer existed before the run.
+                    if metadata.get("producer_event") is None
+                    or before_view(metadata.get("producer_event"))
+                )
+                if self.artifact_store is not None
+                else None
+            ),
+            simultaneous=simultaneous,
+        )
+
+    def _state_at_version(self, scope: _RunScope, version: int) -> dict[str, Any]:
+        """The committed state at ``version``, read back from persistence."""
+        if version <= 0:
+            if self._initial_state is not None:
+                return copy.deepcopy(self._initial_state)
+            return dict(scope.state or {})
+        history = getattr(self.persistence, "iter_state_history", None)
+        if history is not None:
+            iterator = history(scope.run_id)
+            try:
+                for candidate, snapshot in iterator:
+                    if candidate == version:
+                        return dict(snapshot)
+                    if candidate > version:
+                        break
+            finally:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
+        raise ValueError(
+            f"INFORMATION_TIMING_VIEW_UNAVAILABLE: state version {version} of run "
+            f"'{scope.run_id}' cannot be read to rebuild a simultaneous batch's view"
+        )
+
     def run(
         self,
         run_id: str,
@@ -1959,6 +3699,18 @@ class RunController:
         executed: list[str] = []
         condition = dict(condition or {})
         matching = dict(matching or {})
+        scope = _RunScope(
+            run_id=run_id,
+            seed=seed,
+            seed_identity=seed_identity,
+            experiment_id=experiment_id,
+            condition_id=condition_id,
+            replication=replication,
+            matching=matching,
+            condition=condition,
+            state=state,
+        )
+        self._reopen_interrupted_batches(scope)
         stop_phase = phase_end + 1 if phase_end is not None else phase_limit
         start_phase = max(self._next_phase, phase_start)
         for phase in range(start_phase, stop_phase):
@@ -2002,6 +3754,26 @@ class RunController:
                     )
                     if item.process_id not in executed_this_phase
                 ]
+                # An open simultaneous batch finishes before anything else runs,
+                # and its trigger is not re-evaluated: it was evaluated once, as
+                # the batch began, so a sibling's commit cannot stop the batch
+                # part-way (CON-008).
+                open_batch = next(
+                    (
+                        process_id
+                        for (process_id, batch_phase), open_view in self._batch_views.items()
+                        if open_view.simultaneous
+                        and batch_phase == phase
+                        and process_id not in executed_this_phase
+                        and self._actor_queues.get((process_id, batch_phase))
+                    ),
+                    None,
+                )
+                if open_batch is not None:
+                    ready = [
+                        ScheduledProcess(open_batch, phase),
+                        *(entry for entry in ready if entry.process_id != open_batch),
+                    ]
                 if not ready:
                     break
                 item = ready[0]
@@ -2029,593 +3801,87 @@ class RunController:
                         if self.state_store is not None
                         else (state or {}),
                     )
+                    timing_mode, timing_order = timing_of(process)
+                    if timing_order == "shuffled":
+                        actor_groups = self._activation_order(
+                            scope, item.process_id, phase, actor_groups
+                        )
                     self._actor_queues[actor_key] = [
                         actors
                         for actors in actor_groups
                         if (item.process_id, phase, actors) not in self._completed_actor_occurrences
                     ]
+                    batched = len(actor_groups) > 1 and bool(self._actor_queues[actor_key])
+                    reads_from_view = batched and self._reads_from_view(item.process_id, process)
+                    if batched and (reads_from_view or timing_order == "shuffled"):
+                        self._batch_orders[actor_key] = tuple(actor_groups)
+                    if reads_from_view:
+                        self._batch_views[actor_key] = self._open_batch_view(
+                            scope, actor_key, simultaneous=timing_mode == "simultaneous"
+                        )
                 if not self._actor_queues[actor_key]:
-                    self.scheduler.complete(item.process_id, phase)
+                    self._complete_occurrence(item.process_id, phase)
+                    continue
+                open_view = self._batch_views.get(actor_key)
+                if (
+                    open_view is not None
+                    and not open_view.simultaneous
+                    and self._foreign_commit_since_view(actor_key)
+                ):
+                    # Another process committed part-way through this undeclared
+                    # batch. Actors read live state before batch views existed, so
+                    # the remaining actors see that commit; their own siblings stay
+                    # unseen, because nothing the batch writes reaches its context.
+                    self._batch_views[actor_key] = self._open_batch_view(
+                        scope, actor_key, simultaneous=False
+                    )
+                batch_limit = self._batch_limit(
+                    item.process_id,
+                    actor_key,
+                    partial(
+                        self._scheduling_stable,
+                        item.process_id,
+                        phase,
+                        scheduler_state,
+                        executed_this_phase,
+                    ),
+                )
+                if batch_limit > 1:
+                    template = _ActorTurn(
+                        process_id=item.process_id,
+                        process=process,
+                        phase=phase,
+                        actor_ids=(),
+                        max_attempts=max_attempts,
+                        feedback_slots=feedback_slots,
+                        view=self._batch_views.get(actor_key),
+                    )
+                    if not self._run_batch_concurrently(
+                        scope, actor_key, template, batch_limit, max_events, executed
+                    ):
+                        return executed
+                    self._actor_queues.pop(actor_key, None)
+                    self._batch_views.pop(actor_key, None)
+                    self._batch_orders.pop(actor_key, None)
+                    self._view_opened_at.pop(actor_key, None)
+                    self._complete_occurrence(item.process_id, phase)
                     continue
                 actor_ids = self._actor_queues[actor_key].pop(0)
-                actor_seed_id = "\x1f".join(actor_ids)
-                actor_suffix = f"-{'-'.join(actor_ids)}" if actor_ids else ""
+                turn = _ActorTurn(
+                    process_id=item.process_id,
+                    process=process,
+                    phase=phase,
+                    actor_ids=actor_ids,
+                    max_attempts=max_attempts,
+                    feedback_slots=feedback_slots,
+                    view=self._batch_views.get(actor_key),
+                )
                 for attempt in range(1, max_attempts + 1):
-                    input_refs = process.get("inputs", [])
-                    resolved_inputs = (
-                        self.artifact_store.resolve(
-                            list(input_refs), actor_ids=actor_ids, phase=phase
-                        )
-                        if self.artifact_store is not None and isinstance(input_refs, list | tuple)
-                        else {}
-                    )
-                    binding = process.get("executor", {})
-                    parameters = (
-                        binding.get("parameters", {}) if isinstance(binding, Mapping) else {}
-                    )
-                    stream_id = (
-                        str(parameters.get("random_stream", "conventional"))
-                        if isinstance(parameters, Mapping)
-                        else "conventional"
-                    )
-                    shared_streams = matching.get("shared_streams", [])
-                    matching_key = (
-                        stream_id
-                        if matching.get("enabled") is True
-                        and isinstance(shared_streams, list | tuple)
-                        and stream_id in shared_streams
-                        else None
-                    )
-                    call = ProcessInvocation(
-                        f"{run_id}-{item.process_id}{actor_suffix}-{phase}",
-                        run_id,
-                        item.process_id,
-                        actor_ids=actor_ids,
-                        phase=phase,
-                        state_version=self.state_store.version if self.state_store else 0,
-                        inputs=resolved_inputs,
-                        seed=derive_seed(
-                            seed,
-                            seed_identity or run_id,
-                            item.process_id,
-                            actor_seed_id,
-                            experiment_id=experiment_id,
-                            condition_id=condition_id,
-                            replication=replication,
-                            matching_key=matching_key,
-                        ),
-                        attempt=attempt,
-                        condition=condition,
-                        event_history=tuple(self._event_history),
-                        feedback_slots=feedback_slots,
-                    )
-                    policy_id = process.get("context_policy", "private")
-                    call = ProcessInvocation(
-                        call.invocation_id,
-                        call.run_id,
-                        call.process_id,
-                        call.actor_ids,
-                        call.phase,
-                        call.time,
-                        call.state_version,
-                        call.inputs,
-                        self.context_engine.build(
-                            policy_id,
-                            call,
-                            self.state_store.snapshot()
-                            if self.state_store is not None
-                            else (state or {}),
-                        ),
-                        call.seed,
-                        call.attempt,
-                        process.get("executor", {}),
-                        call.condition,
-                        call.event_history,
-                        call.feedback_slots,
-                    )
-                    dispatch_order = len(self.dispatch_log) + 1
-                    self.dispatch_log.append(
-                        {
-                            "order": dispatch_order,
-                            "invocation_id": call.invocation_id,
-                            "process_id": item.process_id,
-                            "phase": phase,
-                            "attempt": attempt,
-                        }
-                    )
-                    state_before = self.state_store.snapshot() if self.state_store else None
-                    state_version_before = self.state_store.version if self.state_store else 0
-                    artifact_before = (
-                        self.artifact_store.snapshot() if self.artifact_store is not None else None
-                    )
-                    state_applied = False
-                    persistence_committed = False
-                    persistence_attempted = False
-                    failure_persisted = False
-                    executor_returned = False
-                    failure_recorded = False
-                    try:
-                        if self.state_store is not None:
-                            call = ProcessInvocation(
-                                call.invocation_id,
-                                call.run_id,
-                                call.process_id,
-                                call.actor_ids,
-                                call.phase,
-                                call.time,
-                                self.state_store.version,
-                                call.inputs,
-                                self.context_engine.build(
-                                    policy_id,
-                                    call,
-                                    self.state_store.snapshot(),
-                                ),
-                                call.seed,
-                                call.attempt,
-                                call.executor_binding,
-                                call.condition,
-                                call.event_history,
-                                call.feedback_slots,
-                            )
-                        result = self.registry.execute(item.process_id, call)
-                        executor_returned = True
-                        retry_policy = process.get("retry_policy", {})
-                        retry_policy = retry_policy if isinstance(retry_policy, Mapping) else {}
-                        if result.status == "failed":
-                            failure_policy = str(retry_policy.get("failure_policy", "fail_run"))
-                            if failure_policy == "use_declared_fallback" and isinstance(
-                                retry_policy.get("fallback_outputs"), Mapping
-                            ):
-                                result = ProcessResult(
-                                    outputs=dict(retry_policy["fallback_outputs"]),
-                                    metadata={
-                                        **_plain(result.metadata),
-                                        "fallback": True,
-                                        "original_code": result.metadata.get("code"),
-                                    },
-                                )
-                            elif failure_policy == "skip_with_event":
-                                result = ProcessResult(
-                                    status="skipped",
-                                    outputs=dict(retry_policy.get("fallback_outputs", {})),
-                                    metadata={**_plain(result.metadata), "skipped_fallback": True},
-                                )
-                        # F3/SCH-002: every declared artifact output — including a
-                        # fallback — must satisfy its declared schema before any
-                        # state or artifact commit. This is the common
-                        # output-commit boundary, so all executors are covered.
-                        if (
-                            result.status == "succeeded"
-                            and self.output_schema_validator is not None
-                        ):
-                            # F1: the schema comes from the executing process's
-                            # own output declaration (process.outputs[].schema_ref),
-                            # not from a separate domain-artifact id, so a
-                            # process-declared schema is always enforced.
-                            declared_outputs = process.get("outputs") or []
-                            declared_schemas: list[tuple[str, str]] = []
-                            for decl in declared_outputs:
-                                if not isinstance(decl, Mapping):
-                                    continue
-                                artifact_type = decl.get("artifact_type")
-                                schema_ref = decl.get("schema_ref")
-                                if isinstance(artifact_type, str) and isinstance(schema_ref, str):
-                                    declared_schemas.append((artifact_type, schema_ref))
-                            schema_errors: list[str] = []
-                            for artifact_id, schema_ref in declared_schemas:
-                                if artifact_id not in (result.outputs or {}):
-                                    continue
-                                # Normalize frozen mappingproxies to plain
-                                # JSON-able values before schema validation.
-                                schema_value = _plain(result.outputs[artifact_id])
-                                for message in self.output_schema_validator(
-                                    schema_ref, schema_value
-                                ):
-                                    schema_errors.append(f"{artifact_id}: {message}")
-                            if schema_errors:
-                                metadata = dict(_plain(result.metadata))
-                                metadata.update(
-                                    {
-                                        "code": "OUTPUT_VALIDATION_FAILED",
-                                        "schema_valid": False,
-                                        "validation_errors": schema_errors,
-                                    }
-                                )
-                                result = ProcessResult(
-                                    status="failed",
-                                    outputs=result.outputs,
-                                    metadata=metadata,
-                                )
-                        if result.status == "failed":
-                            self.failures.append(
-                                {
-                                    "invocation_id": call.invocation_id,
-                                    "attempt": attempt,
-                                    "error": str(
-                                        result.metadata.get(
-                                            "error", result.metadata.get("code", "process failed")
-                                        )
-                                    ),
-                                    "classification": result.metadata.get(
-                                        "code", "executor_defect"
-                                    ),
-                                }
-                            )
-                            failure_recorded = True
-                            if self.persistence:
-                                persistence_attempted = True
-                                failed_event_id = f"{call.invocation_id}-attempt-{attempt}"
-                                failed_commit_order = len(self.commit_log) + 1
-                                self.persistence.commit_process_result(
-                                    {
-                                        "event_id": failed_event_id,
-                                        "invocation_id": call.invocation_id,
-                                        "run_id": run_id,
-                                        "kind": "process_failed",
-                                        "process_id": item.process_id,
-                                        "actors": list(call.actor_ids),
-                                        "phase": phase,
-                                        "attempt": attempt,
-                                        "dispatch_order": dispatch_order,
-                                        "commit_order": failed_commit_order,
-                                        "metadata": _event_safe_metadata(result.metadata),
-                                        **self._trace_meta(process, call),
-                                        "state_version": self._persisted_count + 1,
-                                        "state_delta": {},
-                                    },
-                                    {
-                                        "run_id": run_id,
-                                        "state_version": self._persisted_count + 1,
-                                        "payload": json.dumps(
-                                            self.state_store.snapshot() if self.state_store else {},
-                                            sort_keys=True,
-                                        ).encode(),
-                                    },
-                                    [],
-                                )
-                                self._persisted_count += 1
-                                self._sync_persisted_state_version()
-                                self._last_event_id = failed_event_id
-                                self.commit_log.append(
-                                    {
-                                        "order": failed_commit_order,
-                                        "invocation_id": call.invocation_id,
-                                        "process_id": item.process_id,
-                                        "phase": phase,
-                                        "status": "failed",
-                                    }
-                                )
-                            self.results.append(result)
-                            if attempt == max_attempts:
-                                self.status = "failed"
-                                raise _ReportedProcessFailure(f"process {item.process_id} failed")
-                            continue
-                        if result.status == "skipped":
-                            if self.persistence:
-                                persistence_attempted = True
-                                skipped_commit_order = len(self.commit_log) + 1
-                                self.persistence.commit_process_result(
-                                    {
-                                        "event_id": f"{call.invocation_id}-attempt-{attempt}",
-                                        "invocation_id": call.invocation_id,
-                                        "run_id": run_id,
-                                        "kind": "process_skipped",
-                                        "process_id": item.process_id,
-                                        "phase": phase,
-                                        "attempt": attempt,
-                                        "dispatch_order": dispatch_order,
-                                        "commit_order": skipped_commit_order,
-                                        "metadata": _event_safe_metadata(result.metadata),
-                                        **self._trace_meta(process, call),
-                                        "state_version": self._persisted_count + 1,
-                                        "state_delta": {},
-                                    },
-                                    {
-                                        "run_id": run_id,
-                                        "state_version": self._persisted_count + 1,
-                                        "payload": json.dumps(
-                                            self.state_store.snapshot() if self.state_store else {},
-                                            sort_keys=True,
-                                        ).encode(),
-                                    },
-                                    [],
-                                )
-                                persistence_committed = True
-                                self._persisted_count += 1
-                                self._sync_persisted_state_version()
-                                self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
-                                self.commit_log.append(
-                                    {
-                                        "order": skipped_commit_order,
-                                        "invocation_id": call.invocation_id,
-                                        "process_id": item.process_id,
-                                        "phase": phase,
-                                        "status": "skipped",
-                                    }
-                                )
-                            self.results.append(result)
-                            break
-                        _validate_scheduling_effects(self.scheduler, result.scheduling_effects)
-                        raw_state_effects = process.get("state_effects", [])
-                        declared: set[str] = set()
-                        for effect_item in raw_state_effects:
-                            if isinstance(effect_item, str):
-                                declared.add(effect_item)
-                            elif isinstance(effect_item, Mapping) and effect_item.get("field"):
-                                declared.add(str(effect_item["field"]))
-                        effects = result.state_effects or {
-                            key: value for key, value in result.outputs.items() if key in declared
-                        }
-                        if self.state_store and effects:
-                            self.state_store.apply(
-                                effects, declared, expected_version=self.state_store.version
-                            )
-                            state_applied = True
-                        declared_artifacts: list[dict[str, Any]] = []
-                        if self.artifact_store is not None:
-                            for artifact_id, value in result.outputs.items():
-                                if artifact_id not in self.artifact_store.catalog:
-                                    continue
-                                catalog = self.artifact_store.catalog[artifact_id]
-                                artifact_instance_id = (
-                                    f"{artifact_id}-{call.invocation_id}-attempt-{attempt}"
-                                )
-                                producer_event = f"{call.invocation_id}-attempt-{attempt}"
-                                consumed_input_ids = sorted(
-                                    self._consumed_input_records(call).keys()
-                                )
-                                self.artifact_store.put(
-                                    artifact_id,
-                                    value,
-                                    owner=catalog.get("owner"),
-                                    schema_ref=catalog.get("schema_ref"),
-                                    visibility=catalog.get("visibility"),
-                                    lifecycle_scope=catalog.get("lifecycle_scope"),
-                                    lineage=consumed_input_ids,
-                                    instance_id=artifact_instance_id,
-                                    actors=call.actor_ids,
-                                    producer_process=item.process_id,
-                                    producer_event=producer_event,
-                                    phase=phase,
-                                )
-                                declared_artifacts.append(
-                                    {
-                                        "artifact_id": artifact_instance_id,
-                                        "run_id": run_id,
-                                        "payload": json.dumps(
-                                            {
-                                                "value": _plain(value),
-                                                "content_hash": _hash(value),
-                                                "schema_ref": catalog.get("schema_ref"),
-                                                "owner": catalog.get("owner"),
-                                                "visibility": catalog.get("visibility"),
-                                                "lifecycle_scope": catalog.get("lifecycle_scope"),
-                                                "producer_event": producer_event,
-                                                "producer_process": item.process_id,
-                                                "declared_artifact_id": artifact_id,
-                                                "invocation_id": call.invocation_id,
-                                                "phase": phase,
-                                                "attempt": attempt,
-                                                "actors": list(call.actor_ids),
-                                                "lineage": consumed_input_ids,
-                                            },
-                                            sort_keys=True,
-                                        ).encode(),
-                                    }
-                                )
-                        if self.persistence:
-                            persistence_attempted = True
-                            trace = process.get("trace_policy", {})
-                            trace = trace if isinstance(trace, Mapping) else {}
-                            storage_outputs = dict(_plain(result.outputs))
-                            omit_provider_bodies = trace.get("record_raw_response", True) is False
-                            storage_metadata = (
-                                _event_safe_metadata(result.metadata)
-                                if omit_provider_bodies
-                                else _plain(result.metadata)
-                            )
-                            if (
-                                omit_provider_bodies
-                                and (process.get("executor", {}).get("mode") == "generative")
-                                and "response" in storage_outputs
-                            ):
-                                storage_outputs["response"] = "<raw-response-not-recorded>"
-                            state_after = self.state_store.snapshot() if self.state_store else None
-                            state_delta = (
-                                self._state_delta(state_before, state_after)
-                                if self.state_store and state_after is not None
-                                else {}
-                            )
-                            payload = json.dumps(
-                                {
-                                    "outputs": storage_outputs,
-                                    "raw_response": storage_metadata.get("raw_response"),
-                                    "parsed_response": _plain(
-                                        storage_metadata.get("parsed_response")
-                                    ),
-                                    "provider_attempts": _plain(
-                                        storage_metadata.get("provider_attempts", [])
-                                    ),
-                                    "process_id": item.process_id,
-                                    "invocation_id": call.invocation_id,
-                                    "phase": phase,
-                                    "attempt": attempt,
-                                    "actors": list(call.actor_ids),
-                                },
-                                sort_keys=True,
-                            ).encode()
-                            state_payload = json.dumps(
-                                state_after if state_after is not None else {},
-                                sort_keys=True,
-                            ).encode()
-                            persist_version = self._persisted_count + 1
-                            self.persistence.commit_process_result(
-                                {
-                                    "event_id": f"{call.invocation_id}-attempt-{attempt}",
-                                    "invocation_id": call.invocation_id,
-                                    "run_id": run_id,
-                                    "kind": "process_completed",
-                                    "process_id": item.process_id,
-                                    "actors": list(call.actor_ids),
-                                    "phase": phase,
-                                    "attempt": attempt,
-                                    "dispatch_order": dispatch_order,
-                                    "commit_order": len(self.commit_log) + 1,
-                                    "events": _plain(result.events),
-                                    "metadata": _event_safe_metadata(result.metadata),
-                                    "scheduling_effects": _plain(result.scheduling_effects),
-                                    **self._trace_meta(process, call),
-                                    "state_version": persist_version,
-                                    "state_delta": state_delta,
-                                },
-                                {
-                                    "run_id": run_id,
-                                    "state_version": persist_version,
-                                    "payload": state_payload,
-                                },
-                                [
-                                    {
-                                        "artifact_id": (f"{call.invocation_id}-attempt-{attempt}"),
-                                        "run_id": run_id,
-                                        "payload": payload,
-                                    },
-                                    *declared_artifacts,
-                                ],
-                            )
-                            persistence_committed = True
-                            self._persisted_count += 1
-                            self._sync_persisted_state_version()
-                            self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
-                        commit_order = len(self.commit_log) + 1
-                        self.commit_log.append(
-                            {
-                                "order": commit_order,
-                                "invocation_id": call.invocation_id,
-                                "process_id": item.process_id,
-                                "phase": phase,
-                            }
-                        )
-                        self._completed_process_events.append(
-                            {
-                                "event_id": f"{call.invocation_id}-attempt-{attempt}",
-                                "process_id": item.process_id,
-                                "phase": phase,
-                                "actors": list(call.actor_ids),
-                            }
-                        )
-                        if state_applied:
-                            self._record_state_writes(
-                                f"{call.invocation_id}-attempt-{attempt}", phase, effects
-                            )
-                        self.results.append(result)
-                        for emitted in result.events:
-                            self._event_history.append(
-                                {
-                                    **_plain(emitted),
-                                    "producer_event": (f"{call.invocation_id}-attempt-{attempt}"),
-                                    "producer_process": item.process_id,
-                                    "actor_ids": list(call.actor_ids),
-                                    "phase": phase,
-                                }
-                            )
-                            event_name = (
-                                emitted.get("type") or emitted.get("kind") or emitted.get("event")
-                            )
-                            if event_name:
-                                self.scheduler.signal_event(str(event_name))
-                        for effect in result.scheduling_effects:
-                            effect_type = effect.get("type")
-                            if effect_type == "signal_event" and effect.get("event"):
-                                self.scheduler.signal_event(str(effect["event"]))
-                            elif effect_type == "schedule":
-                                target = effect.get("process_id")
-                                scheduled_phase = effect.get("phase")
-                                self.scheduler.schedule(
-                                    str(target), cast(int | float, scheduled_phase)
-                                )
+                    call = self._prepare_call(scope, turn, attempt)
+                    dispatch_order = self._log_dispatch(turn, call, attempt)
+                    outcome = self._execute_call(turn, call)
+                    if self._commit_attempt(turn, call, dispatch_order, attempt, outcome):
                         break
-                    except _ReportedProcessFailure:
-                        raise
-                    except Exception as exc:
-                        if state_applied and not persistence_committed and self.state_store:
-                            self.state_store.restore(state_before or {}, state_version_before)
-                        if (
-                            artifact_before is not None
-                            and not persistence_committed
-                            and self.artifact_store is not None
-                        ):
-                            self.artifact_store.restore(artifact_before)
-                        if not failure_recorded:
-                            failure = {
-                                "invocation_id": call.invocation_id,
-                                "attempt": attempt,
-                                "error": str(exc),
-                            }
-                            if not executor_returned:
-                                failure["classification"] = "executor_exception"
-                            self.failures.append(failure)
-                            failure_recorded = True
-                        if not persistence_attempted and self.persistence:
-                            failed_commit_order = len(self.commit_log) + 1
-                            classification = (
-                                "executor_exception" if not executor_returned else "invalid_output"
-                            )
-                            try:
-                                persistence_attempted = True
-                                self.persistence.commit_process_result(
-                                    {
-                                        "event_id": f"{call.invocation_id}-attempt-{attempt}",
-                                        "invocation_id": call.invocation_id,
-                                        "run_id": run_id,
-                                        "kind": "process_failed",
-                                        "process_id": item.process_id,
-                                        "actors": list(call.actor_ids),
-                                        "phase": phase,
-                                        "attempt": attempt,
-                                        "dispatch_order": dispatch_order,
-                                        "commit_order": failed_commit_order,
-                                        "classification": classification,
-                                        "error": str(exc),
-                                        **self._trace_meta(process, call),
-                                        "state_version": self._persisted_count + 1,
-                                        "state_delta": {},
-                                    },
-                                    {
-                                        "run_id": run_id,
-                                        "state_version": self._persisted_count + 1,
-                                        "payload": json.dumps(
-                                            self.state_store.snapshot() if self.state_store else {},
-                                            sort_keys=True,
-                                        ).encode(),
-                                    },
-                                    [],
-                                )
-                            except Exception:
-                                self.status = "failed"
-                                raise
-                            self._persisted_count += 1
-                            self._sync_persisted_state_version()
-                            self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
-                            failure_persisted = True
-                            self.commit_log.append(
-                                {
-                                    "order": failed_commit_order,
-                                    "invocation_id": call.invocation_id,
-                                    "process_id": item.process_id,
-                                    "phase": phase,
-                                    "status": "failed",
-                                }
-                            )
-                        if attempt == max_attempts:
-                            self.status = "failed"
-                            raise
-                        if (
-                            persistence_attempted
-                            and not persistence_committed
-                            and not failure_persisted
-                        ):
-                            self.status = "failed"
-                            raise
                 executed.append(item.process_id)
                 self._event_count += 1
                 if max_events is not None and self._event_count >= max_events:
@@ -2626,7 +3892,10 @@ class RunController:
                     executed_this_phase.discard(item.process_id)
                     continue
                 self._actor_queues.pop(actor_key, None)
-                self.scheduler.complete(item.process_id, phase)
+                self._batch_views.pop(actor_key, None)
+                self._batch_orders.pop(actor_key, None)
+                self._view_opened_at.pop(actor_key, None)
+                self._complete_occurrence(item.process_id, phase)
             self._next_phase = phase + 1
             if self.status in {"cancelled", "paused"}:
                 break

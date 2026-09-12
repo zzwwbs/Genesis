@@ -521,8 +521,17 @@ class AnalysisExporter:
                 f"PARQUET_SCHEMA: {target.name} holds values with incompatible types: {exc}"
             )
 
+        def changed(detail: str) -> ValueError:
+            return ValueError(
+                f"PARQUET_SOURCE_CHANGED: {target.name}: the rows changed between the "
+                f"schema pass and the write pass ({detail}); export again once the source "
+                "is no longer being written"
+            )
+
         schema: Any = None
+        inferred_rows = 0
         for batch in batches():
+            inferred_rows += len(batch)
             names = list(dict.fromkeys(key for row in batch for key in row))
             try:
                 inferred = pa.Table.from_pydict(columns(batch, names)).schema
@@ -543,12 +552,30 @@ class AnalysisExporter:
         writer: Any = None
         try:
             writer = pq.ParquetWriter(temporary, schema)
+            written_rows = 0
             for batch in batches():
+                written_rows += len(batch)
+                # The schema was fixed by the first pass. A source that changed
+                # since -- a run committing while its history is exported -- would
+                # otherwise be silently truncated to that schema or lose columns.
+                names = list(dict.fromkeys(key for row in batch for key in row))
+                unexpected = sorted(set(names) - set(schema.names))
+                if unexpected:
+                    raise changed(f"new columns {unexpected}")
+                try:
+                    inferred = pa.Table.from_pydict(columns(batch, names)).schema
+                    widened = pa.unify_schemas([schema, inferred], promote_options="permissive")
+                except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+                    raise changed(f"incompatible values: {exc}") from exc
+                if not widened.equals(schema):
+                    raise changed("a column's values changed type")
                 try:
                     table = pa.Table.from_pydict(columns(batch, schema.names), schema=schema)
                 except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
                     raise refused(exc) from exc
                 writer.write_table(table)
+            if written_rows != inferred_rows:
+                raise changed(f"{inferred_rows} rows inferred, {written_rows} written")
             writer.close()
             writer = None
             os.replace(temporary, target)

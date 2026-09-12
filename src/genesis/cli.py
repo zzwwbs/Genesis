@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -49,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         "import": "Import local data",
         "doctor": "Check local service prerequisites",
         "backup": "Back up the local database",
+        "gc": "Report unreferenced object files; remove them with --apply",
         "integrity-check": "Verify a compiled build",
     }.items():
         command = subparsers.add_parser(name, help=help_text)
@@ -85,6 +87,19 @@ def build_parser() -> argparse.ArgumentParser:
                 metavar="FACTOR=VALUE",
                 help="Branchable factor override (branch mode; repeatable)",
             )
+        if name == "gc":
+            command.add_argument(
+                "--apply", action="store_true", help="Remove the unreferenced object files"
+            )
+        if name == "run":
+            command.add_argument(
+                "--max-concurrency",
+                action="append",
+                default=None,
+                dest="max_concurrency",
+                metavar="N|PROFILE=N",
+                help="Concurrent model calls: N for every profile, or PROFILE=N (repeatable)",
+            )
         if name == "export":
             command.add_argument(
                 "--mode",
@@ -93,6 +108,32 @@ def build_parser() -> argparse.ArgumentParser:
                 help="Bundle capability level",
             )
     return parser
+
+
+def _max_concurrency(values: list[str] | None) -> int | dict[str, int] | None:
+    """Parse ``--max-concurrency`` values; ranges and profiles are checked by the
+    service before the run is created (CON-003)."""
+    if not values:
+        return None
+    shared: int | None = None
+    per_profile: dict[str, int] = {}
+    for value in values:
+        profile, separator, number = value.rpartition("=")
+        # Plain digits only: int() would also accept "4_0" and " 4".
+        if not re.fullmatch(r"[0-9]+", number):
+            raise SystemExit(f"--max-concurrency expects N or PROFILE=N, got '{value}'")
+        limit = int(number)
+        if separator:
+            if profile in per_profile:
+                raise SystemExit(f"--max-concurrency sets '{profile}' more than once")
+            per_profile[profile] = limit
+        elif shared is not None:
+            raise SystemExit("--max-concurrency N may be given only once")
+        else:
+            shared = limit
+    if shared is not None and per_profile:
+        raise SystemExit("--max-concurrency takes either N or PROFILE=N entries, not both")
+    return shared if shared is not None else per_profile
 
 
 def _replay(service: Any, run_id: str, args: Any) -> dict[str, Any]:
@@ -217,6 +258,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(json.dumps(service.doctor()))
         finally:
             service.close()
+    elif args.command == "gc":
+        from genesis.service import GenesisService
+
+        service = GenesisService(args.path)
+        try:
+            print(json.dumps(service.collect_garbage(apply=bool(args.apply))))
+        finally:
+            service.close()
     elif args.command == "backup":
         if not args.output:
             raise SystemExit("backup requires --output")
@@ -243,14 +292,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         run_id = args.run_id or "run-1"
         try:
             if args.command == "run":
+                # The override is parsed and fully validated -- range and profiles --
+                # before the run is created, so a rejected value never leaves a stray
+                # run behind under the (default) run id.
+                max_concurrency = _max_concurrency(getattr(args, "max_concurrency", None))
+                existing: dict[str, Any] | None
                 try:
-                    service.get_run(run_id)
+                    existing = service.get_run(run_id)
                 except KeyError:
-                    payload = {"id": run_id}
-                    if args.output:
-                        payload["build"] = args.output
+                    existing = None
+                payload: dict[str, Any] = dict(existing) if existing else {"id": run_id}
+                if existing is None and args.output:
+                    payload["build"] = args.output
+                try:
+                    service.validate_execution_options(payload, max_concurrency=max_concurrency)
+                except ValueError as exc:
+                    raise SystemExit(str(exc)) from None
+                if existing is None:
                     service.create_run(payload)
-                result = service.execute_run(run_id)
+                result = service.execute_run(run_id, max_concurrency=max_concurrency)
             elif args.command == "status":
                 result = service.get_run(run_id)
             elif args.command in {"pause", "resume", "cancel"}:

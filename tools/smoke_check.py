@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import yaml
 
@@ -23,7 +23,7 @@ ROUNDS = 3
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 
 
-def fail(message: str) -> None:
+def fail(message: str) -> NoReturn:
     raise SystemExit(f"smoke check failed: {message}")
 
 
@@ -52,7 +52,6 @@ def genesis(*args: str) -> dict[str, Any]:
         result: dict[str, Any] = json.loads(lines[-1])
     except json.JSONDecodeError:
         fail(f"`genesis {command}` did not print JSON: {lines[-1][:200]}")
-        raise
     return result
 
 

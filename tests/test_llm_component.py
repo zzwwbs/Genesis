@@ -169,7 +169,11 @@ def test_model_profile_status_reports_key_presence_without_revealing_value(
     response = client.get("/llm/profiles/openai-default/status")
 
     assert response.status_code == 200
-    assert response.json() == {"id": "openai-default", "credential_present": True}
+    assert response.json() == {
+        "id": "openai-default",
+        "credential_present": True,
+        "credential_required": True,
+    }
     assert "secret-value" not in response.text
 
 

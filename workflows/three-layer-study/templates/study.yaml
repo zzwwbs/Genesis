@@ -1,2 +1,11 @@
 schema_version: '1.0'
 study_id: '{{study_id}}'
+# The study foundation names the research object and its provenance.
+#
+# title: Governance and peer visibility in an attention market
+# description: >-
+#   One or two sentences stating the research question in substantive terms.
+# owners: [researcher-name]
+# source_citations: [Author 2024]
+# artifact_refs: []              # data assets the package carries, by id
+# package_compatibility: {min_genesis_version: '1.0'}

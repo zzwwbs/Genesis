@@ -7,9 +7,14 @@ implement the same request/response dataclasses later.
 from __future__ import annotations
 
 import hashlib
+import http.client
+import io
 import json
+import math
 import os
+import random
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -17,11 +22,72 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
-from genesis.runtime import ProcessInvocation, ProcessResult
+from genesis.runtime import ProcessInvocation, ProcessResult, _plain
 from genesis.schema_validation import SchemaDiagnostic
 from genesis.schema_validation import validate_schema as _authoritative_validate_schema
+
+# Failures worth retrying: the request was well-formed but the provider could not
+# serve it now. Anything else in 4xx describes the request itself, so repeating
+# it only repeats the error (CON-001).
+# 425 asks for a replay (RFC 8470); 520-524 are gateway failures in front of an
+# origin (e.g. Cloudflare); 529 is a provider reporting itself overloaded.
+TRANSIENT_HTTP_STATUSES = frozenset(
+    {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
+)
+DEFAULT_MAX_RETRIES = 3
+BACKOFF_BASE_SECONDS = 1.0
+BACKOFF_CAP_SECONDS = 60.0
+
+
+def _retry_after_seconds(value: str | None, now: datetime | None = None) -> float | None:
+    """Seconds a ``Retry-After`` header asks for, or ``None`` when unusable.
+
+    The header is either delay-seconds or an HTTP date (RFC 9110 §10.2.3).
+    """
+    if value is None or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = None
+    if seconds is not None:
+        # "nan" and "inf" parse as floats but ask for no usable wait; backing off
+        # with jitter is safer than retrying at once or waiting the whole cap.
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    try:
+        moment = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return max(0.0, (moment - (now or datetime.now(UTC))).total_seconds())
+
+
+def retry_wait(
+    retry_number: int,
+    retry_after: str | None,
+    *,
+    base: float = BACKOFF_BASE_SECONDS,
+    cap: float = BACKOFF_CAP_SECONDS,
+    rng: random.Random | None = None,
+) -> float:
+    """How long to wait before retry ``retry_number`` (1-based).
+
+    A provider's own ``Retry-After`` wins, capped. Otherwise exponential backoff
+    with full jitter, so concurrent callers that failed together do not retry
+    together. The jitter only moves *when* a request is sent; it never enters a
+    prompt, a seed or a recorded answer, so it cannot change results.
+    """
+    requested = _retry_after_seconds(retry_after)
+    if requested is not None:
+        return min(cap, requested)
+    ceiling = min(cap, base * 2 ** max(0, retry_number - 1))
+    return (rng or random).uniform(0.0, ceiling)
 
 
 @dataclass(frozen=True)
@@ -32,6 +98,109 @@ class ProviderRequest:
     context_hash: str | None = None
     artifact_id: str | None = None
     process_id: str | None = None
+    # Standing instructions sent as a system message, when a template declares
+    # them; ``prompt`` is then the user message.
+    system: str | None = None
+
+    def content_digest(self) -> str:
+        """Digest of what was sent: the prompt, plus the system message if any."""
+        material = self.prompt if self.system is None else f"{self.system}\x1e{self.prompt}"
+        return hashlib.sha256(material.encode()).hexdigest()
+
+
+# ``[system]`` and ``[user]`` alone on a line split a template into messages.
+_ROLE_MARKER = re.compile(r"^\[(system|user)\][ \t\r]*$", re.MULTILINE)
+# ``{context.<path>}`` renders one part of the authorised context in place.
+_CONTEXT_SLOT = re.compile(r"\{context\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)\}")
+# Every placeholder a template may carry, matched in one pass.
+_PLACEHOLDER = re.compile(
+    r"\{context\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)\}|\{context\}|\{actor_ids\}|\{phase\}"
+)
+
+
+def _json_text(value: Any) -> str:
+    """JSON a model can read: non-finite numbers as null rather than NaN.
+
+    ``json.dumps`` emits bare ``NaN`` and ``Infinity``, which are not JSON, so a
+    prompt that promised JSON carried something no strict parser accepts.
+    """
+
+    def finite(item: Any) -> Any:
+        if isinstance(item, float) and (item != item or item in (float("inf"), float("-inf"))):
+            return None
+        if isinstance(item, Mapping):
+            return {key: finite(entry) for key, entry in item.items()}
+        if isinstance(item, list | tuple):
+            return [finite(entry) for entry in item]
+        return item
+
+    return json.dumps(finite(value), sort_keys=True, default=str, ensure_ascii=False)
+
+
+def split_prompt_roles(template: str) -> tuple[str | None, str]:
+    """Split a template into ``(system, user)``; a template without markers is all user.
+
+    Raises ``ValueError`` for text before the first marker, a repeated role, or
+    no user section, so a malformed template never silently sends its
+    instructions in the wrong message.
+    """
+    markers = list(_ROLE_MARKER.finditer(template))
+    if not markers:
+        return None, template
+    if template[: markers[0].start()].strip():
+        raise ValueError("PROMPT_TEMPLATE: text before the first [system] or [user] marker")
+    sections: dict[str, str] = {}
+    for index, marker in enumerate(markers):
+        role = marker.group(1)
+        if role in sections:
+            raise ValueError(f"PROMPT_TEMPLATE: the [{role}] section is declared twice")
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(template)
+        sections[role] = template[marker.end() : end].strip("\n")
+    if "user" not in sections:
+        raise ValueError("PROMPT_TEMPLATE: a template with role markers needs a [user] section")
+    if not sections["user"].strip():
+        # An empty user message is sent as an empty message: the instructions
+        # sit in the system section and the model is asked nothing.
+        raise ValueError("PROMPT_TEMPLATE: the [user] section is empty")
+    return sections.get("system"), sections["user"]
+
+
+def render_prompt(
+    template: str, context: Any, actor_ids: Sequence[str], phase: Any
+) -> tuple[str | None, str]:
+    """Render a template into ``(system, user)`` messages.
+
+    ``{context}`` is the whole authorised context as JSON, exactly as before;
+    ``{context.<path>}`` is one part of it -- text as text, anything else as
+    JSON -- so a template can lay out sections in its own order.
+    """
+    system, user = split_prompt_roles(template)
+    context = _plain(context)
+    whole = _json_text(context)
+
+    def fill(text: str) -> str:
+        def replace(match: re.Match[str]) -> str:
+            placeholder = match.group(0)
+            if placeholder == "{context}":
+                return whole
+            if placeholder == "{actor_ids}":
+                return ", ".join(actor_ids)
+            if placeholder == "{phase}":
+                return str(phase)
+            value: Any = context
+            for part in match.group(1).split("."):
+                value = value.get(part) if isinstance(value, Mapping) else None
+            if isinstance(value, str):
+                return value
+            return _json_text(value)
+
+        # One pass over the template. Substituting and then scanning the result
+        # again rewrote placeholders that appeared inside a value: an actor's own
+        # text containing {actor_ids} was replaced in the prompt, and one
+        # containing {context} inlined the whole context where it stood.
+        return _PLACEHOLDER.sub(replace, text)
+
+    return (fill(system) if system is not None else None), fill(user)
 
 
 @dataclass(frozen=True)
@@ -61,6 +230,10 @@ class ModelProvider(Protocol):
 
 class ProviderExecutor:
     """Adapt a provider response to the runtime result contract with trace metadata."""
+
+    # Safe to run concurrently (CON-011): execution reads only the invocation and
+    # this executor's fixed configuration, and all per-call state is local.
+    concurrent_safe = True
 
     def __init__(
         self,
@@ -130,6 +303,25 @@ class ProviderExecutor:
                     total[key] = total.get(key, 0) + value
         return total
 
+    @staticmethod
+    def _attempt_record(response: ProviderResponse, prompt_hash: str) -> dict[str, Any]:
+        """What one provider call cost and returned, including its retries.
+
+        Transient failures the provider retried internally are part of what the
+        attempt spent, so they are kept with it rather than dropped (CON-001).
+        """
+        record: dict[str, Any] = {
+            "request_id": response.request_id,
+            "prompt_hash": prompt_hash,
+            "usage": dict(response.usage),
+            "raw_response": response.text,
+            "parsed_response": response.parsed,
+        }
+        retries = response.metadata.get("retries")
+        if retries:
+            record["retries"] = [dict(item) for item in retries]
+        return record
+
     def _outputs(self, value: Any) -> dict[str, Any]:
         outputs = {self.output_key: value}
         if self.mode == "generative" and self.output_key != "response":
@@ -138,10 +330,8 @@ class ProviderExecutor:
 
     def execute(self, invocation: ProcessInvocation) -> ProcessResult:
         context_value = getattr(invocation.context, "data", invocation.context)
-        context = json.dumps(context_value, sort_keys=True, default=str)
-        prompt = self.prompt_template.replace("{context}", context)
-        prompt = prompt.replace("{actor_ids}", ", ".join(invocation.actor_ids)).replace(
-            "{phase}", str(invocation.phase)
+        system, prompt = render_prompt(
+            self.prompt_template, context_value, invocation.actor_ids, invocation.phase
         )
         request = ProviderRequest(
             model=self.model,
@@ -149,24 +339,17 @@ class ProviderExecutor:
             parameters=self.parameters,
             context_hash=getattr(invocation.context, "content_hash", None),
             process_id=getattr(invocation, "process_id", None),
+            system=system,
         )
         self._raise_if_cancelled()
         started = time.perf_counter()
         response = self.provider.generate(request)
-        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        prompt_hash = request.content_digest()
         # Each attempt records the prompt that produced it and what it cost. A
         # repair sends a DIFFERENT prompt, so one prompt hash and the last
         # response's usage describe neither what was actually sent nor what was
         # actually spent.
-        provider_attempts = [
-            {
-                "request_id": response.request_id,
-                "prompt_hash": prompt_hash,
-                "usage": dict(response.usage),
-                "raw_response": response.text,
-                "parsed_response": response.parsed,
-            }
-        ]
+        provider_attempts = [self._attempt_record(response, prompt_hash)]
         latency_ms = (time.perf_counter() - started) * 1000
         value = response.parsed if response.parsed is not None else response.text
         if self.output_schema is not None:
@@ -184,22 +367,21 @@ class ProviderExecutor:
                 request = ProviderRequest(
                     model=self.model,
                     prompt=repair_prompt,
+                    system=system,
                     parameters=self.parameters,
                     context_hash=getattr(invocation.context, "content_hash", None),
                     process_id=getattr(invocation, "process_id", None),
                 )
                 response = self.provider.generate(request)
-                provider_attempts.append(
-                    {
-                        "request_id": response.request_id,
-                        "prompt_hash": hashlib.sha256(repair_prompt.encode()).hexdigest(),
-                        "usage": dict(response.usage),
-                        "raw_response": response.text,
-                        "parsed_response": response.parsed,
-                    }
-                )
+                # The same digest scheme as the first attempt, so every attempt's
+                # recorded hash identifies what was actually sent, system
+                # message included.
+                provider_attempts.append(self._attempt_record(response, request.content_digest()))
                 value = response.parsed if response.parsed is not None else response.text
                 errors = self._schema_messages(value)
+                # The accepted response came from the repair, so the invocation's
+                # prompt hash must identify that request, not the discarded one.
+                prompt_hash = request.content_digest()
             latency_ms = (time.perf_counter() - started) * 1000
             metadata: dict[str, Any] = {
                 "mode": self.mode,
@@ -264,11 +446,14 @@ class DeterministicMockProvider:
         return max(1, len(request.prompt.split()))
 
     def generate(self, request: ProviderRequest) -> ProviderResponse:
-        canonical = json.dumps(
-            {"model": request.model, "prompt": request.prompt, "parameters": request.parameters},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        described: dict[str, Any] = {
+            "model": request.model,
+            "prompt": request.prompt,
+            "parameters": request.parameters,
+        }
+        if request.system is not None:
+            described["system"] = request.system
+        canonical = json.dumps(described, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(canonical.encode()).hexdigest()
         text = f"mock:{digest[:16]}"
         return ProviderResponse(
@@ -346,7 +531,10 @@ class AnswerPoolProvider:
             # pool, so a new process does not stop a pooled run dead.
             answers = [item for values in self._pool.values() for item in values]
             group = "*"
-        key = "|".join([str(self._seed), group, str(request.context_hash or ""), request.prompt])
+        parts = [str(self._seed), group, str(request.context_hash or ""), request.prompt]
+        if request.system is not None:
+            parts.append(request.system)
+        key = "|".join(parts)
         digest = hashlib.sha256(key.encode()).hexdigest()
         return digest, answers[int(digest, 16) % len(answers)]
 
@@ -380,6 +568,22 @@ class AnswerPoolProvider:
         )
 
 
+def _transient_connection_error(exc: BaseException) -> bool:
+    """Whether a connection-level failure could succeed if simply repeated.
+
+    A certificate the client refuses will be refused again, so retrying it only
+    delays the report. Timeouts, resets and refused connections can clear.
+    """
+    if isinstance(exc, http.client.InvalidURL):
+        return False  # a malformed URL stays malformed
+    reason = getattr(exc, "reason", exc)
+    return not isinstance(reason, ssl.SSLCertVerificationError)
+
+
+def _after_retries(retries: Sequence[Mapping[str, Any]]) -> str:
+    return f" after {len(retries)} retries" if retries else ""
+
+
 class OpenAICompatibleProvider:
     """Small adapter for providers implementing OpenAI Chat Completions."""
 
@@ -394,6 +598,9 @@ class OpenAICompatibleProvider:
         api_key: str | None = None,
         timeout: float = 60.0,
         cancel_event: threading.Event | None = None,
+        max_retries: int | None = DEFAULT_MAX_RETRIES,
+        backoff_base: float = BACKOFF_BASE_SECONDS,
+        backoff_cap: float = BACKOFF_CAP_SECONDS,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -401,6 +608,11 @@ class OpenAICompatibleProvider:
         self.api_key = api_key
         self.timeout = timeout
         self.cancel_event = cancel_event
+        self.max_retries = max(0, int(DEFAULT_MAX_RETRIES if max_retries is None else max_retries))
+        self.backoff_base = float(backoff_base)
+        self.backoff_cap = float(backoff_cap)
+        # Unseeded on purpose: jitter decides only when a retry is sent.
+        self._jitter = random.Random()
 
     def capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -446,6 +658,24 @@ class OpenAICompatibleProvider:
     def estimate_tokens(self, request: ProviderRequest) -> int:
         return max(1, len(request.prompt.split()))
 
+    def _back_off(
+        self, retries: list[dict[str, Any]], *, status: int | str, retry_after: str | None
+    ) -> None:
+        """Record a transient failure and wait before retrying it.
+
+        The wait is cancellable: a researcher pausing or cancelling a run is not
+        held behind a provider's ``Retry-After``.
+        """
+        number = len(retries) + 1
+        wait = retry_wait(
+            number, retry_after, base=self.backoff_base, cap=self.backoff_cap, rng=self._jitter
+        )
+        retries.append({"retry": number, "status": status, "wait_seconds": round(wait, 3)})
+        if self.cancel_event is None:
+            time.sleep(wait)
+        elif self.cancel_event.wait(wait):
+            raise ValueError("PROVIDER_CANCELLED: provider request aborted by researcher")
+
     def _open_cancellable(self, http_request: Any) -> tuple[bytes, int]:
         """Open the request, aborting the wait when the researcher cancels.
 
@@ -461,6 +691,21 @@ class OpenAICompatibleProvider:
             try:
                 with urllib.request.urlopen(http_request, timeout=self.timeout) as response:
                     box.append((response.read(), getattr(response, "status", 200)))
+            except urllib.error.HTTPError as exc:
+                # Read the error body here, inside the cancellable wait. Read on
+                # the caller's thread, a stalled body blocked past cancellation,
+                # and a failed read escaped retry handling as a bare error.
+                try:
+                    body = exc.read()
+                except (OSError, http.client.HTTPException, ValueError):
+                    body = b""
+                finally:
+                    exc.close()
+                box.append(
+                    urllib.error.HTTPError(
+                        exc.filename or "", exc.code, exc.msg, exc.headers, io.BytesIO(body)
+                    )
+                )
             except Exception as exc:  # surfaced by the caller
                 box.append(exc)
             finally:
@@ -483,12 +728,16 @@ class OpenAICompatibleProvider:
                 f"PROVIDER_CREDENTIAL: credential unavailable; set {self.api_key_env} "
                 "or store an api_key on the model profile"
             )
+        messages = [{"role": "user", "content": request.prompt}]
+        if request.system is not None:
+            messages.insert(0, {"role": "system", "content": request.system})
         payload = {
             "model": request.model or self.model,
-            "messages": [{"role": "user", "content": request.prompt}],
+            "messages": messages,
             **request.parameters,
         }
         degraded_parameters: list[str] = []
+        retries: list[dict[str, Any]] = []
         attempts = 0
         while True:
             body = json.dumps(payload, separators=(",", ":")).encode()
@@ -505,7 +754,18 @@ class OpenAICompatibleProvider:
             try:
                 raw, status = self._open_cancellable(http_request)
             except urllib.error.HTTPError as exc:
-                detail = exc.read().decode(errors="replace")[:2000]  # for parameter repair
+                try:
+                    detail = exc.read().decode(errors="replace")[:2000]  # for parameter repair
+                except (OSError, http.client.HTTPException, ValueError):
+                    detail = ""
+                if exc.code in TRANSIENT_HTTP_STATUSES and len(retries) < self.max_retries:
+                    headers = exc.headers
+                    self._back_off(
+                        retries,
+                        status=exc.code,
+                        retry_after=headers.get("Retry-After") if headers is not None else None,
+                    )
+                    continue
                 if attempts == 0:
                     fixed = self._unsupported_parameter_fix(payload, detail)
                     if fixed is not None:
@@ -524,10 +784,18 @@ class OpenAICompatibleProvider:
                 # govern it; the full body stays on the chained exception.
                 summary = " ".join(detail.split())[:200]
                 raise ValueError(
-                    f"PROVIDER_HTTP: provider returned HTTP {exc.code}: {summary}"
+                    f"PROVIDER_HTTP: provider returned HTTP {exc.code}"
+                    f"{_after_retries(retries)}: {summary}"
                 ) from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                raise ValueError(f"PROVIDER_UNAVAILABLE: provider request failed: {exc}") from exc
+            # HTTPException covers responses broken mid-flight (IncompleteRead,
+            # BadStatusLine), which are not OSErrors.
+            except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
+                if len(retries) < self.max_retries and _transient_connection_error(exc):
+                    self._back_off(retries, status="unavailable", retry_after=None)
+                    continue
+                raise ValueError(
+                    f"PROVIDER_UNAVAILABLE: provider request failed{_after_retries(retries)}: {exc}"
+                ) from exc
             if not 200 <= status < 300:
                 raise ValueError(f"PROVIDER_HTTP: provider returned HTTP {status}")
             break
@@ -561,6 +829,7 @@ class OpenAICompatibleProvider:
             metadata={
                 "base_url": self.base_url,
                 **({"degraded_parameters": degraded_parameters} if degraded_parameters else {}),
+                **({"retries": retries} if retries else {}),
             },
         )
 

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import statistics
 import tempfile
@@ -34,6 +35,7 @@ from genesis.elicitation import (
     ElicitationSessionStore,
     PatchPreviewService,
     WorkflowRegistry,
+    attribute_specification_error,
     completion_checks,
     require_completion_rules,
 )
@@ -51,6 +53,8 @@ from genesis.evidence import (
 )
 from genesis.execution_manifest import (
     canonical_json,
+    executor_code_digest,
+    executor_code_reference,
     resolve_execution_manifest,
     scientific_config_digest,
 )
@@ -63,6 +67,7 @@ from genesis.outcome_plan import (
 )
 from genesis.persistence import ObjectRef, PersistenceCoordinator
 from genesis.providers import (
+    DEFAULT_MAX_RETRIES,
     AnswerPoolProvider,
     OpenAICompatibleProvider,
     ProviderExecutor,
@@ -514,6 +519,10 @@ def _resolve_callable(reference: str | None) -> Any:
     if not reference or ":" not in reference:
         raise ValueError("EXECUTOR_UNAVAILABLE: function reference must use module:attribute form")
     module_name, _, attribute = reference.partition(":")
+    if not all(part.isidentifier() for part in module_name.split(".")):
+        # A relative or malformed module name raised a bare TypeError from the
+        # import machinery, which named neither the reference nor the contract.
+        raise ValueError(f"EXECUTOR_UNAVAILABLE: '{reference}' does not name an importable module")
     try:
         import importlib
 
@@ -523,6 +532,87 @@ def _resolve_callable(reference: str | None) -> Any:
         raise ValueError(
             f"EXECUTOR_UNAVAILABLE: cannot resolve function reference '{reference}'"
         ) from exc
+
+
+def _executor_code_identity(processes: Iterable[Any]) -> dict[str, dict[str, Any]]:
+    """Source identity of the study code a build's processes run.
+
+    Computational and stochastic executors name ``module:attribute`` code that
+    lives outside the package, so the build hash does not pin it: the rules a
+    study runs on could change while the build and run record stayed the same.
+    Each such process is recorded with the digest of the module file the
+    reference names (modules that file imports are not covered). The module
+    file is hashed, not wherever the attribute happens to be defined, so the
+    digest describes what the package points at. A reference that does not
+    resolve is recorded with no digest; the run then fails as it always did,
+    unless an override supplies the executor.
+    """
+    identity: dict[str, dict[str, Any]] = {}
+    for process in processes:
+        if not isinstance(process, Mapping):
+            continue
+        reference = executor_code_reference(process)
+        if not reference:
+            continue
+        try:
+            digest = _module_source_digest(reference.partition(":")[0])
+        except Exception:  # noqa: BLE001 - a package must not break manifest building
+            digest = None
+        identity[str(process.get("id"))] = {"reference": reference, "source_sha256": digest}
+    return identity
+
+
+def _module_source_digest(module_name: str) -> str | None:
+    """Digest of the source a ``module:attribute`` reference names, or None.
+
+    The file is found by walking ``sys.path`` rather than by importing, because
+    importing runs code: locating ``pkg.mod`` through the import system executes
+    ``pkg/__init__.py``, so merely building a manifest ran a study's module-level
+    code, and a package that raised aborted the run.
+
+    A reference naming a package covers every module under it. A package's
+    ``__init__.py`` is usually re-exports, so hashing it alone left the file that
+    actually defines the executor unpinned: editing it changed no digest, and a
+    resumed run or a replay was accepted under different rules.
+    """
+    import sys
+
+    parts = module_name.split(".")
+    if not all(part.isidentifier() for part in parts):
+        return None
+    for entry in sys.path:
+        root = Path(entry or ".")
+        target = root.joinpath(*parts)
+        if (target / "__init__.py").is_file():
+            files = sorted(path for path in target.rglob("*.py") if path.is_file())
+            digest = hashlib.sha256()
+            for path in files:
+                digest.update(str(path.relative_to(target)).encode())
+                digest.update(b"\0")
+                digest.update(path.read_bytes())
+            return digest.hexdigest()
+        module_file = target.with_suffix(".py")
+        if module_file.is_file():
+            return hashlib.sha256(module_file.read_bytes()).hexdigest()
+    return None
+
+
+def _changed_executor_code(
+    frozen: Mapping[str, Any], current: Mapping[str, Mapping[str, Any]]
+) -> list[str]:
+    """Processes whose frozen, resolved study code no longer matches."""
+    changed: list[str] = []
+    for process_id, record in frozen.items():
+        if not isinstance(record, Mapping) or not record.get("source_sha256"):
+            continue
+        now = current.get(str(process_id))
+        if (
+            now is None
+            or now.get("reference") != record.get("reference")
+            or now.get("source_sha256") != record.get("source_sha256")
+        ):
+            changed.append(str(process_id))
+    return sorted(changed)
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -580,6 +670,111 @@ def _check_profile_drift(
             f"MODEL_PROFILE_DRIFT: runtime profile '{profile_id}' differs from the "
             f"compiled package on: {', '.join(mismatches)} (build {build_hash[:12]})"
         )
+
+
+# Operational profile settings describe how a run talks to a provider, never what
+# it asks. They sit beside ``parameters`` rather than inside it: ``parameters`` is
+# sent in every request body and compared for drift, and neither applies to how
+# many calls run at once or how often a busy provider is retried (CON-002).
+OPERATIONAL_PROFILE_FIELDS = ("max_concurrency", "max_retries")
+# Every field a stored model profile may carry, across provider kinds. A payload
+# naming anything else -- a typo such as "time_out" -- is refused rather than
+# accepted with the intended setting silently left at its default (M15).
+MODEL_PROFILE_FIELDS = frozenset(
+    {
+        "id",
+        "provider",
+        "model",
+        "parameters",
+        "version",
+        "base_url",
+        "api_key_env",
+        "api_key",
+        "timeout",
+        "pool",
+        "seed",
+        "echo",
+        *OPERATIONAL_PROFILE_FIELDS,
+    }
+)
+
+
+def _refuse_unknown_profile_fields(payload: Mapping[str, Any]) -> None:
+    unknown = sorted(set(payload) - MODEL_PROFILE_FIELDS)
+    if unknown:
+        raise ValueError(f"INVALID_FIELD: unsupported model profile field(s): {', '.join(unknown)}")
+
+
+MAX_CONCURRENCY_LIMIT = 64
+MAX_RETRIES_LIMIT = 10
+
+
+def _bounded_int(value: Any, code: str, name: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{code}: {name} must be an integer between {minimum} and {maximum}")
+    return int(value)
+
+
+def _operational_profile_fields(
+    payload: Mapping[str, Any], *, supports_retries: bool
+) -> dict[str, Any]:
+    """Validated operational settings for a model profile (CON-002)."""
+    parameters = payload.get("parameters")
+    if isinstance(parameters, Mapping):
+        misplaced = sorted(set(parameters) & set(OPERATIONAL_PROFILE_FIELDS))
+        if misplaced:
+            raise ValueError(
+                f"MODEL_PARAMETERS: {', '.join(misplaced)} are operational settings; set "
+                "them on the profile itself, because parameters are sent to the provider"
+            )
+    # ``None`` resets a field to its default, so an update can clear it.
+    concurrency = payload.get("max_concurrency")
+    retries = payload.get("max_retries")
+    fields: dict[str, Any] = {
+        "max_concurrency": _bounded_int(
+            1 if concurrency is None else concurrency,
+            "MAX_CONCURRENCY",
+            "max_concurrency",
+            1,
+            MAX_CONCURRENCY_LIMIT,
+        )
+    }
+    # Validated even where it does not apply, so a malformed value is refused
+    # rather than silently discarded.
+    checked_retries = _bounded_int(
+        DEFAULT_MAX_RETRIES if retries is None else retries,
+        "MODEL_RETRIES",
+        "max_retries",
+        0,
+        MAX_RETRIES_LIMIT,
+    )
+    if supports_retries:
+        fields["max_retries"] = checked_retries
+    return fields
+
+
+def _concurrency_override(value: Any) -> int | dict[str, int] | None:
+    """Normalize a per-run ``max_concurrency`` override (CON-003).
+
+    One integer applies to every model profile the run uses; a mapping sets it
+    per profile and leaves the others at their profile's own value.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        override: dict[str, int] = {}
+        for profile_id, limit in value.items():
+            if not isinstance(profile_id, str) or not profile_id:
+                raise ValueError("MAX_CONCURRENCY: override keys must be model profile ids")
+            override[profile_id] = _bounded_int(
+                limit,
+                "MAX_CONCURRENCY",
+                f"max_concurrency for '{profile_id}'",
+                1,
+                MAX_CONCURRENCY_LIMIT,
+            )
+        return override
+    return _bounded_int(value, "MAX_CONCURRENCY", "max_concurrency", 1, MAX_CONCURRENCY_LIMIT)
 
 
 def _replayed_result(record: Mapping[str, Any], *, source_run_id: str, process_id: str) -> Any:
@@ -839,6 +1034,17 @@ class GenesisService:
         )
         self._patch_preview = PatchPreviewService(self)
         self.last_outcome_engine = "python"
+        # Runs executing in this process. A run is executed by one caller at a
+        # time; a second concurrent call is refused rather than duplicating the
+        # run's work and provider spend.
+        self._executing_runs: set[str] = set()
+        self._executing_lock = threading.Lock()
+        # The profile store is read, modified and rewritten as a whole; concurrent
+        # API requests would otherwise lose or corrupt each other's writes (M4).
+        self._profiles_lock = threading.RLock()
+        # Temporary files an interrupted write left behind; recent ones may belong
+        # to a writer in another process, so only old ones are removed.
+        self.persistence.object_store.cleanup_orphans(older_than=3600.0)
 
     def register_extension(
         self,
@@ -1047,12 +1253,21 @@ class GenesisService:
 
     def _save_model_profiles(self, profiles: Mapping[str, Mapping[str, Any]]) -> None:
         path = self._model_profiles_path()
-        temporary = path.with_name(f".{path.name}.tmp")
-        temporary.write_text(json.dumps(dict(profiles), indent=2, sort_keys=True) + "\n")
-        # A profile may hold a pasted API key, so the file is owner-only rather
-        # than whatever the umask allows.
-        temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        os.replace(temporary, path)
+        # A unique temporary name: one shared name let two writers interleave on
+        # the same file and replace each other's half-written store (M4).
+        handle, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        try:
+            with os.fdopen(handle, "w") as stream:
+                stream.write(json.dumps(dict(profiles), indent=2, sort_keys=True) + "\n")
+            # A profile may hold a pasted API key, so the file is owner-only rather
+            # than whatever the umask allows.
+            os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+            os.replace(temporary, path)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
 
     @staticmethod
     def _validate_model_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1101,6 +1316,7 @@ class GenesisService:
                 "seed": seed,
                 "echo": dict(echo),
                 "parameters": dict(parameters),
+                **_operational_profile_fields(payload, supports_retries=False),
                 "version": int(payload.get("version", 1)),
             }
         if provider_kind != "openai-compatible":
@@ -1132,6 +1348,7 @@ class GenesisService:
             "api_key_env": api_key_env,
             "parameters": dict(parameters),
             "timeout": timeout,
+            **_operational_profile_fields(payload, supports_retries=True),
             "version": int(payload.get("version", 1)),
         }
         if api_key is not None:
@@ -1161,48 +1378,77 @@ class GenesisService:
         return self._public_model_profile(profile)
 
     def create_model_profile(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        _refuse_unknown_profile_fields(payload)
         profile = self._validate_model_profile(payload)
-        profiles = self._load_model_profiles()
-        if profile["id"] in profiles:
-            raise ValueError(f"ALREADY_EXISTS: model profile '{profile['id']}' already exists")
-        profiles[profile["id"]] = profile
-        self._save_model_profiles(profiles)
+        with self._profiles_lock:
+            profiles = self._load_model_profiles()
+            if profile["id"] in profiles:
+                raise ValueError(f"ALREADY_EXISTS: model profile '{profile['id']}' already exists")
+            profiles[profile["id"]] = profile
+            self._save_model_profiles(profiles)
         return self._public_model_profile(profile)
 
     def update_model_profile(
         self, profile_id: str, payload: Mapping[str, Any], expected_version: int
     ) -> dict[str, Any]:
-        profiles = self._load_model_profiles()
-        current = profiles.get(profile_id)
-        if current is None:
-            raise KeyError(profile_id)
-        if current.get("version") != expected_version:
-            raise ValueError(
-                f"EXPECTED_VERSION: expected {expected_version}, found {current.get('version')}"
-            )
-        candidate = {**current, **dict(payload), "id": profile_id, "version": expected_version + 1}
-        profile = self._validate_model_profile(candidate)
-        profiles[profile_id] = profile
-        self._save_model_profiles(profiles)
+        _refuse_unknown_profile_fields(payload)
+        with self._profiles_lock:
+            profiles = self._load_model_profiles()
+            current = profiles.get(profile_id)
+            if current is None:
+                raise KeyError(profile_id)
+            if current.get("version") != expected_version:
+                raise ValueError(
+                    f"EXPECTED_VERSION: expected {expected_version}, found {current.get('version')}"
+                )
+            candidate = {
+                **current,
+                **dict(payload),
+                "id": profile_id,
+                "version": expected_version + 1,
+            }
+            profile = self._validate_model_profile(candidate)
+            profiles[profile_id] = profile
+            self._save_model_profiles(profiles)
         return self._public_model_profile(profile)
 
     def model_profile_status(self, profile_id: str) -> dict[str, Any]:
         profile = self._full_model_profile(profile_id)
+        if profile.get("provider") == "answer-pool":
+            # A local pool needs no credential; reporting a missing one, or failing
+            # on the absent credential fields, misdescribed a valid profile (M14).
+            return {"id": profile_id, "credential_present": True, "credential_required": False}
         return {
             "id": profile_id,
             "credential_present": bool(
-                profile.get("api_key") or os.environ.get(str(profile["api_key_env"]))
+                profile.get("api_key") or os.environ.get(str(profile.get("api_key_env") or ""))
             ),
+            "credential_required": True,
         }
 
     def test_model_profile(self, profile_id: str, prompt: str = "Reply with OK.") -> dict[str, Any]:
         profile = self._full_model_profile(profile_id)
+        if profile.get("provider") == "answer-pool":
+            pooled = self._answer_pool_provider(profile).generate(
+                ProviderRequest(model=str(profile["model"]), prompt=prompt, parameters={})
+            )
+            return {
+                "id": profile_id,
+                "provider": pooled.provider,
+                "model": pooled.model,
+                "request_id": pooled.request_id,
+                "text": pooled.text,
+                "usage": pooled.usage,
+            }
         provider = OpenAICompatibleProvider(
             base_url=str(profile["base_url"]),
             model=str(profile["model"]),
             api_key_env=str(profile["api_key_env"]),
             api_key=profile.get("api_key"),
             timeout=float(profile["timeout"]),
+            # A connectivity check reports what the provider says now; retrying
+            # would hold the request open behind a busy provider's Retry-After.
+            max_retries=0,
         )
         response = provider.generate(
             ProviderRequest(
@@ -1636,18 +1882,29 @@ class GenesisService:
     ) -> dict[str, Any]:
         """LLM-mediated elicitation: propose a draft payload without writing it (AST-006)."""
         profiles = self._load_model_profiles()
-        if not profiles:
+        # Drafting needs a live model; an answer-pool profile replays recorded
+        # answers for runs, so it is never picked as the default assistant (M14).
+        live = sorted(
+            pid for pid, item in profiles.items() if item.get("provider") != "answer-pool"
+        )
+        if not live and profile_id is None:
             raise ValueError("MODEL_PROFILE: no model profile configured for the assistant")
-        profile_id = profile_id or sorted(profiles)[0]
+        profile_id = profile_id or live[0]
         configured = profiles.get(profile_id)
         if configured is None:
             raise KeyError(profile_id)
+        if configured.get("provider") == "answer-pool":
+            raise ValueError(
+                f"MODEL_PROFILE: answer-pool profile '{profile_id}' cannot act as the "
+                "assistant; choose an openai-compatible profile"
+            )
         provider = OpenAICompatibleProvider(
             base_url=str(configured["base_url"]),
             model=str(configured["model"]),
             api_key_env=str(configured["api_key_env"]),
             api_key=configured.get("api_key"),
             timeout=float(configured.get("timeout", 60)),
+            max_retries=int(configured.get("max_retries", DEFAULT_MAX_RETRIES)),
         )
         response = provider.generate(
             ProviderRequest(
@@ -1936,10 +2193,16 @@ class GenesisService:
         }
         protocol: dict[str, Any] = {}
         build_manifest: dict[str, Any] = {}
+        code_identity: dict[str, dict[str, Any]] = {}
         build_ref = run.get("build") or run.get("build_path")
         if build_ref:
             build_path = self.resolve_path(build_ref)
             build_manifest = json.loads((build_path / "build_manifest.json").read_text())
+            processes_path = build_path / "processes.json"
+            if processes_path.is_file():
+                code_identity = _executor_code_identity(json.loads(processes_path.read_text()))
+            if code_identity:
+                manifest["executor_code"] = code_identity
             manifest["study_id"] = build_manifest.get("study_id")
             manifest["build_hash"] = build_manifest.get("build_hash")
             # Exact package identity: the compile-time StudyBuild record, never
@@ -2054,6 +2317,7 @@ class GenesisService:
                 model_configuration_digest=model_configuration_digest,
                 outcome_plan_digest=str(manifest.get("outcome_plan_digest", "")),
                 origin_experiment_id=run.get("experiment_id"),
+                executor_code_digest=executor_code_digest(code_identity),
             )
             manifest["execution"] = execution
             manifest["scientific_config_digest"] = scientific_config_digest(execution)
@@ -2337,6 +2601,7 @@ class GenesisService:
                     api_key=configured.get("api_key"),
                     timeout=float(configured.get("timeout", 60)),
                     cancel_event=cancel_event,
+                    max_retries=int(configured.get("max_retries", DEFAULT_MAX_RETRIES)),
                 )
             prompt_ref = process.get("prompt_ref")
             prompt_template = (
@@ -2348,6 +2613,13 @@ class GenesisService:
                 **dict(configured.get("parameters", {})),
                 **dict(profile.get("parameters", {})),
             }
+            misplaced = sorted(set(parameters) & set(OPERATIONAL_PROFILE_FIELDS))
+            if misplaced:
+                # These would be sent to the provider as request fields (CON-002).
+                raise ValueError(
+                    f"MODEL_PARAMETERS: profile '{profile_id}' declares operational settings "
+                    f"in parameters: {', '.join(misplaced)}"
+                )
             output_schema = None
             output_schema_validator = None
             output_key = "response"
@@ -2391,11 +2663,53 @@ class GenesisService:
         return executors
 
     def execute_run(
-        self, run_id: str, *, executor_overrides: Mapping[str, Any] | None = None
+        self,
+        run_id: str,
+        *,
+        executor_overrides: Mapping[str, Any] | None = None,
+        max_concurrency: int | Mapping[str, int] | None = None,
     ) -> dict[str, Any]:
+        run = self.get_run(run_id)
+        # A malformed override is refused before the run changes state -- even for
+        # a completed run, which would otherwise ignore it -- so a typo never leaves
+        # a run marked failed or passes unnoticed (CON-003).
+        override = self.validate_execution_options(run, max_concurrency=max_concurrency)
+        if run["status"] == "completed":
+            return run
+        with self._executing_lock:
+            if run_id in self._executing_runs:
+                raise ValueError(
+                    f"RUN_ALREADY_EXECUTING: run '{run_id}' is already executing in this process"
+                )
+            self._executing_runs.add(run_id)
+        try:
+            return self._execute_claimed_run(
+                run_id, executor_overrides=executor_overrides, max_concurrency=override
+            )
+        finally:
+            with self._executing_lock:
+                self._executing_runs.discard(run_id)
+
+    def _execute_claimed_run(
+        self,
+        run_id: str,
+        *,
+        executor_overrides: Mapping[str, Any] | None,
+        max_concurrency: int | dict[str, int] | None,
+    ) -> dict[str, Any]:
+        """Execute a run this process has claimed (see ``execute_run``).
+
+        A run still marked ``running`` here is not executing in this process --
+        the claim would have refused it -- so its last execution either was
+        resumed through a status change or ended without recording an outcome
+        (a crashed or killed process). It is resumed, and the execution record
+        says which status it was resumed from.
+        """
         run = self.get_run(run_id)
         if run["status"] == "completed":
             return run
+        if run["status"] not in {"created", "paused", "running"}:
+            raise ValueError(f"RUN_TRANSITION: cannot execute run in {run['status']} status")
         # Operational preflight happens before the state transition so a denied
         # dispatch never leaves the run persisted as "running" (finding 7).
         try:
@@ -2406,22 +2720,183 @@ class GenesisService:
             raise ValueError(
                 f"OPERATIONS_BLOCKED: disk space below dispatch threshold ({usage.free} free)"
             )
-        if run["status"] == "paused":
+        resumed_from = str(run["status"])
+        # Everything that can fail before execution -- the frozen build no longer
+        # matching, a missing or unreadable build -- is checked before the run
+        # becomes "running", so such a failure leaves the run as it was.
+        self._check_build_unchanged(run)
+        self._check_executor_code_unchanged(run)
+        manifest = None
+        if run.get("manifest") is None and resumed_from != "running":
+            manifest = self._build_run_manifest(run)
+        if resumed_from in {"created", "paused"}:
             run = self.persistence.transition_run(run_id, "running", run["version"])
-        elif run["status"] == "created":
-            run = self.persistence.transition_run(run_id, "running", run["version"])
-        elif run["status"] != "running":
-            raise ValueError(f"RUN_TRANSITION: cannot execute run in {run['status']} status")
-        if run.get("manifest") is None:
-            run = self.persistence.attach_run_manifest(run_id, self._build_run_manifest(run))
-
         try:
-            return self._dispatch_run(run_id, run, executor_overrides=executor_overrides)
+            if run.get("manifest") is None:
+                run = self.persistence.attach_run_manifest(
+                    run_id, manifest if manifest is not None else self._build_run_manifest(run)
+                )
+            return self._dispatch_run(
+                run_id,
+                run,
+                executor_overrides=executor_overrides,
+                max_concurrency=max_concurrency,
+                resumed_from=resumed_from if resumed_from != "created" else None,
+            )
         except Exception:
             latest = self.get_run(run_id)
             if latest["status"] == "running":
                 self.persistence.transition_run(run_id, "failed", latest["version"])
             raise
+
+    def _check_build_unchanged(self, run: Mapping[str, Any]) -> None:
+        """Refuse to continue a run whose build no longer matches its frozen manifest.
+
+        The manifest pins the build a run started with; replacing the build at
+        the same path would otherwise resume the run under a different protocol
+        while its record still names the original build.
+        """
+        manifest = run.get("manifest")
+        build_ref = run.get("build") or run.get("build_path")
+        if not isinstance(manifest, Mapping) or not build_ref or not manifest.get("build_hash"):
+            return
+        build_manifest = self.resolve_path(build_ref) / "build_manifest.json"
+        current = json.loads(build_manifest.read_text()).get("build_hash")
+        if current != manifest["build_hash"]:
+            raise ValueError(
+                f"RUN_BUILD_CHANGED: run '{run['id']}' was frozen against build "
+                f"{str(manifest['build_hash'])[:12]}, but {build_ref} now holds build "
+                f"{str(current)[:12]}; restore that build or start a new run"
+            )
+
+    @staticmethod
+    def _check_executor_code_pinned(
+        run: Mapping[str, Any],
+        processes: Iterable[Any],
+        executor_overrides: Mapping[str, Any] | None,
+    ) -> None:
+        """Refuse to run study code that nothing pins.
+
+        A reference whose source could not be located is recorded without a
+        digest, and a record without one is skipped by the change check for
+        ever. The code still ran: a module that becomes importable later -- one
+        a path change brings into view -- executed with nothing to compare it
+        against, and no RUN_CODE_CHANGED could ever fire for it.
+        """
+        overridden = set(executor_overrides or {})
+        unpinned = sorted(
+            str(process.get("id"))
+            for process in processes
+            if isinstance(process, Mapping)
+            and executor_code_reference(process)
+            and str(process.get("id")) not in overridden
+            and not _module_source_digest(str(executor_code_reference(process)).partition(":")[0])
+        )
+        if unpinned:
+            raise ValueError(
+                f"RUN_CODE_UNPINNED: run '{run.get('id')}' would run study code whose source "
+                f"could not be located for {', '.join(unpinned)}; make the module importable "
+                "from a file, or supply the executor directly"
+            )
+
+    def _check_executor_code_unchanged(self, run: Mapping[str, Any]) -> None:
+        """Refuse to continue a run whose study code changed since it was frozen.
+
+        A resumed run would otherwise finish under different distribution,
+        settlement or selection rules while its manifest still records the
+        code it started with.
+        """
+        manifest = run.get("manifest")
+        build_ref = run.get("build") or run.get("build_path")
+        frozen = manifest.get("executor_code") if isinstance(manifest, Mapping) else None
+        if not isinstance(frozen, Mapping) or not frozen or not build_ref:
+            return
+        processes = json.loads((self.resolve_path(build_ref) / "processes.json").read_text())
+        changed = _changed_executor_code(frozen, _executor_code_identity(processes))
+        if changed:
+            raise ValueError(
+                f"RUN_CODE_CHANGED: run '{run['id']}' was frozen against different study "
+                f"code for {', '.join(changed)}; restore that code or start a new run"
+            )
+
+    def validate_execution_options(
+        self,
+        run: Mapping[str, Any],
+        *,
+        max_concurrency: int | Mapping[str, int] | None = None,
+    ) -> int | dict[str, int] | None:
+        """Check a run's execution options without touching the run (CON-003).
+
+        Shared by ``execute_run`` and by callers, such as the CLI, that must refuse
+        a bad value before creating the run it would apply to. ``run`` may be a
+        stored run or the payload a run is about to be created from.
+        """
+        override = _concurrency_override(max_concurrency)
+        if isinstance(override, dict) and override:
+            self._check_override_profiles(run, override)
+        return override
+
+    def _check_override_profiles(self, run: Mapping[str, Any], override: Mapping[str, int]) -> None:
+        """Refuse a per-profile override that could not affect the run.
+
+        A profile the build does not declare is a mistake; one it declares but no
+        process uses would be accepted, recorded and silently have no effect.
+        """
+        build_ref = run.get("build") or run.get("build_path")
+        declared: set[str] = set()
+        used: set[str] = set()
+        if build_ref:
+            build_path = self.resolve_path(build_ref)
+            profiles_path = build_path / "model_profiles.json"
+            if profiles_path.is_file():
+                declared = {
+                    str(profile.get("id"))
+                    for profile in json.loads(profiles_path.read_text())
+                    if isinstance(profile, dict)
+                }
+            processes_path = build_path / "processes.json"
+            if processes_path.is_file():
+                for process in json.loads(processes_path.read_text()):
+                    binding = process.get("executor") if isinstance(process, dict) else None
+                    if isinstance(binding, dict) and isinstance(binding.get("model_profile"), str):
+                        used.add(binding["model_profile"])
+        unknown = sorted(set(override) - declared)
+        if unknown:
+            raise ValueError(
+                "MAX_CONCURRENCY: override names model profiles this run's build does not "
+                f"declare: {', '.join(unknown)}"
+            )
+        unused = sorted(set(override) - used)
+        if unused:
+            raise ValueError(
+                "MAX_CONCURRENCY: override names model profiles no process in this run's "
+                f"build uses, so it would have no effect: {', '.join(unused)}"
+            )
+
+    def _effective_concurrency(
+        self, profile_ids: Iterable[str], override: int | Mapping[str, int] | None
+    ) -> dict[str, dict[str, Any]]:
+        """The concurrency each model profile runs at in this execution, and why."""
+        resolved: dict[str, dict[str, Any]] = {}
+        for profile_id in sorted(profile_ids):
+            if isinstance(override, int):
+                resolved[profile_id] = {"max_concurrency": override, "source": "override"}
+                continue
+            if isinstance(override, Mapping) and profile_id in override:
+                resolved[profile_id] = {
+                    "max_concurrency": int(override[profile_id]),
+                    "source": "override",
+                }
+                continue
+            try:
+                configured = self._full_model_profile(profile_id)
+            except KeyError:
+                continue
+            resolved[profile_id] = {
+                "max_concurrency": int(configured.get("max_concurrency", 1)),
+                "source": "profile",
+            }
+        return resolved
 
     def _dispatch_run(
         self,
@@ -2429,6 +2904,8 @@ class GenesisService:
         run: Mapping[str, Any],
         *,
         executor_overrides: Mapping[str, Any] | None = None,
+        max_concurrency: int | Mapping[str, int] | None = None,
+        resumed_from: str | None = None,
     ) -> dict[str, Any]:
         cancel_event = threading.Event()
 
@@ -2452,6 +2929,7 @@ class GenesisService:
             build_path = self.resolve_path(build_ref)
             StudyCompiler.verify_build(build_path)
             processes = json.loads((build_path / "processes.json").read_text())
+            self._check_executor_code_pinned(run, processes, executor_overrides)
             model_profiles_path = build_path / "model_profiles.json"
             model_profiles = {
                 profile["id"]: profile
@@ -2519,6 +2997,29 @@ class GenesisService:
             cancel_event=cancel_event,
         )
         registry = ExecutorRegistry(executors)
+        concurrency_by_process: dict[str, int] = {}
+        execution_recorded = False
+        if build_ref and (model_profiles or resumed_from):
+            model_concurrency = self._effective_concurrency(model_profiles, max_concurrency)
+            # Recorded beside the manifest, not in it: how many calls ran at once
+            # is operational, and a resumed run may use a different value without
+            # becoming a different experiment (CON-003).
+            self.persistence.record_run_execution(
+                run_id,
+                {
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "model_concurrency": model_concurrency,
+                    **({"resumed_from_status": resumed_from} if resumed_from else {}),
+                },
+            )
+            execution_recorded = True
+            for process in processes:
+                binding = process.get("executor")
+                profile_id = binding.get("model_profile") if isinstance(binding, Mapping) else None
+                if isinstance(profile_id, str) and profile_id in model_concurrency:
+                    concurrency_by_process[str(process["id"])] = int(
+                        model_concurrency[profile_id]["max_concurrency"]
+                    )
         state_store = StateStore(state_schema, initial_state) if build_ref else None
         artifact_store = ArtifactStore(artifact_catalog) if build_ref else None
         # F3/SCH-002: schema enforcement at the common output-commit boundary.
@@ -2558,6 +3059,8 @@ class GenesisService:
             artifact_store=artifact_store,
             status_provider=_status_provider,
             output_schema_validator=output_schema_validator,
+            max_concurrency=concurrency_by_process,
+            cancel_event=cancel_event,
         )
         try:
             # F5: randomness derives from the ROOT source's experiment,
@@ -2594,19 +3097,44 @@ class GenesisService:
                 matching=dict(protocol.get("matching", {})) if build_ref else {},
             )
         except Exception:
+            if execution_recorded:
+                self._record_execution_outcome(run_id, controller)
             latest = self.get_run(run_id)
             if latest["status"] == "running":
                 self.persistence.transition_run(run_id, "failed", latest["version"])
             raise
+        if execution_recorded:
+            self._record_execution_outcome(run_id, controller)
         self._record_process_instances(run_id, controller)
         latest = self.get_run(run_id)
         if controller.status == "cancelled":
+            # The cancel that stopped the controller was usually persisted by the
+            # caller already; cancelled is final, so it is not transitioned again.
+            if latest["status"] == "cancelled":
+                return latest
             return self.persistence.transition_run(run_id, "cancelled", latest["version"])
         if controller.status == "paused":
             if latest["status"] == "paused":
                 return latest
             return self.persistence.transition_run(run_id, "paused", latest["version"])
         return self.persistence.transition_run(run_id, "completed", latest["version"])
+
+    def _record_execution_outcome(self, run_id: str, controller: Any) -> None:
+        """Add how each batched process ran, and any discarded calls (CON-013, CON-015)."""
+        outcome: dict[str, Any] = {}
+        if controller.execution_decisions:
+            outcome["processes"] = dict(controller.execution_decisions)
+        if controller.discarded_calls.get("calls"):
+            outcome["discarded_calls"] = dict(controller.discarded_calls)
+        if not outcome:
+            return
+        try:
+            self.persistence.update_latest_run_execution(run_id, outcome)
+        except Exception:  # noqa: BLE001 - operational metadata only
+            # This record describes how the run executed, not what it produced;
+            # failing to write it must neither mask the run's own error nor turn
+            # a completed or paused run into a failed one.
+            return
 
     def _record_process_instances(self, run_id: str, controller: Any) -> None:
         """Persist ProcessInstance rows derivable from dispatch/commit logs (AW-15)."""
@@ -3671,6 +4199,21 @@ class GenesisService:
         build_path = self.resolve_path(build_ref)
         StudyCompiler.verify_build(build_path)
         processes = json.loads((build_path / "processes.json").read_text())
+        # Every non-artifact replay re-executes study code live. Doing so under
+        # code other than the source run's would present a different model as a
+        # replay of the recorded one.
+        source_manifest = source.get("manifest")
+        frozen_code = (
+            source_manifest.get("executor_code") if isinstance(source_manifest, Mapping) else None
+        )
+        if isinstance(frozen_code, Mapping) and frozen_code:
+            changed_code = _changed_executor_code(frozen_code, _executor_code_identity(processes))
+            if changed_code:
+                raise ValueError(
+                    "REPLAY_CODE_CHANGED: the study code for "
+                    f"{', '.join(changed_code)} differs from the code source run "
+                    f"'{run_id}' ran; restore it to replay that run"
+                )
         process_ids = {str(process["id"]) for process in processes}
         dependency_map = {
             str(process["id"]): list(process.get("dependencies", {}).get("after", []))
@@ -4407,12 +4950,18 @@ class GenesisService:
 
     @staticmethod
     def _retention_purges_raw(processes: list[Mapping[str, Any]]) -> bool:
+        return bool(GenesisService._purging_processes(processes))
+
+    @staticmethod
+    def _purging_processes(processes: list[Mapping[str, Any]]) -> set[str]:
+        """Ids of processes whose trace policy declares a raw-response purge."""
+        purging: set[str] = set()
         for process in processes:
             trace = process.get("trace_policy", {})
             retention = trace.get("retention") if isinstance(trace, Mapping) else None
             if isinstance(retention, str) and "purge" in retention:
-                return True
-        return False
+                purging.add(str(process.get("id")))
+        return purging
 
     @staticmethod
     def _redact_raw_responses(value: Any) -> Any:
@@ -4431,12 +4980,18 @@ class GenesisService:
 
     def _elicitation_provider(self, profile_id: str) -> Any:
         profile = self._full_model_profile(profile_id)
+        if profile.get("provider") == "answer-pool":
+            raise ValueError(
+                f"MODEL_PROFILE: answer-pool profile '{profile_id}' cannot act as the "
+                "assistant; choose an openai-compatible profile"
+            )
         return OpenAICompatibleProvider(
             base_url=str(profile["base_url"]),
             model=str(profile["model"]),
             api_key_env=str(profile.get("api_key_env") or "OPENAI_API_KEY"),
             api_key=profile.get("api_key"),
             timeout=float(profile.get("timeout", 60)),
+            max_retries=int(profile.get("max_retries", DEFAULT_MAX_RETRIES)),
         )
 
     def _approved_upstream_projections(self, session: Any) -> dict[str, str]:
@@ -4733,43 +5288,56 @@ class GenesisService:
             self._elicitation_store.put_assistant_attempts(session.session_id, exc.attempts)
             raise ValueError(str(exc)) from exc
         session.last_assistant_attempts = attempts
-        turn = self._elicitation_engine.record_researcher_answer(
-            session,
-            answer=effective_answer,
-            response_mode=effective_mode,  # type: ignore[arg-type]
-            question=session.current_question,
-            suggestions=suggestions,
-        )
-        self._elicitation_store.set_answer_metadata(
-            session.session_id, turn.id, provider_name, getattr(response, "model", None)
-        )
-        self._elicitation_store.put_turn_evaluation(session.session_id, turn.id, evaluation)
-        session = self._merge_decision_coverage(session.session_id, stage, evaluation)
-        remaining = self._remaining_required_decisions(session, stage)
-        if not remaining:
-            self._elicitation_engine.transition(
-                session, "awaiting_approval", stage_status="draft_ready"
-            )
-            return self.get_elicitation(session_id)
-
-        if evaluation.status == "needs_clarification":
-            question = evaluation.next_question or evaluation.ambiguities[0].question
-            next_suggestions = evaluation.next_suggestions or (
-                evaluation.ambiguities[0].suggestions if evaluation.ambiguities else ()
-            )
-            self._elicitation_engine.transition(
+        # Recording the answer spans several saves. If any later step fails, the
+        # session is restored, so a retry records the answer once instead of
+        # leaving a phantom turn and then adding a second (M17).
+        before = session.model_copy(deep=True)
+        try:
+            turn = self._elicitation_engine.record_researcher_answer(
                 session,
-                "awaiting_answer",
-                stage_status="clarifying",
-                question=question,
-                suggestions=tuple((s.label, s.value) for s in next_suggestions),
+                answer=effective_answer,
+                response_mode=effective_mode,  # type: ignore[arg-type]
+                question=session.current_question,
+                suggestions=suggestions,
             )
-            self._elicitation_store.append_asked_question(session.session_id, stage.id, question)
-            return self.get_elicitation(session_id)
-        raise ValueError(
-            "ASSISTANT_DECISION_INVALID: assistant reported readiness while required "
-            "decisions remain unresolved: " + ", ".join(remaining)
-        )
+            self._elicitation_store.set_answer_metadata(
+                session.session_id, turn.id, provider_name, getattr(response, "model", None)
+            )
+            self._elicitation_store.put_turn_evaluation(session.session_id, turn.id, evaluation)
+            session = self._merge_decision_coverage(session.session_id, stage, evaluation)
+            remaining = self._remaining_required_decisions(session, stage)
+            if not remaining:
+                self._elicitation_engine.transition(
+                    session, "awaiting_approval", stage_status="draft_ready"
+                )
+                return self.get_elicitation(session_id)
+
+            if evaluation.status == "needs_clarification":
+                question = evaluation.next_question or evaluation.ambiguities[0].question
+                next_suggestions = evaluation.next_suggestions or (
+                    evaluation.ambiguities[0].suggestions if evaluation.ambiguities else ()
+                )
+                self._elicitation_engine.transition(
+                    session,
+                    "awaiting_answer",
+                    stage_status="clarifying",
+                    question=question,
+                    suggestions=tuple((s.label, s.value) for s in next_suggestions),
+                )
+                self._elicitation_store.append_asked_question(
+                    session.session_id, stage.id, question
+                )
+                return self.get_elicitation(session_id)
+            raise ValueError(
+                "ASSISTANT_DECISION_INVALID: assistant reported readiness while required "
+                "decisions remain unresolved: " + ", ".join(remaining)
+            )
+
+        except Exception:
+            self._elicitation_store.update(
+                session_id, lambda stored: stored.__dict__.update(before.__dict__)
+            )
+            raise
 
     def _merge_decision_coverage(self, session_id: str, stage: Any, evaluation: Any) -> Any:
         def _mutate(stored: Any) -> None:
@@ -5180,7 +5748,10 @@ class GenesisService:
             form["id"] = session.specification_id
             validation = self._inspect_current_package(session)
             if validation["errors"]:
-                raise ValueError(f"SPECIFICATION_INVALID: {validation['errors'][0]['message']}")
+                raise ValueError(
+                    "SPECIFICATION_INVALID: "
+                    + attribute_specification_error(validation["errors"][0], workflow, stage)
+                )
             updated = self.update_specification(session.specification_id, form, current["version"])
         else:
             if session.pending_patch is None or session.pending_preview is None:
@@ -5229,7 +5800,22 @@ class GenesisService:
             preview = self.preview_elicitation_stage(session_id)["pending_preview"]
             if preview.get("validation", {}).get("errors"):
                 first = preview["validation"]["errors"][0]
-                raise ValueError(f"SPECIFICATION_INVALID: {first.get('message')}")
+                raise ValueError(
+                    "SPECIFICATION_INVALID: "
+                    + attribute_specification_error(first, workflow, stage)
+                )
+            # The preview already compiles the candidate, but only cross-layer
+            # validation gated approval, so a package could be approved complete
+            # and still fail to compile. An intermediate stage cannot compile --
+            # later layers are not elicited yet -- so this applies at the final
+            # stage, where the package is meant to be whole.
+            compile_errors = preview.get("validation", {}).get("compile_errors") or []
+            if compile_errors and workflow.next_stage(session.current_stage) is None:
+                first = compile_errors[0]
+                raise ValueError(
+                    "SPECIFICATION_INVALID: the package does not compile: "
+                    + attribute_specification_error(first, workflow, stage)
+                )
             checks = completion_checks(
                 checklist_state=preview.get("validation", {}).get("checklist", {}),
                 checklist_items=stage.checklist_items,
@@ -5396,25 +5982,21 @@ class GenesisService:
             .as_dict()
         )
         issues = report.get("issues", []) if isinstance(report, dict) else []
+
+        def _entry(item: Mapping[str, Any]) -> dict[str, Any]:
+            # The normalized assistant issue carries json_pointer/source_file;
+            # reading 'path' alone lost the location, so every refusal arrived
+            # without saying which layer it came from.
+            return {
+                "code": item.get("code"),
+                "path": item.get("path") or item.get("json_pointer") or "",
+                "source_file": item.get("source_file") or "",
+                "message": item.get("message", ""),
+            }
+
         return {
-            "errors": [
-                {
-                    "code": item.get("code"),
-                    "path": item.get("path", ""),
-                    "message": item.get("message", ""),
-                }
-                for item in issues
-                if item.get("severity") == "error"
-            ],
-            "warnings": [
-                {
-                    "code": item.get("code"),
-                    "path": item.get("path", ""),
-                    "message": item.get("message", ""),
-                }
-                for item in issues
-                if item.get("severity") == "warning"
-            ],
+            "errors": [_entry(item) for item in issues if item.get("severity") == "error"],
+            "warnings": [_entry(item) for item in issues if item.get("severity") == "warning"],
         }
 
     def _require_expected_version(self, session_id: str, expected_version: Any) -> None:
@@ -5677,10 +6259,18 @@ class GenesisService:
             return {"run_id": run_id, "purged_rows": 0, "policy": "none"}
         build_path = self.resolve_path(build_ref)
         processes = json.loads((build_path / "processes.json").read_text())
-        if not self._retention_purges_raw(processes):
+        purging = self._purging_processes(processes)
+        if not purging:
             return {"run_id": run_id, "purged_rows": 0, "policy": "retain"}
-        purged = self.persistence.retention_purge(run_id)
-        return {"run_id": run_id, "purged_rows": purged, "policy": "purge"}
+        # Only the declaring processes' artifacts are redacted, and only their raw
+        # responses: one purging process must not strip every artifact in the run.
+        purged = self.persistence.retention_purge(run_id, purging)
+        return {
+            "run_id": run_id,
+            "purged_rows": purged,
+            "policy": "purge",
+            "processes": sorted(purging),
+        }
 
     def export_preview(self, run_id: str) -> dict[str, Any]:
         """List exported content and enumerate sensitive classes before writing (AW-20)."""
@@ -5758,6 +6348,15 @@ class GenesisService:
         """Write all bundle members for one run into a prepared directory."""
         run = self.get_run(run_id)
         outcomes = self.evaluate_outcomes(run_id)
+        retention_build = run.get("build") or run.get("build_path")
+        if retention_build:
+            processes_file = self.resolve_path(retention_build) / "processes.json"
+            if processes_file.is_file() and self._retention_purges_raw(
+                json.loads(processes_file.read_text())
+            ):
+                # Outcomes are computed from full evidence, so the raw-response
+                # fields redacted from events and artifacts are redacted here too.
+                outcomes = GenesisService._redact_raw_responses(outcomes)
         result_paths = AnalysisExporter().export_bundle(
             outcomes,
             destination,
@@ -5934,6 +6533,8 @@ class GenesisService:
             has_recorded_outputs=retained_records,
             has_checkpoint_evidence=False,
             has_outcomes=bool(outcomes),
+            # The bundle records which study code the run ran, never its bytes.
+            has_executor_code=not manifest.get("executor_code"),
         )
         source_run_id = str(manifest.get("run_id", run_id))
         bundle_manifest_path = write_bundle_manifest(
@@ -6621,7 +7222,26 @@ class GenesisService:
                 integrity_failures += 1
         checks["objects_inspected"] = inspected
         checks["object_integrity_failures"] = integrity_failures
-        checks["credential_secrets_stored"] = False  # env-only credential policy
+        try:
+            with self.persistence._lock:
+                quick = self.persistence.connection.execute("PRAGMA quick_check").fetchall()
+            checks["database_integrity"] = (
+                "ok" if quick == [("ok",)] else "; ".join(str(row[0]) for row in quick[:5])
+            )
+        except sqlite3.DatabaseError as exc:
+            checks["database_integrity"] = f"error: {exc}"
+        stored_profiles = self._load_model_profiles()
+        # A pasted api_key is stored in the profile file (owner-only), so the
+        # workspace does hold a secret when any profile has one (M13).
+        checks["credential_secrets_stored"] = any(
+            bool(profile.get("api_key")) for profile in stored_profiles.values()
+        )
+        try:
+            orphans = self.persistence.unreferenced_objects()
+            checks["unreferenced_objects"] = len(orphans)
+            checks["unreferenced_bytes"] = sum(size for _digest, size in orphans)
+        except (OSError, sqlite3.DatabaseError):
+            checks["unreferenced_objects"] = None
         try:
             usage = shutil.disk_usage(self.workspace)
             checks["disk_free_bytes"] = usage.free
@@ -6633,13 +7253,20 @@ class GenesisService:
         objects_dir = self.workspace / ".genesis" / "objects"
         checks["objects_readable"] = os.access(objects_dir, os.R_OK)
         credentials: dict[str, bool] = {
-            str(profile_id): bool(os.environ.get(str(profile.get("api_key_env", ""))))
-            for profile_id, profile in self._load_model_profiles().items()
+            str(profile_id): (
+                True
+                if profile.get("provider") == "answer-pool"
+                else bool(
+                    profile.get("api_key") or os.environ.get(str(profile.get("api_key_env", "")))
+                )
+            )
+            for profile_id, profile in stored_profiles.items()
         }
         checks["credential_presence"] = credentials
         healthy = all(
             [
                 checks["database_present"],
+                checks["database_integrity"] == "ok",
                 checks["schema_current"],
                 checks["wal_mode"],
                 integrity_failures == 0,
@@ -6656,11 +7283,37 @@ class GenesisService:
         }
 
     def backup_run(self, run_id: str, destination: str | Path) -> dict[str, Any]:
-        """Back up the entire local database (SQLite safe backup)."""
+        """Back up the entire local database and the object files it references (M5)."""
         self.get_run(run_id)
         target = self.resolve_path(destination)
         path = self.persistence.backup_to(target)
-        return {"path": str(path), "status": "backed-up"}
+        return {
+            "path": str(path),
+            "objects_path": str(self.persistence.objects_backup_path(path)),
+            "status": "backed-up",
+        }
+
+    def collect_garbage(
+        self, *, apply: bool = False, grace_seconds: float = 3600.0
+    ) -> dict[str, Any]:
+        """Report -- and with ``apply`` remove -- object files nothing references (M6).
+
+        Removal is refused while any run is marked running, since a commit in
+        another process may be writing objects it has not recorded yet.
+        """
+        if apply:
+            running = sorted(
+                run["id"] for run in self.list_runs() if run.get("status") == "running"
+            )
+            if running:
+                raise ValueError(
+                    "GC_RUNS_ACTIVE: runs are marked running ("
+                    + ", ".join(running[:5])
+                    + "); collect garbage when no run is executing"
+                )
+        return self.persistence.collect_unreferenced_objects(
+            apply=apply, grace_seconds=grace_seconds
+        )
 
     def close(self) -> None:
         self.persistence.close()

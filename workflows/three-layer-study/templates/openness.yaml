@@ -1,13 +1,53 @@
 schema_version: '1.0'
 study_id: '{{study_id}}'
 processes: []
-# Each processes entry must be a mapping, for example:
+# Layer 1 declares what is left open to generation and what is closed by design.
+# Each processes entry is a mapping with these fields; never a descriptive sentence.
+#
 # - id: formulate-strategy
+#   actors: {source: creators, id_field: id, fan_out: true}
+#       # 'source' is a BARE state id -- 'creators', never 'state.creators'.
+#       # Or an explicit list: [creator-01, creator-02]. Omit for a single invocation.
+#   trigger: {phase: round, rounds: 1-40}
+#       # THREE trigger forms, and only these:
+#       #   {phase: round, rounds: 1-40} or {phase: round, rounds: [3, 6, 9]}
+#       #   {phase: N, repeat: true}
+#       #   {type: condition, predicate: {path: condition.governance, op: eq,
+#       #                                 value: on}}
+#       #   {type: event, event: <event id>}
+#       # A condition predicate uses the predicate grammar below, and may NOT
+#       # read 'state.' -- scheduling is fixed by design, not by run-time state.
+#   dependencies: {requires: [], same_round_results_visible: false}
 #   executor: {mode: generative, model_profile: study-model}
-#   context_policy: creator-context
+#       # deterministic and stochastic executors need parameters.function
+#   context_policy: creator-context      # a visibility id declared in Layer 3
+#   prompt_ref: formulate-strategy       # a prompt file in the package
+#   inputs: [own-items, leaderboard]     # ARTIFACT ids declared in Layer 3 --
+#                                        # not process ids, not free text
+#   outputs: [{artifact_type: strategy, schema_ref: strategy-schema}]
+#   state_effects:
+#   - {field: strategies, op: put, from: strategy, key: actor}
+#       # field: a Layer 3 state id. op: set|append|increment|remove|put|
+#       # add-relation|remove-relation. from: which output feeds the effect.
+#       # 'from' belongs to a MODEL CALL only (generative or semantic-evaluator).
+#       # A deterministic or stochastic executor computes its own writes, so its
+#       # state_effects declare {field, op} (and 'key' where the op needs one)
+#       # and never 'from'.
+#       # key: required for 'put'. The ONLY supported value is the literal
+#       # 'actor', which writes under the acting actor's id; a process whose
+#       # effect uses it must fan out one invocation per actor.
+#   information_timing: {mode: simultaneous, order: listed}
+#       # REQUIRED when a batched process can see its own siblings' results this
+#       # phase. sequential = later siblings see earlier ones; simultaneous = all
+#       # act on the phase-start view.
+#   measurement: true                    # marks an observation-only process
+#   measurement_use:                     # who may consume that measurement, and when
+#   - source: detect-signal
+#     rationale: The sanction is applied only under the governance condition.
+#     when: {all: [{path: condition.governance, op: eq, value: on},
+#                  {path: protocol.phase, op: gte, value: 20}]}
 #   openness_rationale: Strategy content cannot be enumerated in advance.
 #   closure_rationale: Timing and authorised inputs are fixed by the experiment.
-#   prompt_ref: formulate-strategy
-#   outputs: [{artifact_type: strategy, schema_ref: strategy-schema}]
-# Use the supplied canonical schema for exact fields and declare references in
-# the appropriate later stages. Never insert a descriptive sentence as an entry.
+#
+# A process that reads another process's STATE cannot also gate that use with
+# 'when' -- state cannot be withheld per condition. Read it as an input artifact.

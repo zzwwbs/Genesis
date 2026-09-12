@@ -29,7 +29,33 @@ RUNTIME_CONTRACT_VERSION = 1
 # Assets that must never enter a package closure (spec §2.1): credentials and
 # API keys, and the workspace-internal metadata registry.
 _EXCLUDED_NAMES = {".credentials", ".credentials.yaml", ".credentials.yml", "credentials.json"}
-_CREDENTIAL_MARKERS = ("credential", "secret", "private_key", "api_key", ".key", "creds")
+_CREDENTIAL_MARKERS = (
+    "credential",
+    "secret",
+    "private_key",
+    "private-key",
+    "api_key",
+    "api-key",
+    "apikey",
+    "api_token",
+    "api-token",
+    "access_token",
+    "access-token",
+    "auth_token",
+    "auth-token",
+    ".key",
+    "creds",
+)
+# Whole file or directory names that denote secrets, compared without suffix.
+_CREDENTIAL_STEMS = {"key", "keys", "token", "tokens", "password", "passwords", "env"}
+# The asset types each package directory may contribute (spec §2.1). An
+# allowlist, so a stray file -- an .env, a key, an editor cache -- cannot enter a
+# closure, and with it every build and export, merely by being in the tree.
+_ALLOWED_SUFFIXES = {
+    "prompts": frozenset({".txt"}),
+    "schemas": frozenset({".yaml", ".yml", ".json"}),
+    "data": frozenset({".csv", ".json", ".parquet"}),
+}
 
 
 def _media_type(path: Path) -> str:
@@ -47,14 +73,29 @@ def _media_type(path: Path) -> str:
     return "application/octet-stream"
 
 
+def _exclusion_reason(relative: Path) -> str | None:
+    """Why a package file must stay out of the closure, or ``None`` (spec §2.1).
+
+    Every path component is checked, not only the file name: a secret is just as
+    much a secret inside ``prompts/.credentials/``.
+    """
+    parts = [part.lower() for part in relative.parts]
+    if any(part.startswith(".") for part in parts):
+        return "hidden"
+    for part in parts:
+        if part in _EXCLUDED_NAMES or Path(part).stem in _CREDENTIAL_STEMS:
+            return "credential"
+        if any(marker in part for marker in _CREDENTIAL_MARKERS):
+            return "credential"
+    allowed = _ALLOWED_SUFFIXES.get(parts[0]) if len(parts) > 1 else None
+    if allowed is not None and relative.suffix.lower() not in allowed:
+        return "unsupported file type"
+    return None
+
+
 def _is_excluded(relative: Path) -> bool:
-    """Exclude credential-like files from the closure (spec §2.1)."""
-    name = relative.name.lower()
-    if name in _EXCLUDED_NAMES:
-        return True
-    if any(marker in name for marker in _CREDENTIAL_MARKERS):
-        return True
-    return False
+    """Exclude credential-like and unsupported files from the closure (spec §2.1)."""
+    return _exclusion_reason(relative) is not None
 
 
 def _safe_relative(root: Path, path: Path) -> Path:
@@ -81,6 +122,9 @@ class PackageClosure:
     source: str
     digest: str
     manifest: dict[str, Any]
+    # Package files left out, with the reason, so an omission is visible rather
+    # than silent. Not part of the digest: the closure is what was included.
+    excluded: tuple[tuple[str, str], ...] = ()
 
     @property
     def assets(self) -> dict[str, dict[str, Any]]:
@@ -104,6 +148,7 @@ def build_package_closure(source: str | Path) -> PackageClosure:
     if not root.is_dir():
         raise ValueError(f"package directory does not exist: {root}")
     assets: list[dict[str, Any]] = []
+    excluded: list[tuple[str, str]] = []
     seen: set[str] = set()
     candidates: list[Path] = []
     for pattern in ("*.yaml", "*.yml", "*.json", "*.txt"):
@@ -117,7 +162,10 @@ def build_package_closure(source: str | Path) -> PackageClosure:
         normalized = relative.as_posix()
         if normalized in seen:
             continue
-        if _is_excluded(relative):
+        reason = _exclusion_reason(relative)
+        if reason is not None:
+            seen.add(normalized)
+            excluded.append((normalized, reason))
             continue
         seen.add(normalized)
         content = path.read_bytes()
@@ -139,6 +187,7 @@ def build_package_closure(source: str | Path) -> PackageClosure:
         source=str(root),
         digest=hashlib.sha256(canonical_json(manifest).encode()).hexdigest(),
         manifest=manifest,
+        excluded=tuple(sorted(excluded)),
     )
 
 
@@ -159,8 +208,18 @@ class ExecutionManifest:
     model_configuration_digest: str = ""
     outcome_plan_digest: str = ""
     runtime_contract_version: int = RUNTIME_CONTRACT_VERSION
+    # Source identity of the study code computational and stochastic executors
+    # run. Empty when a build runs none, and then left out, so a configuration
+    # without study code keeps the digest it had before this field existed.
+    executor_code_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
+        payload = self._core_dict()
+        if self.executor_code_digest:
+            payload["executor_code_digest"] = self.executor_code_digest
+        return payload
+
+    def _core_dict(self) -> dict[str, Any]:
         return {
             "manifest_version": self.manifest_version,
             "package_digest": self.package_digest,
@@ -208,6 +267,7 @@ def resolve_execution_manifest(
     model_configuration_digest: str,
     outcome_plan_digest: str,
     origin_experiment_id: str | None = None,
+    executor_code_digest: str = "",
 ) -> dict[str, Any]:
     """Resolve the effective configuration from build and protocol facts.
 
@@ -232,7 +292,42 @@ def resolve_execution_manifest(
         origin_experiment_id=origin_experiment_id,
         model_configuration_digest=model_configuration_digest,
         outcome_plan_digest=outcome_plan_digest,
+        executor_code_digest=executor_code_digest,
     ).to_dict()
+
+
+EXECUTOR_CODE_MODES = frozenset({"computational", "stochastic"})
+
+
+def executor_code_reference(process: Mapping[str, Any]) -> str | None:
+    """The ``module:attribute`` a computational or stochastic process runs, or None."""
+    binding = process.get("executor")
+    if not isinstance(binding, Mapping):
+        return None
+    mode = str(binding.get("mode", ""))
+    if mode not in EXECUTOR_CODE_MODES:
+        return None
+    parameters = binding.get("parameters")
+    parameters = parameters if isinstance(parameters, Mapping) else {}
+    key = "function" if mode == "stochastic" else "entry_point"
+    return str(parameters.get(key) or "") or None
+
+
+def executor_code_digest(identity: Mapping[str, Mapping[str, Any]]) -> str:
+    """One digest over the study code a build runs, where it could be located.
+
+    A process whose module could not be found contributes nothing: whether a
+    module happens to be importable is a property of the machine, not of the
+    configuration, and it must not change the configuration's identity.
+    """
+    resolved = {
+        process_id: record
+        for process_id, record in identity.items()
+        if isinstance(record, Mapping) and record.get("source_sha256")
+    }
+    if not resolved:
+        return ""
+    return hashlib.sha256(canonical_json(resolved).encode()).hexdigest()
 
 
 def scientific_config_digest(manifest: ExecutionManifest | dict[str, Any]) -> str:

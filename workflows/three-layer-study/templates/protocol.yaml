@@ -3,3 +3,44 @@ study_id: '{{study_id}}'
 time_model:
   type: rounds
   end: 10
+# The protocol declares the condition space, not the model. ONE build serves every
+# condition: runs are expanded from this declaration at execution time, and each
+# run records its own condition_id.
+#
+# Declare EITHER factors OR conditions -- never both. A package carrying both is
+# refused at run time.
+#
+# factors:                     # crossed design; cells are the product of levels
+# - id: governance
+#   levels: [none, on]
+#   branchable: true           # only branchable factors may be overridden by a
+# - id: visibility             # branch replay of an existing run
+#   levels: [low, high]
+#
+# conditions:                  # OR an explicit list, when cells are not crossed
+# - id: baseline
+#   factors: {governance: none, visibility: low}
+#
+# A factor id is readable from any predicate as condition.<factor_id>.
+#
+# phases:                      # named spans, readable as protocol.phase
+# - id: pre-intervention
+#   start: 1
+#   end: 19
+# - id: post-intervention
+#   start: 20
+#   end: 40
+#
+# replications: 3              # repeats per condition
+# matching:                    # aligns streams so cells are comparable
+#   enabled: true
+#   shared_streams: [population, activation-order]
+#   shared_initialization: true
+# random_streams:
+# - id: population
+#   purpose: [initial population draw]
+#   seed_policy: replication-condition-block
+# termination:
+# - {type: end_time, at: 40, early_stopping: false}
+# budgets: {max_events: 1000000}
+# model_freezing: true

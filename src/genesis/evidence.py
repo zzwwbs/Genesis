@@ -44,6 +44,7 @@ def evaluate_capabilities(
     has_recorded_outputs: bool,
     has_checkpoint_evidence: bool,
     has_outcomes: bool,
+    has_executor_code: bool = True,
 ) -> list[dict[str, Any]]:
     """Individually evaluate every capability with missing prerequisites.
 
@@ -94,13 +95,20 @@ def evaluate_capabilities(
         missing_reexecute.append("package_closure")
     if not has_build:
         missing_reexecute.append("build")
+    # A study whose processes run module:attribute code cannot be re-executed
+    # from the bundle alone: that code lives outside the package, so the bundle
+    # carries its digest but never its bytes. Advertising the capability made a
+    # promise no recipient could keep.
+    if not has_executor_code:
+        missing_reexecute.append("executor_code")
+    available_reexecute = has_build and has_closure and has_executor_code
     add(
         "reexecute",
-        has_build and has_closure,
+        available_reexecute,
         missing_reexecute,
         "a compatible local runtime could reconstruct supported execution inputs"
-        if has_build and has_closure
-        else "executable build or package closure is missing",
+        if available_reexecute
+        else "executable build, package closure, or the study code the run ran is missing",
     )
     missing_replay = []
     if not has_build:

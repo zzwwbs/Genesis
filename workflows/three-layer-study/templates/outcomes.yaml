@@ -1,3 +1,36 @@
 schema_version: '1.0'
 study_id: '{{study_id}}'
 outcomes: []
+# Outcomes are computed from datasets, which are extracted from the recorded run.
+#
+# datasets:
+# - id: item-rows
+#   source: {kind: artifacts, artifact_type: item}
+#       # kind: events | artifacts | state
+#       # events   -> also give 'process'; artifacts -> 'artifact_type';
+#       # state    -> also give 'state' and 'snapshot' (final | each_completed_round)
+#   fields:
+#   - {name: phase, op: copy, field: phase}
+#   - {name: creator_id, op: copy, field: creator_id}
+#   - {name: flagged, op: comparison, field: detector_score, operator: gte, value: 7}
+#       # op: copy | literal | arithmetic | comparison | conditional
+#   where:
+#   - {field: detector_score, op: truthy}
+#   deduplicate_on: [phase, creator_id]
+#   missing: retain_null
+#
+# outcomes:                    # 'source' is a dataset id above, or a state id
+# - id: flag-rate-by-period
+#   source: detections
+#   grouping: [condition, replication, period]
+#   aggregation: {measure: proportion, numerator: score_gte_7, denominator: all_items}
+#       # or {measure: mean, field: score}; measure: mean | sum | count | proportion
+#   missingness: {policy: retain_null, exclude_missing_score: true}
+#   window: {type: round_bins, size: 10}
+#   output_schema: outcome-summary
+#
+# traces:                      # narrative evidence chains for qualitative reading
+# - id: escalation-trace
+#   title: A creator escalating after an unexplained payoff drop
+#   seed: {dataset: item-rows, order_by: [phase, commit_order], select: first}
+#   depth: 12

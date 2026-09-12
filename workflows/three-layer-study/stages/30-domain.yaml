@@ -37,7 +37,10 @@ critical_decisions:
   required: true
 - id: initialization-and-provenance
   question: How are required actors and state initialized, and what is their provenance?
-  rationale: It determines whether a run can initialize reproducibly.
+  rationale: It determines whether a run can initialize reproducibly. Mode 'empirical'
+    requires a named data asset that the package actually carries; if no such file
+    exists yet, ask the researcher for it rather than naming one, or use a generative
+    or researcher-specified initialization instead.
   target_paths: [/domain/initialization]
   required: true
 depends_on:

@@ -504,9 +504,15 @@ def create_app(
             return _service_error(exc)
 
     @app.post("/runs/{run_id}/execute")
-    def execute_run(run_id: str) -> Any:
+    def execute_run(run_id: str, payload: dict[str, Any] | None = None) -> Any:
         try:
-            return service.execute_run(run_id)
+            options = dict(payload or {})
+            unknown = sorted(set(options) - {"max_concurrency"})
+            if unknown:
+                raise ValueError(
+                    f"INVALID_FIELD: unsupported execute options: {', '.join(unknown)}"
+                )
+            return service.execute_run(run_id, max_concurrency=options.get("max_concurrency"))
         except Exception as exc:
             return _service_error(exc)
 

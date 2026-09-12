@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,6 +29,32 @@ from genesis.state_encoding import (
 
 _SCHEMA_VERSION = 9
 _RUN_STATUSES = {"created", "running", "paused", "completed", "failed", "cancelled"}
+# A SHA-256 object digest as it appears inside stored JSON records.
+_DIGEST_PATTERN = re.compile(r"\b[0-9a-f]{64}\b")
+# Fields that carry raw provider responses (AW-20), as export redaction treats them.
+_RAW_RESPONSE_KEYS = frozenset({"response", "raw_response", "parsed_response"})
+_PURGED = "<purged-by-retention>"
+
+
+def _redact_raw_responses(value: Any) -> tuple[Any, bool]:
+    """Replace raw-response fields with a purge marker; report whether any changed."""
+    if isinstance(value, dict):
+        changed = False
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _RAW_RESPONSE_KEYS and item not in (None, "", _PURGED):
+                redacted[key] = _PURGED
+                changed = True
+            else:
+                redacted[key], child_changed = _redact_raw_responses(item)
+                changed = changed or child_changed
+        return redacted, changed
+    if isinstance(value, list):
+        results = [_redact_raw_responses(item) for item in value]
+        return [item for item, _ in results], any(flag for _, flag in results)
+    return value, False
+
+
 _RUN_TRANSITIONS = {
     "created": {"running", "failed", "cancelled"},
     "running": {"paused", "completed", "failed", "cancelled"},
@@ -95,14 +122,22 @@ class ObjectStore:
         self._metadata[digest] = (media_type, len(payload))
         return ObjectRef(digest, media_type, len(payload), path)
 
-    def cleanup_orphans(self) -> int:
+    def cleanup_orphans(self, older_than: float | None = None) -> int:
+        """Remove leftover temporary files from interrupted writes.
+
+        ``older_than`` (seconds) spares files a writer in another process may
+        still be about to move into place.
+        """
+        import time as _time
+
+        cutoff = None if older_than is None else _time.time() - older_than
         removed = 0
-        for path in self.root.rglob("*.tmp"):
-            if path.is_file():
-                path.unlink()
-                removed += 1
-        for path in self.root.rglob(".object-*"):
-            if path.is_file():
+        for pattern in ("*.tmp", ".object-*"):
+            for path in self.root.rglob(pattern):
+                if not path.is_file():
+                    continue
+                if cutoff is not None and path.stat().st_mtime > cutoff:
+                    continue
                 path.unlink()
                 removed += 1
         return removed
@@ -1218,14 +1253,17 @@ class PersistenceCoordinator:
                     # by asking whether the row is still there, and say plainly
                     # that the view is no longer the one this call started with
                     # rather than reporting a missing object.
-                    still_present = self.connection.execute(
-                        "SELECT 1 FROM artifacts WHERE artifact_id = ? AND run_id = ?",
+                    current = self.connection.execute(
+                        "SELECT payload_ref FROM artifacts WHERE artifact_id = ? AND run_id = ?",
                         (artifact_id, run_id),
                     ).fetchone()
-                    if still_present is None:
+                    # Retention now redacts in place, replacing the payload object,
+                    # so a changed reference is the same concurrent purge as a
+                    # removed row.
+                    if current is None or current[0] != payload_ref:
                         raise ValueError(
                             f"ARTIFACT_PURGED_DURING_READ: artifact '{artifact_id}' of run "
-                            f"'{run_id}' was removed while its artifacts were being read; "
+                            f"'{run_id}' was purged while its artifacts were being read; "
                             "retry the read"
                         ) from None
                     raise
@@ -1522,6 +1560,53 @@ class PersistenceCoordinator:
                 )
                 self.connection.execute("COMMIT")
                 return deepcopy(record)
+            except Exception:
+                self._rollback()
+                raise
+
+    def record_run_execution(self, run_id: str, execution: dict[str, Any]) -> dict[str, Any]:
+        """Append one execution segment's operational settings to a run (CON-003).
+
+        Kept beside the frozen manifest rather than inside it: the manifest pins
+        what the run *is*, while settings such as concurrency may differ between
+        the first execution and a resume without changing the experiment.
+        """
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._get_run(run_id)
+                executions = record.setdefault("executions", [])
+                if not isinstance(executions, list):
+                    raise ValueError("RUN_EXECUTIONS: executions must be a list")
+                executions.append(deepcopy(execution))
+                record["version"] += 1
+                self.connection.execute(
+                    """UPDATE runs SET version = ?, payload_json = ? WHERE run_id = ?""",
+                    (record["version"], self._encode_record(record), run_id),
+                )
+                self.connection.execute("COMMIT")
+                return deepcopy(execution)
+            except Exception:
+                self._rollback()
+                raise
+
+    def update_latest_run_execution(self, run_id: str, updates: dict[str, Any]) -> None:
+        """Merge what an execution segment did into its record (CON-015)."""
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._get_run(run_id)
+                executions = record.get("executions")
+                if not isinstance(executions, list) or not executions:
+                    self.connection.execute("ROLLBACK")
+                    return
+                executions[-1].update(deepcopy(updates))
+                record["version"] += 1
+                self.connection.execute(
+                    """UPDATE runs SET version = ?, payload_json = ? WHERE run_id = ?""",
+                    (record["version"], self._encode_record(record), run_id),
+                )
+                self.connection.execute("COMMIT")
             except Exception:
                 self._rollback()
                 raise
@@ -1981,58 +2066,190 @@ class PersistenceCoordinator:
     def current_schema_version(self) -> int:
         return _SCHEMA_VERSION
 
-    def retention_purge(self, run_id: str) -> int:
-        """Delete durable raw-response artifact rows for a purged run (AW-20).
+    def retention_purge(self, run_id: str, process_ids: Collection[str] | None = None) -> int:
+        """Redact raw provider responses from a run's artifact payloads (AW-20).
 
-        The immutable event ledger is untouched; only artifact payloads that
-        carry raw provider responses are removed. Payloads live in the object
-        store, so rows are inspected via their object references.
+        Only artifacts produced by ``process_ids`` -- the processes whose retention
+        declares a purge; every process when ``None`` -- are touched, and in them
+        only the raw-response fields are replaced. Outputs, lineage and declared
+        artifacts remain, so outcomes and replay still read them. Matching the
+        bytes ``"response"`` anywhere in a payload, as this once did, deleted any
+        artifact that merely contained that word. The immutable event ledger is
+        untouched. Returns the number of artifact payloads rewritten.
         """
+        wanted = None if process_ids is None else {str(item) for item in process_ids}
         with self._lock:
             rows = self.connection.execute(
                 "SELECT artifact_id, payload_ref FROM artifacts WHERE run_id = ?",
                 (run_id,),
             ).fetchall()
-            removed = 0
-            unreferenced: list[str] = []
-            for artifact_id, payload_ref in rows:
-                payload = self._read_object(payload_ref)
-                if b'"response"' in payload:
+            rewritten = 0
+            replaced: list[str] = []
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                for artifact_id, payload_ref in rows:
+                    try:
+                        payload = json.loads(self._read_object(payload_ref))
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    producer = payload.get("process_id") or payload.get("producer_process")
+                    if wanted is not None and str(producer) not in wanted:
+                        continue
+                    redacted, changed = _redact_raw_responses(payload)
+                    if not changed:
+                        continue
+                    ref = self.object_store.put(json.dumps(redacted, sort_keys=True).encode())
+                    self._record_object(ref)
                     self.connection.execute(
-                        "DELETE FROM artifacts WHERE artifact_id = ?", (artifact_id,)
+                        "UPDATE artifacts SET payload_ref = ? WHERE artifact_id = ? AND run_id = ?",
+                        (ref.digest, artifact_id, run_id),
                     )
-                    removed += 1
-                    unreferenced.append(payload_ref)
-            # Reference-aware garbage collection: drop object rows and files that
-            # are no longer used by any artifacts, events, states, or checkpoints.
-            for digest in unreferenced:
-                still_used = self.connection.execute(
-                    """SELECT 1 FROM artifacts WHERE payload_ref = ? UNION ALL
-                       SELECT 1 FROM events WHERE payload_ref = ? UNION ALL
-                       SELECT 1 FROM states WHERE payload_ref = ? UNION ALL
-                       SELECT 1 FROM checkpoints WHERE payload_ref = ?""",
-                    (digest, digest, digest, digest),
-                ).fetchone()
-                if still_used is not None:
+                    rewritten += 1
+                    replaced.append(payload_ref)
+                # Reference-aware collection of the payloads just replaced.
+                for digest in replaced:
+                    still_used = self.connection.execute(
+                        """SELECT 1 FROM artifacts WHERE payload_ref = ? UNION ALL
+                           SELECT 1 FROM events WHERE payload_ref = ? UNION ALL
+                           SELECT 1 FROM states WHERE payload_ref = ? UNION ALL
+                           SELECT 1 FROM checkpoints WHERE payload_ref = ?""",
+                        (digest, digest, digest, digest),
+                    ).fetchone()
+                    if still_used is None:
+                        self.connection.execute("DELETE FROM objects WHERE digest = ?", (digest,))
+                self.connection.execute("COMMIT")
+            except Exception:
+                self._rollback()
+                raise
+            for digest in replaced:
+                if digest in self._referenced_digests():
                     continue
-                self.connection.execute("DELETE FROM objects WHERE digest = ?", (digest,))
                 self.object_store._metadata.pop(digest, None)
                 object_path = self.object_store.root / digest[:2] / digest[2:]
                 if object_path.is_file():
                     object_path.unlink()
-            return removed
+            return rewritten
+
+    def _referenced_digests(self) -> set[str]:
+        """Every object digest a stored record refers to (M6).
+
+        Payload references from the run tables, package snapshots, and -- to be
+        safe -- any digest quoted inside a stored JSON record.
+        """
+        referenced: set[str] = set()
+        for table in ("events", "states", "artifacts", "checkpoints"):
+            referenced.update(
+                str(row[0]) for row in self.connection.execute(f"SELECT payload_ref FROM {table}")
+            )
+        if "snapshot_digest" in self._table_columns("package_versions"):
+            referenced.update(
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT snapshot_digest FROM package_versions WHERE snapshot_digest IS NOT NULL"
+                )
+            )
+        for table in ("runs", "studies", "package_versions", "study_builds", "experiments"):
+            if "payload_json" not in self._table_columns(table):
+                continue
+            for (text,) in self.connection.execute(f"SELECT payload_json FROM {table}"):
+                referenced.update(_DIGEST_PATTERN.findall(str(text or "")))
+        return referenced
+
+    def unreferenced_objects(self, *, grace_seconds: float = 3600.0) -> list[tuple[str, int]]:
+        """Object files no stored record references, older than ``grace_seconds``.
+
+        Files are written before the transaction that records them commits, so a
+        young unreferenced file may belong to a commit still in flight.
+        """
+        import time as _time
+
+        cutoff = _time.time() - max(0.0, float(grace_seconds))
+        with self._lock:
+            referenced = self._referenced_digests()
+            orphans: list[tuple[str, int]] = []
+            for path in sorted(self.object_store.root.glob("??/*")):
+                if not path.is_file() or path.name.startswith("."):
+                    continue
+                digest = path.parent.name + path.name
+                if digest in referenced:
+                    continue
+                stat_result = path.stat()
+                if stat_result.st_mtime > cutoff:
+                    continue
+                orphans.append((digest, int(stat_result.st_size)))
+            return orphans
+
+    def collect_unreferenced_objects(
+        self, *, apply: bool = False, grace_seconds: float = 3600.0
+    ) -> dict[str, Any]:
+        """Report, and with ``apply`` remove, unreferenced object files (M6).
+
+        A failed commit leaves the object files it wrote behind, and nothing
+        reclaimed them. Removal re-checks references under the lock, so a record
+        committed since the scan keeps its object.
+        """
+        with self._lock:
+            orphans = self.unreferenced_objects(grace_seconds=grace_seconds)
+            removed = 0
+            if apply:
+                referenced = self._referenced_digests()
+                for digest, _size in orphans:
+                    if digest in referenced:
+                        continue
+                    self.connection.execute("DELETE FROM objects WHERE digest = ?", (digest,))
+                    self.object_store._metadata.pop(digest, None)
+                    object_path = self.object_store.root / digest[:2] / digest[2:]
+                    if object_path.is_file():
+                        object_path.unlink()
+                        removed += 1
+            return {
+                "unreferenced_objects": len(orphans),
+                "unreferenced_bytes": sum(size for _digest, size in orphans),
+                "removed_objects": removed,
+                "applied": bool(apply),
+                "grace_seconds": float(grace_seconds),
+            }
 
     def backup_to(self, destination: str | Path) -> Path:
-        """Create a consistent SQLite backup using the safe backup API."""
+        """Back up the database and the object store it refers to (M5).
+
+        The database is copied with SQLite's safe backup API; the payloads its
+        events, states and artifacts reference live in the object store, so those
+        files are copied beside it into ``<destination>.objects``. A database
+        backup alone restores records whose evidence is missing. Restore by
+        placing the two at ``.genesis/genesis.db`` and ``.genesis/objects``.
+        """
+        import shutil as _shutil
+
         target = Path(destination)
         target.parent.mkdir(parents=True, exist_ok=True)
         backup = sqlite3.connect(str(target), isolation_level=None, check_same_thread=False)
         try:
             with self._lock:
                 self.connection.backup(backup)
+                referenced = self._referenced_digests()
         finally:
             backup.close()
+        objects_target = self.objects_backup_path(target)
+        for digest in sorted(referenced):
+            source = self.object_store.root / digest[:2] / digest[2:]
+            if not source.is_file():
+                continue
+            copy = objects_target / digest[:2] / digest[2:]
+            if copy.is_file() and copy.stat().st_size == source.stat().st_size:
+                continue
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copy2(source, copy)
+        objects_target.mkdir(parents=True, exist_ok=True)
         return target
+
+    @staticmethod
+    def objects_backup_path(target: str | Path) -> Path:
+        """Where ``backup_to`` places the object files for a database backup."""
+        target = Path(target)
+        return target.with_name(f"{target.name}.objects")
 
     def close(self) -> None:
         with self._lock:

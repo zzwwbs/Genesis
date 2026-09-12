@@ -37,12 +37,17 @@ genesis serve --workspace ./genesis-workspace
 
 ```python
 from genesis.service import GenesisService
+
 svc = GenesisService("./genesis-workspace")
-svc.create_model_profile({
-    "id": "openai-default", "provider": "openai-compatible",
-    "model": "<model>", "base_url": "https://api.openai.com/v1",
-    "api_key_env": "OPENAI_API_KEY",
-})
+svc.create_model_profile(
+    {
+        "id": "openai-default",
+        "provider": "openai-compatible",
+        "model": "<model>",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+    }
+)
 svc.test_model_profile("openai-default")
 ```
 
@@ -64,12 +69,13 @@ A study is 7 YAML files plus optional `prompts/`, `schemas/`, `data/` directorie
 
 ```python
 from genesis.service import GenesisService
+
 svc = GenesisService("./genesis-workspace")
-draft = svc.create_specification({...})            # or import a YAML package
+draft = svc.create_specification({...})  # or import a YAML package
 approved = svc.approve_specification("<id>", draft["version"], "agent")
 compiled = svc.compile_study(None, "builds/<id>", specification_id="<id>")
 svc.create_run({"id": "run-1", "study_id": "<id>", "build": compiled["path"]})
-svc.execute_run("run-1")                            # deterministic-only? pass executor_overrides
+svc.execute_run("run-1")  # deterministic-only? pass executor_overrides
 events = svc.trace_run("run-1")
 svc.export_run("run-1", "exports/run-1")
 ```

@@ -15,6 +15,7 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -195,6 +196,36 @@ class ActorSelector(StrictModel):
         return self
 
 
+class InformationTiming(StrictModel):
+    """When an actor may see results its siblings produced in the same batch (CON-005).
+
+    ``mode`` is a research decision: ``sequential`` lets a later actor see what
+    earlier siblings committed; ``simultaneous`` gives every actor the view as it
+    stood when the batch began. It is required only where the choice can change
+    results. ``order`` is the order actors act (sequential) or commit
+    (simultaneous): the authored list, or a seeded shuffle per phase.
+    """
+
+    mode: Literal["sequential", "simultaneous"] | None = None
+    order: Literal["listed", "shuffled"] = "listed"
+
+
+class MeasurementUse(StrictModel):
+    """A declared, reasoned use of a measurement process's outputs in behaviour.
+
+    A measurement observes the simulated world and must not feed back into it,
+    unless the design makes it an instrument -- a detector whose score sets
+    revenue under a governance condition. ``when`` (a predicate over
+    ``condition`` and ``protocol.phase``) limits the use to where the design
+    applies it; outside it, the measurement's artifacts are not resolved as
+    inputs at all.
+    """
+
+    source: StableId
+    rationale: str = Field(min_length=1)
+    when: dict[str, Any] | None = None
+
+
 class ProcessSpec(StrictModel):
     id: StableId
     name: str | None = None
@@ -217,8 +248,22 @@ class ProcessSpec(StrictModel):
     # declaring it here lets that isolation be checked for any package instead
     # of by naming a particular study's processes.
     measurement: bool = False
+    measurement_use: list[MeasurementUse] = Field(default_factory=list)
+    information_timing: InformationTiming | None = None
     origin: OriginMetadata | None = None
     approval: ApprovalMetadata | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_undeclared_timing(self, handler: Any) -> Any:
+        # Undeclared timing and measurement uses are left out rather than written
+        # as null or empty, so a package that does not use them serializes --
+        # and hashes -- exactly as it did before the fields existed.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("information_timing") is None:
+            data.pop("information_timing", None)
+        if isinstance(data, dict) and not data.get("measurement_use"):
+            data.pop("measurement_use", None)
+        return data
 
     @field_validator("context_policy")
     @classmethod
@@ -335,15 +380,43 @@ class StateSpec(StrictModel):
     approval: ApprovalMetadata | None = None
 
 
+def _without_empty_provenance(data: Any) -> Any:
+    """Drop provenance keys that were never set.
+
+    Written out as nulls, they would change the canonical form -- and so the
+    package content hash -- of every package that does not use them.
+    """
+    if isinstance(data, dict):
+        for name in ("origin", "approval"):
+            if data.get(name) is None:
+                data.pop(name, None)
+    return data
+
+
 class MechanismSpec(StrictModel):
     id: StableId
     implements: str | None = None
     description: str | None = None
+    # Provenance, as every other declared domain entry carries. Without it a
+    # guided draft that cites its turns -- which the workflow instructs the
+    # assistant to do for every proposed value -- was refused outright.
+    origin: OriginMetadata | None = None
+    approval: ApprovalMetadata | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_provenance(self, handler: Any) -> Any:
+        return _without_empty_provenance(handler(self))
 
 
 class InstitutionSpec(StrictModel):
     id: StableId
     type: str | None = None
+    origin: OriginMetadata | None = None
+    approval: ApprovalMetadata | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_provenance(self, handler: Any) -> Any:
+        return _without_empty_provenance(handler(self))
 
 
 class VisibilitySpec(StrictModel):
@@ -354,6 +427,19 @@ class VisibilitySpec(StrictModel):
     cardinality: dict[str, Any] = Field(default_factory=dict)
     aggregate: dict[str, Any] = Field(default_factory=dict)
     available_when: dict[str, Any] = Field(default_factory=dict)
+    # Per allowed path: {keep: [fields]} or {drop: [fields]} of each record, so a
+    # policy can hand over part of a record (an article without its author's
+    # private strategy text) rather than all or none of it.
+    project: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def _omit_undeclared_projection(self, handler: Any) -> Any:
+        # Left out when empty, so a policy without projections serializes -- and
+        # hashes -- exactly as it did before the field existed.
+        data = handler(self)
+        if isinstance(data, dict) and not data.get("project"):
+            data.pop("project", None)
+        return data
 
 
 class AvailabilitySpec(StrictModel):

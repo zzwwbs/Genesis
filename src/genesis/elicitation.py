@@ -18,7 +18,7 @@ import tempfile
 import threading
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -101,6 +101,10 @@ class WorkflowStage(BaseModel):
     ambiguity_topics: tuple[StableId, ...] = ()
     completion_rules: tuple[CompletionRule, ...] = ()
     templates: dict[str, str] = Field(default_factory=dict)
+    # Template bodies, resolved once at registry load. The assistant has to see
+    # the shape it is drafting into while it is still deciding what to ask; a
+    # bare file path told it nothing and it invented its own vocabulary.
+    template_texts: dict[str, str] = Field(default_factory=dict)
     depends_on: tuple[StableId, ...] = ()
     approval_required: bool = True
 
@@ -329,6 +333,8 @@ class PatchPreviewService:
                 validation["compile_errors"] = [
                     {
                         "code": getattr(issue, "code", "COMPILE"),
+                        "path": getattr(issue, "json_pointer", ""),
+                        "source_file": getattr(issue, "source_file", ""),
                         "message": getattr(issue, "message", str(issue)),
                     }
                     for issue in exc.issues
@@ -414,25 +420,71 @@ class PatchPreviewService:
         except Exception:
             checklist = {}
         return {
-            "errors": [
-                {
-                    "code": item.get("code"),
-                    "path": item.get("json_pointer", item.get("path", "")),
-                    "message": item.get("message", ""),
-                }
-                for item in errors
-            ],
-            "warnings": [
-                {
-                    "code": item.get("code"),
-                    "path": item.get("json_pointer", item.get("path", "")),
-                    "message": item.get("message", ""),
-                }
-                for item in warnings
-            ],
+            "errors": [_preview_issue(item) for item in errors],
+            "warnings": [_preview_issue(item) for item in warnings],
             "checklist": {key: value for key, value in checklist.items() if isinstance(value, str)},
             "summary": report.get("summary", "") if isinstance(report, dict) else "",
         }
+
+
+def _preview_issue(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one inspection issue, keeping where it came from.
+
+    ``source_file`` is what lets a refusal name the layer at fault; dropping it
+    produced refusals that blamed the stage being approved for a defect in an
+    already-approved one.
+    """
+    return {
+        "code": item.get("code"),
+        "path": item.get("json_pointer", item.get("path", "")),
+        "source_file": item.get("source_file", ""),
+        "message": item.get("message", ""),
+    }
+
+
+def _section_of(error: Mapping[str, Any]) -> str:
+    """The canonical section an error belongs to ('openness', 'domain', ...)."""
+    source_file = str(error.get("source_file") or "")
+    if source_file.endswith(".yaml"):
+        stem = source_file[: -len(".yaml")]
+        if stem in CANONICAL_SECTIONS:
+            return stem
+    pointer = str(error.get("path") or "")
+    first = pointer.removeprefix("/").split("/", 1)[0]
+    return first if first in CANONICAL_SECTIONS else ""
+
+
+def attribute_specification_error(
+    error: Mapping[str, Any],
+    workflow: WorkflowDefinition | None,
+    stage: WorkflowStage | None,
+) -> str:
+    """Render a validation error with the stage that owns the offending layer.
+
+    Cross-layer validation runs over the whole package, so approving one stage
+    can be refused for a defect in another. Saying only the message left the
+    researcher looking for the fault in the wrong layer.
+    """
+    message = str(error.get("message", "")) or "package validation failed"
+    section = _section_of(error)
+    if not section or workflow is None:
+        return message
+    owner = None
+    for candidate in workflow.stages:
+        if any(
+            owned == f"/{section}" or owned.startswith(f"/{section}/")
+            for owned in candidate.owned_paths
+        ):
+            owner = candidate
+            break
+    if owner is None:
+        return f"{message} [in {section}]"
+    if stage is not None and owner.id == stage.id:
+        return f"{message} [in {section}, owned by this stage]"
+    return (
+        f"{message} [in {section}, owned by the '{owner.id}' stage] "
+        f"— reopen that stage to change it"
+    )
 
 
 class ElicitationAssistant:
@@ -477,7 +529,7 @@ class ElicitationAssistant:
             f"Pending researcher turn: {len(session.turns) + 1}",
             "",
             "## Draft target templates",
-            _render_templates(stage.templates, workflow),
+            _render_templates(stage),
             "",
             "## Registered theory templates",
             _render_theory_templates(workflow, stage),
@@ -536,10 +588,20 @@ class ElicitationAssistant:
         return evaluation
 
 
-def _render_templates(templates: dict[str, str], workflow: WorkflowDefinition) -> str:
-    if not templates:
+def _render_templates(stage: WorkflowStage) -> str:
+    """Render template bodies, not their paths.
+
+    The assistant cannot open files; a path is unusable context. Showing the
+    body is what lets a clarification question be asked in the grammar the
+    draft will actually have to use.
+    """
+    if not stage.templates:
         return "(none)"
-    return "\n".join(f"- {key}: {path}" for key, path in templates.items())
+    sections: list[str] = []
+    for key, path in stage.templates.items():
+        body = stage.template_texts.get(key, "").rstrip()
+        sections.append(f"### template {key} ({path})\n{body}" if body else f"### {key} ({path})")
+    return "\n\n".join(sections)
 
 
 def _render_critical_decisions(stage: WorkflowStage, coverage: dict[str, Any]) -> str:
@@ -885,10 +947,13 @@ class WorkflowRegistry:
         for rule in stage.completion_rules:
             if rule.rule not in WORKFLOW_COMPLETION_RULES:
                 raise ValueError(f"WORKFLOW_STAGE_INVALID: unknown completion rule '{rule.rule}'")
-        for template_path in stage.templates.values():
-            if not (package_dir / template_path).is_file():
+        template_texts: dict[str, str] = {}
+        for key, template_path in stage.templates.items():
+            resolved = package_dir / template_path
+            if not resolved.is_file():
                 raise ValueError(f"WORKFLOW_STAGE_INVALID: missing template file '{template_path}'")
-        return stage
+            template_texts[key] = resolved.read_text()
+        return stage.model_copy(update={"template_texts": template_texts})
 
     def get(self, workflow_id: str) -> WorkflowDefinition:
         try:
@@ -1629,9 +1694,22 @@ class ElicitationEngine:
             raise ValueError(f"WORKFLOW_INVALID: workflow '{workflow_id}' has no stages")
         if session_id:
             try:
-                return self.store.get(session_id)
+                existing = self.store.get(session_id)
             except KeyError:
-                pass
+                existing = None
+            if existing is not None:
+                # Reusing a session id must not silently route the conversation to
+                # a different study or workflow than the caller asked for (M16).
+                if (
+                    existing.specification_id != specification_id
+                    or existing.workflow_id != workflow_id
+                ):
+                    raise ValueError(
+                        f"ELICITATION_SESSION_CONFLICT: session '{session_id}' belongs to "
+                        f"specification '{existing.specification_id}' (workflow "
+                        f"'{existing.workflow_id}'), not '{specification_id}' ({workflow_id})"
+                    )
+                return existing
         first = workflow.stages[0]
         session = ElicitationSession(
             session_id=str(session_id or uuid.uuid4()),

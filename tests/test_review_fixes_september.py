@@ -3818,6 +3818,8 @@ def _review_package(workspace, *, scope=None, cardinality=None, datasets=None, o
                     },
                     "context_policy": "c",
                     "actors": {"ids": ["a1", "a2"]},
+                    # a2 can read the topic a1 set this round; keep that as declared.
+                    "information_timing": {"mode": "sequential"},
                     "trigger": {"type": "phase", "phase": 0, "repeat": True},
                     "state_effects": [
                         {"field": "topic", "op": "set"},
@@ -4070,3 +4072,64 @@ def test_outcome_evaluation_hands_relations_over_without_listing_them(
 
     assert seen["dataset_sources"] == {"events": True, "artifacts": True, "state": True}
     assert seen["legacy_artifacts_listed"] is False
+
+
+def test_a_signed_zero_transition_survives_patch_storage(tmp_path) -> None:
+    """-0.0 and 0.0 compare equal but serialize differently; a patch must keep the sign."""
+    import json as _json
+
+    from genesis.persistence import PersistenceCoordinator
+    from genesis.runtime import (
+        ContextEngine,
+        ExecutorRegistry,
+        ProcessResult,
+        RunController,
+        Scheduler,
+        StateStore,
+    )
+    from genesis.state_encoding import apply_patch, canonical_bytes, encode_patch, identical
+
+    assert identical(-0.0, 0.0) is False
+    assert identical(0.0, 0.0) and identical(-0.0, -0.0)
+    for previous, current in (
+        ({"x": -0.0}, {"x": 0.0}),
+        ({"x": 0.0}, {"x": -0.0}),
+        ({"x": [1, -0.0]}, {"x": [1, 0.0]}),
+        ({"x": {"y": -0.0}}, {"x": {"y": 0.0}}),
+    ):
+        rebuilt = apply_patch(previous, encode_patch(previous, current))
+        assert canonical_bytes(rebuilt) == canonical_bytes(current)
+
+    values = {0: -0.0, 1: 0.0, 2: -0.0}
+
+    class Flip:
+        def execute(self, invocation):
+            return ProcessResult(state_effects={"x": values[invocation.phase]})
+
+    db = PersistenceCoordinator(tmp_path / "zero.db", tmp_path / "zero-objects")
+    try:
+        controller = RunController(
+            Scheduler(
+                [
+                    {
+                        "id": "flip",
+                        "context_policy": "none",
+                        "state_effects": ["x"],
+                        "trigger": {"type": "phase", "phase": 0, "repeat": True},
+                    }
+                ]
+            ),
+            ExecutorRegistry({"flip": Flip()}),
+            ContextEngine({"none": {"allow": []}}),
+            persistence=db,
+            state_store=StateStore({"x": float}, {"x": 1.0}),
+        )
+        controller.run("r", phase_limit=3)
+        history = [
+            _json.dumps(snapshot, sort_keys=True) for _v, snapshot in db.iter_state_history("r")
+        ]
+        assert history == ['{"x": -0.0}', '{"x": 0.0}', '{"x": -0.0}']
+        latest = db.latest_json_state("r")
+        assert latest is not None and _json.dumps(latest[1]) == '{"x": -0.0}'
+    finally:
+        db.close()
