@@ -16,6 +16,18 @@ from typing import Any
 
 OUTCOME_PLAN_VERSION = 1
 
+# What the outcome evaluator reads. A key outside these is never consulted, so a
+# declaration using one compiled clean and evaluated as something else: every
+# clickbait outcome declared ``measure: proportion`` and was counted, and seven
+# named sources nothing defined and produced no rows at all.
+OUTCOME_BUILTIN_SOURCES = frozenset({"events", "artifacts", "state", "lineage"})
+OUTCOME_AGGREGATION_KEYS = frozenset({"op", "type", "operation", "field", "select"})
+OUTCOME_AGGREGATION_OPS = frozenset({"count", "sum", "mean", "trajectory", "distribution"})
+OUTCOME_MISSINGNESS_KEYS = frozenset({"policy"})
+OUTCOME_MISSINGNESS_POLICIES = frozenset({"exclude", "zero"})
+OUTCOME_WINDOW_KEYS = frozenset({"time_field", "start", "end"})
+OUTCOME_JOIN_KEYS = frozenset({"left", "right", "on"})
+
 # Sentinel ``_round`` annotation attached by the service to state snapshots
 # committed in a phase where no round completed (a process failed, was left
 # active, or was skipped). ``each_completed_round`` must never emit an
@@ -125,6 +137,38 @@ def _matches(row: Mapping[str, Any], predicate: Mapping[str, Any]) -> bool:
     return bool(handler(actual, expected))
 
 
+def _exploded(rows: list[dict[str, Any]], path: str) -> list[dict[str, Any]]:
+    """One row per element of the list, or entry of the mapping, at ``path``.
+
+    A record element's fields join its parent's, the element winning a name
+    both carry; a scalar element is written under the path's last segment; a
+    mapping entry's key is kept as ``<segment>_key``. The exploded value itself
+    is not repeated on every row. A row with nothing at the path yields none.
+    """
+    name = path.rsplit(".", 1)[-1]
+    head, _, _ = path.partition(".")
+    exploded: list[dict[str, Any]] = []
+    for row in rows:
+        value = _resolve_path(row, path)
+        if isinstance(value, Mapping):
+            entries: list[tuple[Any, Any]] = list(value.items())
+        elif isinstance(value, list | tuple):
+            entries = [(None, item) for item in value]
+        else:
+            continue
+        parent = {key: item for key, item in row.items() if key != head}
+        for key, element in entries:
+            child = dict(parent)
+            if key is not None:
+                child[f"{name}_key"] = key
+            if isinstance(element, Mapping):
+                child.update(dict(element))
+            else:
+                child[name] = element
+            exploded.append(child)
+    return exploded
+
+
 def _relation(sources: Mapping[str, Any], name: str) -> Iterable[Any]:
     """A fresh walk of one source relation, given as a sequence or a factory.
 
@@ -206,7 +250,15 @@ def materialize_datasets(
                 )
                 if artifact_type and declared_id != artifact_type:
                     continue
-                if process and (payload is None or str(payload.get("process_id", "")) != process):
+                # An invocation row records process_id; a declared artifact
+                # records producer_process. Reading only the first dropped
+                # every declared artifact from a process-filtered dataset.
+                producer = (
+                    payload.get("process_id") or payload.get("producer_process")
+                    if payload is not None
+                    else None
+                )
+                if process and str(producer or "") != process:
                     continue
                 row = {key: value for key, value in artifact.items() if key != "payload"}
                 if payload is not None:
@@ -276,10 +328,23 @@ def materialize_datasets(
             # strip it here rather than letting it leak, but ONLY for state
             # datasets (event/artifact rows may legitimately carry their own
             # fields).
+            # The round a snapshot closed is kept as ``phase`` when the state
+            # does not already carry one: stripped, a per-round table could not
+            # say which round each row was.
             rows = [
-                {key: value for key, value in row.items() if key not in ("_round", "state_version")}
+                {
+                    **({"phase": row["_round"]} if "_round" in row and "phase" not in row else {}),
+                    **{
+                        key: value
+                        for key, value in row.items()
+                        if key not in ("_round", "state_version")
+                    },
+                }
                 for row in rows
             ]
+        explode = dataset.get("explode")
+        if isinstance(explode, str) and explode:
+            rows = _exploded(rows, explode)
         for step in dataset.get("fields") or []:
             if isinstance(step, Mapping):
                 rows = [_apply_fields(dict(row), [step]) for row in rows]

@@ -3063,7 +3063,9 @@ def test_hash_join_matches_the_nested_loop_and_scales_linearly() -> None:
         merged = []
         for left_row in left_rows:
             for right_row in right_rows:
-                if left_row.get(on) == right_row.get(on):
+                # A missing key matches nothing (2026-09-14): None == None joined
+                # every keyless row to every other.
+                if left_row.get(on) is not None and left_row.get(on) == right_row.get(on):
                     merged.append({**left_row, **right_row})
         return merged
 
@@ -3071,6 +3073,7 @@ def test_hash_join_matches_the_nested_loop_and_scales_linearly() -> None:
 
     # An unhashable key cannot index, but it can still compare equal: {} == {}
     # is true and the nested loop matched such rows, so they must not vanish.
+    assert _hash_join([{"k": None, "l": 1}], [{"k": None, "r": 2}], "k") == []
     for keys in ([{}], [[1]], [{"x": 1}], [(1,)], [None]):
         both = [{"k": keys[0], "l": 1}]
         other = [{"k": keys[0], "r": 2}]

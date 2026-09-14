@@ -1,33 +1,39 @@
 schema_version: '1.0'
 study_id: '{{study_id}}'
 outcomes: []
-# Outcomes are computed from datasets, which are extracted from the recorded run.
+# Datasets are the study's analysis tables: flat rows extracted from the recorded
+# run, exported with the run as CSV and Parquet. Declare one per unit a researcher
+# will analyse (an article, a detection, a response). Every row carries the run,
+# condition, factor levels, replication and round, so rows from all cells stack.
 #
 # datasets:
-# - id: item-rows
-#   source: {kind: artifacts, artifact_type: item}
-#       # kind: events | artifacts | state
-#       # events   -> also give 'process'; artifacts -> 'artifact_type';
-#       # state    -> also give 'state' and 'snapshot' (final | each_completed_round)
+# - id: detections
+#   source: {kind: artifacts, artifact_type: detection-result}
+#       # kind: artifacts -> artifact_type (and optionally process)
+#       # kind: events    -> path, a dotted path to a list on each event
+#       #                    (e.g. state_delta.analytics)
+#       # kind: state     -> state, and snapshot: final | each_completed_round
+#   explode: items      # optional: one row per element of a list (or entry of a
+#                       # mapping) at this path -- a feed's items, a map keyed by id
 #   fields:
-#   - {name: phase, op: copy, field: phase}
-#   - {name: creator_id, op: copy, field: creator_id}
-#   - {name: flagged, op: comparison, field: detector_score, operator: gte, value: 7}
+#   - {name: flagged, op: comparison, field: score, operator: gte, value: 7}
 #       # op: copy | literal | arithmetic | comparison | conditional
 #   where:
-#   - {field: detector_score, op: truthy}
-#   deduplicate_on: [phase, creator_id]
+#   - {field: score, op: gte, value: 0}
+#   deduplicate_on: [artifact_id]
 #   missing: retain_null
 #
-# outcomes:                    # 'source' is a dataset id above, or a state id
-# - id: flag-rate-by-period
-#   source: detections
-#   grouping: [condition, replication, period]
-#   aggregation: {measure: proportion, numerator: score_gte_7, denominator: all_items}
-#       # or {measure: mean, field: score}; measure: mean | sum | count | proportion
-#   missingness: {policy: retain_null, exclude_missing_score: true}
-#   window: {type: round_bins, size: 10}
-#   output_schema: outcome-summary
+# outcomes:                    # simple summaries only; anything more (a rate
+# - id: flagged-by-round       # difference, a difference-in-differences, a
+#   source: detections         # concentration index) is computed by the
+#   grouping: [phase]          # researcher from the exported datasets
+#   aggregation: {op: mean, field: flagged}
+#       # op: count | sum | mean | distribution | trajectory; field is required
+#       # except for count. A mean of a true/false field is a proportion.
+#   missingness: {policy: exclude}   # exclude | zero
+#   window: {time_field: phase, start: 1, end: 20}
+#       # source: a dataset id above, a declared artifact id, or events |
+#       # artifacts | state | lineage. Any other key is refused at compile.
 #
 # traces:                      # narrative evidence chains for qualitative reading
 # - id: escalation-trace

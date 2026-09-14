@@ -637,8 +637,19 @@ class OutcomeDatasetFilter(StrictModel):
 class OutcomeDataset(StrictModel):
     """A named, versioned row relation feeding one or more outcomes."""
 
+    @model_serializer(mode="wrap")
+    def _omit_undeclared_explode(self, handler: Any) -> Any:
+        # Left out when undeclared, so existing packages hash as before.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("explode") is None:
+            data.pop("explode", None)
+        return data
+
     id: StableId
     source: OutcomeDatasetSource
+    # One row per element of a list, or per entry of a mapping, at this dotted
+    # path on each source row: a feed's items, a settlement keyed by article.
+    explode: str | None = None
     fields: list[OutcomeDatasetField] = Field(default_factory=list)
     # Narrowing belongs to the relation, not only to the outcomes reading it:
     # a trace seed selects rows without defining an outcome over them.

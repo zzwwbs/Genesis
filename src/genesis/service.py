@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -215,6 +216,7 @@ _FORM_FIELDS: frozenset[str] = frozenset(
         "model_freezing",
         "outcomes",
         "datasets",
+        "traces",
     }
 )
 
@@ -314,6 +316,40 @@ def _artifact_row(
     return row
 
 
+# Columns the engine writes on every dataset row, so rows from any cell stack.
+CELL_COLUMNS = ("run_id", "experiment_id", "condition_id", "replication")
+
+
+def _table_order(row: Mapping[str, Any]) -> tuple[str, float]:
+    """Sort key for an analysis table: run, then round; stable within a round."""
+    phase = row.get("phase")
+    numeric = (
+        float(phase) if isinstance(phase, int | float) and not isinstance(phase, bool) else math.inf
+    )
+    return (str(row.get("run_id", "")), numeric)
+
+
+def _cell_columns(run_id: str, run: Mapping[str, Any]) -> dict[str, Any]:
+    """Which run and cell a dataset row came from, as flat columns.
+
+    Every exported row names its run, condition, replication and each factor
+    level (``factor_<id>``), written by the engine: the cell was recorded only in
+    the run manifest, so rows from different cells could not be stacked.
+    """
+    raw_condition = run.get("condition")
+    condition: Mapping[str, Any] = raw_condition if isinstance(raw_condition, Mapping) else {}
+    raw_factors = condition.get("factors")
+    factors: Mapping[str, Any] = raw_factors if isinstance(raw_factors, Mapping) else {}
+    columns: dict[str, Any] = {
+        "run_id": run_id,
+        "experiment_id": run.get("experiment_id"),
+        "condition_id": run.get("condition_id", condition.get("id", "base")),
+        "replication": int(run.get("replication", 1)),
+    }
+    columns.update({f"factor_{name}": level for name, level in sorted(factors.items())})
+    return columns
+
+
 def _source_rows(sources: Mapping[str, Any], name: str) -> Iterable[Mapping[str, Any]]:
     """A fresh walk of one relation, whether it is a list or a lazy factory."""
     source = sources.get(name)
@@ -344,6 +380,10 @@ def _hash_join(
     unindexed: list[Mapping[str, Any]] = []
     for row in right:
         key = row.get(on)
+        if key is None:
+            # A row without the key matches nothing. Matching None to None joined
+            # every keyless row to every other: 636 events became 767,016 rows.
+            continue
         try:
             index.setdefault(key, []).append(row)
         except TypeError:
@@ -351,6 +391,8 @@ def _hash_join(
     merged: list[dict[str, Any]] = []
     for row in left:
         key = row.get(on)
+        if key is None:
+            continue
         try:
             matches: Iterable[Mapping[str, Any]] = index.get(key) or ()
         except TypeError:
@@ -1793,6 +1835,7 @@ class GenesisService:
             "outcomes": artifact(
                 outcomes=payload.get("outcomes", []),
                 datasets=payload.get("datasets", []),
+                traces=payload.get("traces", []),
             ),
             "models": artifact(models=payload.get("models", [])),
         }
@@ -5126,7 +5169,58 @@ class GenesisService:
             self.last_outcome_engine = "python"
             return None
 
-    def evaluate_outcomes(self, run_id: str) -> list[dict[str, Any]]:
+    # The build files that determine what a run did. An analysis build may
+    # differ from a run's build only outside these.
+    _EXECUTION_DEFINING_FILES = (
+        "processes.json",
+        "process_graph.json",
+        "context_policies.json",
+        "state_model.json",
+        "artifact_catalog.json",
+        "protocol.json",
+        "schemas.json",
+        "prompt_templates.json",
+        "initialization.json",
+    )
+
+    def _analysis_build(self, run_build: Path, analysis_build: str | Path) -> Path:
+        """A build whose outcome plan may be applied to a run of ``run_build``.
+
+        What a study measures may be revised after its runs; what it ran may
+        not. So another build is accepted only if every file that determined
+        execution is byte-identical to the run's build.
+        """
+        candidate = self.resolve_path(analysis_build)
+        StudyCompiler.verify_build(candidate)
+        differing = [
+            name
+            for name in self._EXECUTION_DEFINING_FILES
+            if (run_build / name).is_file() != (candidate / name).is_file()
+            or (
+                (run_build / name).is_file()
+                and _file_digest(run_build / name) != _file_digest(candidate / name)
+            )
+        ]
+        if differing:
+            raise ValueError(
+                "ANALYSIS_BUILD_MISMATCH: the analysis build differs from the run's build in "
+                f"what determined execution ({', '.join(differing)}); only outcomes, datasets "
+                "and traces may change"
+            )
+        return candidate
+
+    def evaluate_outcomes(
+        self,
+        run_id: str,
+        *,
+        datasets_out: dict[str, list[dict[str, Any]]] | None = None,
+        analysis_build: str | Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Evaluate a run's outcomes; ``datasets_out`` also receives its datasets.
+
+        The declared datasets are built on the way to the outcomes. Export needs
+        exactly those rows, so they are handed back rather than built twice.
+        """
         run = self.get_run(run_id)
         if "imported_outcomes" in run:
             return cast(list[dict[str, Any]], run["imported_outcomes"])
@@ -5149,6 +5243,8 @@ class GenesisService:
         if not build_ref:
             return []
         build_path = self.resolve_path(build_ref)
+        if analysis_build is not None:
+            build_path = self._analysis_build(build_path, analysis_build)
         outcome_plan = compile_outcome_plan(build_path)
         definitions = outcome_plan["outcomes"]
         schema_catalog = self._build_schema_catalog(build_path)
@@ -5269,6 +5365,12 @@ class GenesisService:
                     "state": state_stream,
                 },
             )
+            cell = _cell_columns(run_id, run)
+            for rows in dataset_rows.values():
+                for row in rows:
+                    row.update(cell)
+            if datasets_out is not None:
+                datasets_out.update(dataset_rows)
         sources: dict[str, Any] = {
             "events": event_stream,
             "artifacts": artifact_row_stream,
@@ -5444,6 +5546,111 @@ class GenesisService:
                 flat["kind"] = "measurement"
                 derived_rows.append(flat)
         return derived_rows
+
+    @staticmethod
+    def _dataset_tables(
+        datasets: Mapping[str, list[dict[str, Any]]], build_path: Path
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+        """The datasets as flat tables, and their data dictionary.
+
+        One definition for everything that shows a dataset -- the export files
+        and the page -- so a researcher never sees one table on screen and
+        another in the file.
+        """
+        plan = compile_outcome_plan(build_path)
+        declared = {str(item.get("id")): item for item in plan.get("datasets") or []}
+        schemas_file = build_path / "schemas.json"
+        schemas = json.loads(schemas_file.read_text()) if schemas_file.is_file() else {}
+        catalog_file = build_path / "artifact_catalog.json"
+        catalog = {
+            str(entry.get("id")): entry
+            for entry in (json.loads(catalog_file.read_text()) if catalog_file.is_file() else [])
+            if isinstance(entry, dict)
+        }
+        tables: dict[str, list[dict[str, Any]]] = {}
+        dictionary: dict[str, Any] = {}
+        for name in sorted(datasets):
+            source = dict((declared.get(name) or {}).get("source") or {})
+            raw_rows = list(datasets[name])
+            if str(source.get("kind", "")) == "artifacts":
+                # An artifact's value is already spread into the row's columns;
+                # its nested copy would repeat every field as one JSON cell.
+                raw_rows = [{k: v for k, v in row.items() if k != "value"} for row in raw_rows]
+            # In run and round order: rows came out in storage order, so round 10
+            # sorted before round 2 and a table read out of sequence.
+            raw_rows.sort(key=_table_order)
+            rows = _parquet_safe(raw_rows)
+            columns = sorted({key for row in rows for key in row})
+            rows = [{column: row.get(column) for column in columns} for row in rows]
+            tables[name] = rows
+            artifact = catalog.get(str(source.get("artifact_type") or ""), {})
+            schema = schemas.get(str(artifact.get("schema_ref") or ""), {})
+            properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            described: dict[str, Any] = {}
+            for column in columns:
+                observed = sorted(
+                    {type(row[column]).__name__ for row in rows if row.get(column) is not None}
+                )
+                entry: dict[str, Any] = {"observed_types": observed}
+                if column in CELL_COLUMNS or column.startswith("factor_"):
+                    entry["origin"] = "engine: the run and cell the row belongs to"
+                elif column in properties and isinstance(properties[column], dict):
+                    entry["origin"] = f"schema {artifact.get('schema_ref')}"
+                    entry["schema"] = properties[column]
+                described[column] = entry
+            dictionary[name] = {
+                "rows": len(rows),
+                "source": source,
+                "fields": (declared.get(name) or {}).get("fields", []),
+                "where": (declared.get(name) or {}).get("where", []),
+                "columns": described,
+            }
+        return tables, dictionary
+
+    @staticmethod
+    def _write_datasets(
+        directory: Path, datasets: Mapping[str, list[dict[str, Any]]], build_path: Path
+    ) -> list[Path]:
+        """Write each declared dataset as CSV and Parquet, with a data dictionary.
+
+        The datasets are the study's analysis tables. They were built only to
+        feed outcomes and never written, so a researcher had to rebuild them from
+        the event ledger and artifact payloads.
+        """
+        directory.mkdir(parents=True, exist_ok=True)
+        tables, dictionary = GenesisService._dataset_tables(datasets, build_path)
+        written: list[Path] = []
+        for name, rows in tables.items():
+            written.append(AnalysisExporter().export_csv(rows, directory / f"{name}.csv"))
+            if rows:
+                written.append(
+                    AnalysisExporter.rows_to_parquet(rows, directory / f"{name}.parquet")
+                )
+        target = directory / "dictionary.json"
+        target.write_text(json.dumps(dictionary, indent=2, sort_keys=True, default=str) + "\n")
+        written.append(target)
+        return written
+
+    def run_datasets(
+        self, run_id: str, *, analysis_build: str | Path | None = None
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+        """A run's datasets as the tables its export would write, and their dictionary."""
+        run = self.get_run(run_id)
+        build_ref = run.get("build") or run.get("build_path")
+        if not build_ref:
+            raise ValueError(
+                f"DATASETS_UNAVAILABLE: run '{run_id}' has no build to define its datasets"
+            )
+        build_path = self.resolve_path(str(build_ref))
+        if analysis_build is not None:
+            build_path = self._analysis_build(build_path, analysis_build)
+        datasets: dict[str, list[dict[str, Any]]] = {}
+        self.evaluate_outcomes(run_id, datasets_out=datasets, analysis_build=analysis_build)
+        if self._retention_purges_raw(json.loads((build_path / "processes.json").read_text())):
+            datasets = {
+                name: GenesisService._redact_raw_responses(rows) for name, rows in datasets.items()
+            }
+        return self._dataset_tables(datasets, build_path)
 
     @staticmethod
     def _with_derived_rows(
@@ -7055,10 +7262,121 @@ class GenesisService:
             if path.is_relative_to(staging)
         ]
 
+    def export_experiment(
+        self,
+        experiment_id: str,
+        output: str | Path,
+        *,
+        analysis_build: str | Path | None = None,
+    ) -> list[Path]:
+        """Export one experiment's cells as stacked analysis tables.
+
+        Each run bundle holds one cell, so a comparison across conditions began
+        by stacking four bundles by hand. This writes one table per declared
+        dataset with every cell's rows (each carrying its run, condition, factor
+        levels and replication), the stacked outcomes, and ``experiment.json``
+        saying which runs went in and how each ended -- a run that stopped short
+        is listed as such, not left out. Published atomically, never over an
+        existing destination.
+        """
+        runs = [
+            run
+            for run in self.persistence.list_runs()
+            if run.get("experiment_id") == experiment_id
+            and run.get("id") != experiment_id
+            and (run.get("build") or run.get("build_path"))
+        ]
+        if not runs:
+            raise ValueError(
+                f"EXPORT_EXPERIMENT_EMPTY: experiment '{experiment_id}' has no runs with a build"
+            )
+        builds = {str(run.get("build") or run.get("build_path")) for run in runs}
+        if len(builds) != 1:
+            raise ValueError(
+                f"EXPORT_EXPERIMENT_MIXED: experiment '{experiment_id}' ran {len(builds)} "
+                "different builds; their tables do not share one definition"
+            )
+        build_path = self.resolve_path(builds.pop())
+        if analysis_build is not None:
+            build_path = self._analysis_build(build_path, analysis_build)
+        processes = json.loads((build_path / "processes.json").read_text())
+        purge = self._retention_purges_raw(processes)
+        stacked: dict[str, list[dict[str, Any]]] = {}
+        outcome_rows: list[dict[str, Any]] = []
+        summary: list[dict[str, Any]] = []
+        for run in sorted(runs, key=lambda item: str(item["id"])):
+            run_id = str(run["id"])
+            datasets: dict[str, list[dict[str, Any]]] = {}
+            outcomes = self.evaluate_outcomes(
+                run_id, datasets_out=datasets, analysis_build=analysis_build
+            )
+            cell = _cell_columns(run_id, run)
+            outcome_rows.extend({**cell, **row} for row in outcomes)
+            for name, rows in datasets.items():
+                stacked.setdefault(name, []).extend(rows)
+            executions = run.get("executions") or []
+            summary.append(
+                {
+                    **cell,
+                    "status": run.get("status"),
+                    "complete": run.get("status") == "completed"
+                    and not any(item.get("stopped_by") for item in executions),
+                    "stopped_by": [
+                        item.get("stopped_by") for item in executions if item.get("stopped_by")
+                    ],
+                    "resumed": any(item.get("resumed_from_status") for item in executions),
+                    "build_hash": (run.get("manifest") or {}).get("build_hash"),
+                }
+            )
+        if purge:
+            outcome_rows = GenesisService._redact_raw_responses(outcome_rows)
+            stacked = {
+                name: GenesisService._redact_raw_responses(rows) for name, rows in stacked.items()
+            }
+        destination = self.resolve_path(output).resolve()
+        if destination.exists():
+            raise ValueError(
+                f"EXPORT_DESTINATION: refuses to overwrite existing destination {destination}"
+            )
+        staging = stage_bundle(destination)
+        try:
+            paths = self._write_datasets(staging / "datasets", stacked, build_path)
+            if outcome_rows:
+                safe = _parquet_safe(outcome_rows)
+                paths.append(AnalysisExporter().export_csv(safe, staging / "outcomes.csv"))
+            (staging / "outcomes.json").write_text(
+                json.dumps(outcome_rows, indent=2, sort_keys=True, default=str) + "\n"
+            )
+            experiment: dict[str, Any] = {
+                "id": experiment_id,
+                "runs": summary,
+                # Which outcome plan the tables were built from, when it is not
+                # the one the runs were compiled with.
+                "analysis_build": str(build_path) if analysis_build is not None else None,
+            }
+            try:
+                experiment.update(self.persistence.get_experiment(experiment_id))
+            except KeyError:
+                pass
+            (staging / "experiment.json").write_text(
+                json.dumps(experiment, indent=2, sort_keys=True, default=str) + "\n"
+            )
+            files = [path for path in staging.rglob("*") if path.is_file()]
+            integrity = {path.relative_to(staging).as_posix(): _file_digest(path) for path in files}
+            (staging / "integrity.json").write_text(
+                json.dumps(integrity, indent=2, sort_keys=True) + "\n"
+            )
+            publish_bundle(staging, destination)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return sorted(path for path in destination.rglob("*") if path.is_file())
+
     def _write_bundle(self, run_id: str, destination: Path, *, mode: str) -> list[Path]:
         """Write all bundle members for one run into a prepared directory."""
         run = self.get_run(run_id)
-        outcomes = self.evaluate_outcomes(run_id)
+        datasets: dict[str, list[dict[str, Any]]] = {}
+        outcomes = self.evaluate_outcomes(run_id, datasets_out=datasets)
         retention_build = run.get("build") or run.get("build_path")
         if retention_build:
             processes_file = self.resolve_path(retention_build) / "processes.json"
@@ -7068,6 +7386,10 @@ class GenesisService:
                 # Outcomes are computed from full evidence, so the raw-response
                 # fields redacted from events and artifacts are redacted here too.
                 outcomes = GenesisService._redact_raw_responses(outcomes)
+                datasets = {
+                    name: GenesisService._redact_raw_responses(rows)
+                    for name, rows in datasets.items()
+                }
         result_paths = AnalysisExporter().export_bundle(
             outcomes,
             destination,
@@ -7075,6 +7397,14 @@ class GenesisService:
             replay_lineage={"source_run_id": run_id},
         )
         output_paths = list(result_paths)
+        if datasets and (run.get("build") or run.get("build_path")):
+            output_paths.extend(
+                self._write_datasets(
+                    destination / "datasets",
+                    datasets,
+                    self.resolve_path(str(run.get("build") or run.get("build_path"))),
+                )
+            )
         extras: dict[str, str] = {
             "run_manifest.json": json.dumps(run.get("manifest") or {}, indent=2, sort_keys=True)
         }
@@ -7178,9 +7508,24 @@ class GenesisService:
             extras["artifacts.json"] = json.dumps(artifact_rows, indent=2, default=str)
             output_paths.append(
                 AnalysisExporter.rows_to_parquet(
+                    # The payload's own fields, without the provider exchange
+                    # (in artifacts.json): dropping the payload whole left only
+                    # an id, a media type and a size, and none of the values.
                     _parquet_safe(
                         [
-                            {key: value for key, value in row.items() if key != "payload"}
+                            {
+                                **{key: value for key, value in row.items() if key != "payload"},
+                                **{
+                                    key: value
+                                    for key, value in (
+                                        row["payload"]
+                                        if isinstance(row.get("payload"), dict)
+                                        else {}
+                                    ).items()
+                                    if key not in self._EVIDENCE_ONLY_ARTIFACT_FIELDS
+                                    and key not in row
+                                },
+                            }
                             for row in artifact_rows
                         ]
                     ),
@@ -7931,6 +8276,10 @@ class GenesisService:
             "domain": block_fields(domain, _DOMAIN_BLOCK_FIELDS),
             "protocol": block_fields(protocol, _PROTOCOL_BLOCK_FIELDS),
             "outcomes": [o.model_dump(mode="json") for o in outcomes.outcomes],
+            # Rebuilding the form without these dropped a package's datasets and
+            # traces on import and at every guided approval.
+            "datasets": [d.model_dump(mode="json") for d in outcomes.datasets],
+            "traces": [t.model_dump(mode="json") for t in outcomes.traces],
             "models": [m.model_dump(mode="json") for m in models.models],
             "prompts": prompts,
             "schemas": GenesisService._read_schema_files(source_path),

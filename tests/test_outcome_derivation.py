@@ -707,3 +707,45 @@ def test_deduplicating_on_a_structured_field_does_not_crash() -> None:
     }
     rows = materialize_datasets(plan, {**_sources(), "events": events})["people"]
     assert sorted(row["who"]["id"] for row in rows) == ["u1", "u2"]
+
+
+def test_a_dataset_explodes_a_list_or_a_mapping_into_rows() -> None:
+    """A feed's items, or a settlement keyed by article, as one row each."""
+    artifacts = [
+        {
+            "artifact_id": "f1",
+            "payload": {
+                "declared_artifact_id": "user-feed",
+                "value": {
+                    "user_id": "u1",
+                    "phase": 2,
+                    "items": [{"article_id": "a"}, {"article_id": "b"}],
+                },
+            },
+        }
+    ]
+    state = [{"state_version": 3, "performance": {"a": {"clicks": 2}, "b": {"clicks": 0}}}]
+    plan = {
+        "datasets": [
+            {
+                "id": "deliveries",
+                "source": {"kind": "artifacts", "artifact_type": "user-feed"},
+                "explode": "items",
+            },
+            {
+                "id": "settlement",
+                "source": {"kind": "state", "snapshot": "final", "state": "performance"},
+                "explode": "performance",
+            },
+        ]
+    }
+    built = materialize_datasets(plan, {"artifacts": artifacts, "events": [], "state": state})
+    assert [(row["user_id"], row["phase"], row["article_id"]) for row in built["deliveries"]] == [
+        ("u1", 2, "a"),
+        ("u1", 2, "b"),
+    ]
+    assert all("items" not in row for row in built["deliveries"])
+    assert [(row["performance_key"], row["clicks"]) for row in built["settlement"]] == [
+        ("a", 2),
+        ("b", 0),
+    ]

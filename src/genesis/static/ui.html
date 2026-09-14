@@ -251,6 +251,13 @@
       .research-workspace { min-height: calc(100vh - 220px); }
       #elicitation-action-footer .danger-quiet { margin-left: auto; }
     }
+    /* A fieldset sizes to its content by default, so a wide table stretched the
+       whole page instead of scrolling inside its own box. */
+    fieldset.analysis-tables { min-width: 0; }
+    .table-scroll { overflow: auto; max-width: 100%; max-height: 28rem; margin-top: .5rem; }
+    #dataset-table { border-collapse: collapse; font-size: 12px; }
+    #dataset-table th, #dataset-table td { border: 1px solid #ddd; padding: 2px 6px; white-space: nowrap; max-width: 22rem; overflow: hidden; text-overflow: ellipsis; text-align: left; vertical-align: top; }
+    #dataset-table th { position: sticky; top: 0; background: #f4f4f4; }
   </style>
 </head>
 <body>
@@ -500,6 +507,37 @@
         <label for="trace-max-steps" title="Chains keep the steps nearest the seed; raise this to widen a truncated chain.">max steps</label>
         <input id="trace-max-steps" type="number" min="1" max="1000" value="40" size="5">
         <button onclick="processMap('builds/' + id())">Process map (current build)</button>
+      </div>
+    </fieldset>
+    <fieldset class="analysis-tables">
+      <legend>Analysis tables</legend>
+      <p class="muted">The study's declared datasets, one flat row per item, each carrying its run, condition, factor levels, replication and round. These are the tables an export writes; rates across cells and further statistics are computed from them.</p>
+      <div>
+        <button onclick="loadDatasets()">List datasets for run</button>
+        <label for="dataset-select">Dataset:</label>
+        <select id="dataset-select" onchange="loadDatasetPage(0)"></select>
+        <label for="dataset-limit">rows per page</label>
+        <input id="dataset-limit" type="number" min="1" max="1000" value="50" size="5">
+        <button id="dataset-prev" onclick="datasetPage(-1)" disabled>Previous</button>
+        <button id="dataset-next" onclick="datasetPage(1)" disabled>Next</button>
+        <span id="dataset-status" class="muted"></span>
+      </div>
+      <div>
+        <label for="analysis-build" title="A build whose datasets and outcomes to apply; refused unless everything that determined execution is identical to the run's build.">Analysis build (optional):</label>
+        <input id="analysis-build" placeholder="builds/… (defaults to the run's own)" size="36">
+      </div>
+      <div class="table-scroll"><table id="dataset-table"></table></div>
+    </fieldset>
+    <fieldset>
+      <legend>Export an experiment</legend>
+      <p class="muted">Stacks every cell of an experiment into one table per dataset, with the stacked outcomes and a list of the runs that went in and how each ended.</p>
+      <div>
+        <label for="experiment-select">Experiment:</label>
+        <select id="experiment-select"></select>
+        <button onclick="refreshExperiments()">Refresh experiments</button>
+        <label for="experiment-output">Output:</label>
+        <input id="experiment-output" placeholder="exports/&lt;experiment&gt;-tables" size="28">
+        <button onclick="exportExperiment()">Export experiment tables</button>
       </div>
     </fieldset>
     <pre id="analysis-output">No analysis loaded.</pre>
@@ -1473,7 +1511,119 @@
       if (select && select.options.length) return select.options[0].value;
       return runId();
     };
-    function noteRunSelection() { /* selection stored in the select element */ }
+    // A table left from one run must not read as another's once the run changes.
+    function noteRunSelection() { clearDatasetView(); }
+    function clearDatasetView() {
+      document.getElementById('dataset-select').innerHTML = '';
+      document.getElementById('dataset-table').innerHTML = '';
+      document.getElementById('dataset-status').textContent = '';
+      document.getElementById('dataset-prev').disabled = true;
+      document.getElementById('dataset-next').disabled = true;
+    }
+    function analysisBuildParam() {
+      const build = document.getElementById('analysis-build').value.trim();
+      return build ? `&analysis_build=${encodeURIComponent(build)}` : '';
+    }
+    async function loadDatasets() {
+      const run = selectedRun();
+      clearDatasetView();
+      try {
+        const result = await request(`/runs/${encodeURIComponent(run)}/datasets?${analysisBuildParam().slice(1)}`);
+        const select = document.getElementById('dataset-select');
+        for (const [name, info] of Object.entries(result.datasets || {})) {
+          const option = document.createElement('option');
+          option.value = name;
+          option.textContent = `${name} (${info.rows} rows)`;
+          select.appendChild(option);
+        }
+        show('analysis-output', {run_id: run, datasets: result.datasets});
+        if (select.options.length) {
+          await loadDatasetPage(0);
+        } else {
+          document.getElementById('dataset-status').textContent = "This run's build declares no datasets.";
+        }
+      } catch (e) { show('analysis-output', e.message); }
+    }
+    async function loadDatasetPage(offset) {
+      const run = selectedRun();
+      const name = document.getElementById('dataset-select').value;
+      if (!name) return;
+      const limit = Math.min(1000, Math.max(1, Number(document.getElementById('dataset-limit').value) || 50));
+      try {
+        const page = await request(`/runs/${encodeURIComponent(run)}/datasets/${encodeURIComponent(name)}?offset=${Math.max(0, offset)}&limit=${limit}${analysisBuildParam()}`);
+        renderDatasetTable(page);
+      } catch (e) { show('analysis-output', e.message); }
+    }
+    function datasetPage(direction) {
+      const table = document.getElementById('dataset-table');
+      const offset = Number(table.dataset.offset || 0);
+      const limit = Number(table.dataset.limit || 50);
+      loadDatasetPage(Math.max(0, offset + direction * limit));
+    }
+    // Built as nodes: dataset cells hold model-written text (titles, bodies,
+    // rationales), which must never be parsed as markup.
+    function renderDatasetTable(page) {
+      const table = document.getElementById('dataset-table');
+      table.innerHTML = '';
+      table.dataset.offset = String(page.offset);
+      table.dataset.limit = String(page.limit);
+      const head = document.createElement('tr');
+      for (const column of page.columns) {
+        const cell = document.createElement('th');
+        cell.textContent = column;
+        head.appendChild(cell);
+      }
+      table.appendChild(head);
+      for (const row of page.rows) {
+        const line = document.createElement('tr');
+        for (const column of page.columns) {
+          const cell = document.createElement('td');
+          const value = row[column];
+          cell.textContent = value === null || value === undefined ? '' : String(value);
+          cell.title = cell.textContent;
+          line.appendChild(cell);
+        }
+        table.appendChild(line);
+      }
+      const end = Math.min(page.offset + page.rows.length, page.total);
+      document.getElementById('dataset-status').textContent = page.total
+        ? `${page.dataset}: rows ${page.offset + 1}–${end} of ${page.total}`
+        : `${page.dataset}: no rows`;
+      document.getElementById('dataset-prev').disabled = page.offset <= 0;
+      document.getElementById('dataset-next').disabled = end >= page.total;
+    }
+    async function refreshExperiments() {
+      try {
+        const result = await request('/experiments');
+        const experiments = result.items || result || [];
+        const select = document.getElementById('experiment-select');
+        const previous = select.value;
+        select.innerHTML = '';
+        for (const experiment of experiments) {
+          const option = document.createElement('option');
+          option.value = experiment.id;
+          option.textContent = `${experiment.id} (${experiment.study_id || 'study unknown'})`;
+          select.appendChild(option);
+        }
+        if (previous && [...select.options].some(o => o.value === previous)) select.value = previous;
+        show('analysis-output', {experiments_available: experiments.length});
+      } catch (e) { show('analysis-output', e.message); }
+    }
+    async function exportExperiment() {
+      const experiment = document.getElementById('experiment-select').value;
+      if (!experiment) {
+        show('analysis-output', 'Choose an experiment first: Refresh experiments, then pick one.');
+        return;
+      }
+      const output = document.getElementById('experiment-output').value.trim() || `exports/${experiment}-tables`;
+      const analysisBuild = document.getElementById('analysis-build').value.trim();
+      const body = analysisBuild ? {output, analysis_build: analysisBuild} : {output};
+      try {
+        show('analysis-output', 'Exporting…');
+        const result = await request(`/experiments/${encodeURIComponent(experiment)}/export`, {method:'POST', body:JSON.stringify(body), timeoutMs: 30 * 60 * 1000});
+        show('analysis-output', {experiment_id: result.experiment_id, status: result.status, files: result.paths});
+      } catch (e) { show('analysis-output', e.message); }
+    }
     async function refreshRuns() {
       try {
         const result = await request('/runs');

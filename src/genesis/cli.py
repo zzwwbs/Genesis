@@ -107,6 +107,16 @@ def build_parser() -> argparse.ArgumentParser:
                 choices=["exploration", "reproducibility"],
                 help="Bundle capability level",
             )
+            command.add_argument(
+                "--experiment",
+                default=None,
+                help="Export every run of this experiment as stacked analysis tables",
+            )
+            command.add_argument(
+                "--analysis-build",
+                default=None,
+                help="Build whose datasets and outcomes to apply (execution must be identical)",
+            )
     return parser
 
 
@@ -359,8 +369,16 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         service = GenesisService(args.path)
         try:
-            paths = service.export_run(
-                args.run_id or "run-1", args.output, mode=str(getattr(args, "mode", "exploration"))
+            paths = (
+                service.export_experiment(
+                    args.experiment, args.output, analysis_build=args.analysis_build
+                )
+                if args.experiment
+                else service.export_run(
+                    args.run_id or "run-1",
+                    args.output,
+                    mode=str(getattr(args, "mode", "exploration")),
+                )
             )
             print(json.dumps({"paths": [str(path) for path in paths], "status": "exported"}))
         finally:

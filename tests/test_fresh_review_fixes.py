@@ -311,7 +311,7 @@ def test_exported_outcomes_redact_raw_responses_under_purge_retention(
     monkeypatch.setattr(
         service,
         "evaluate_outcomes",
-        lambda run_id: [{"outcome_id": "texts", "raw_response": "top-secret"}],
+        lambda run_id, **_: [{"outcome_id": "texts", "raw_response": "top-secret"}],
     )
     service.export_run("run-a", "exports/review")
     exported = "".join(

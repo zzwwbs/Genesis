@@ -428,6 +428,65 @@ def create_app(
         except Exception as exc:
             return _service_error(exc)
 
+    @app.get("/runs/{run_id}/datasets")
+    def run_datasets(run_id: str, analysis_build: str | None = None) -> Any:
+        """The run's dataset dictionary: what tables exist, their rows and columns."""
+        try:
+            _tables, dictionary = service.run_datasets(run_id, analysis_build=analysis_build)
+            return {"run_id": run_id, "datasets": dictionary}
+        except Exception as exc:
+            return _service_error(exc)
+
+    @app.get("/runs/{run_id}/datasets/{dataset_id}")
+    def run_dataset_rows(
+        run_id: str,
+        dataset_id: str,
+        offset: int = 0,
+        limit: int = 100,
+        analysis_build: str | None = None,
+    ) -> Any:
+        """One page of a dataset's rows, exactly as the export writes them."""
+        try:
+            if offset < 0 or not 1 <= limit <= 1000:
+                raise ValueError(
+                    "VALIDATION_ERROR: offset must be >= 0 and limit between 1 and 1000"
+                )
+            tables, dictionary = service.run_datasets(run_id, analysis_build=analysis_build)
+            if dataset_id not in tables:
+                raise KeyError(dataset_id)
+            rows = tables[dataset_id]
+            return {
+                "run_id": run_id,
+                "dataset": dataset_id,
+                "total": len(rows),
+                "offset": offset,
+                "limit": limit,
+                "columns": sorted(dictionary[dataset_id]["columns"]),
+                "rows": rows[offset : offset + limit],
+            }
+        except Exception as exc:
+            return _service_error(exc)
+
+    @app.post("/experiments/{experiment_id}/export")
+    def export_experiment(experiment_id: str, payload: dict[str, Any]) -> Any:
+        try:
+            output = str(payload.get("output", ""))
+            if not output:
+                return _error("VALIDATION_ERROR", "output is required", 422)
+            analysis_build = payload.get("analysis_build")
+            paths = service.export_experiment(
+                experiment_id,
+                output,
+                analysis_build=str(analysis_build) if analysis_build else None,
+            )
+            return {
+                "experiment_id": experiment_id,
+                "paths": [str(path) for path in paths],
+                "status": "exported",
+            }
+        except Exception as exc:
+            return _service_error(exc)
+
     @app.get("/specifications/{specification_id}/versions/{version}/snapshot")
     def package_snapshot(specification_id: str, version: int) -> Any:
         try:

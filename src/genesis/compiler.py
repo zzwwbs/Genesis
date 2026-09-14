@@ -620,6 +620,135 @@ def _validate_triggers(openness: OpennessSpec) -> list[dict[str, str]]:
     return errors
 
 
+def _validate_outcomes(outcomes: Any, domain: DomainSpec) -> list[dict[str, str]]:
+    """Refuse an outcome the evaluator would skip, or evaluate as something else.
+
+    The evaluator reads a small grammar and ignores everything outside it: an
+    unknown source yields no rows, an unread aggregation key falls back to a
+    count, and an aggregation with no field is skipped. The clickbait study
+    declared ten outcomes that way; none was computed as written.
+    """
+    from .outcome_plan import (
+        OUTCOME_AGGREGATION_KEYS,
+        OUTCOME_AGGREGATION_OPS,
+        OUTCOME_BUILTIN_SOURCES,
+        OUTCOME_JOIN_KEYS,
+        OUTCOME_MISSINGNESS_KEYS,
+        OUTCOME_MISSINGNESS_POLICIES,
+        OUTCOME_WINDOW_KEYS,
+    )
+
+    known_sources = (
+        set(OUTCOME_BUILTIN_SOURCES)
+        | {str(dataset.id) for dataset in outcomes.datasets}
+        | {str(artifact.id) for artifact in domain.artifacts}
+    )
+    errors: list[dict[str, str]] = []
+
+    def refuse(outcome_id: str, part: str, message: str, code: str) -> None:
+        errors.append(
+            {
+                "code": code,
+                "severity": "error",
+                "path": f"outcomes.outcomes.{outcome_id}.{part}",
+                "message": message,
+            }
+        )
+
+    for outcome in outcomes.outcomes:
+        oid = str(outcome.id)
+        sources = outcome.source if isinstance(outcome.source, list) else [outcome.source]
+        if len(sources) != 1:
+            refuse(
+                oid,
+                "source",
+                f"an outcome reads exactly one source; only the first of {sources} would be read",
+                "OUTCOME_SOURCE_UNKNOWN",
+            )
+        join = outcome.join
+        if isinstance(join, dict):
+            unread = sorted(set(join) - OUTCOME_JOIN_KEYS)
+            if unread:
+                refuse(
+                    oid,
+                    "join",
+                    f"join keys {unread} are never read; a join is {{left, right, on}}",
+                    "OUTCOME_KEY_UNREAD",
+                )
+            for side, default in (("left", "events"), ("right", "artifacts")):
+                name = str(join.get(side, default))
+                if name not in known_sources:
+                    refuse(
+                        oid,
+                        f"join.{side}",
+                        f"join {side} '{name}' is not a source",
+                        "OUTCOME_SOURCE_UNKNOWN",
+                    )
+        elif str(sources[0]) not in known_sources:
+            refuse(
+                oid,
+                "source",
+                f"source '{sources[0]}' is neither a built-in source "
+                f"({', '.join(sorted(OUTCOME_BUILTIN_SOURCES))}), a declared artifact nor a "
+                "dataset declared in outcomes.datasets, so it has no rows",
+                "OUTCOME_SOURCE_UNKNOWN",
+            )
+        aggregation = outcome.aggregation or {}
+        unread = sorted(set(aggregation) - OUTCOME_AGGREGATION_KEYS)
+        if unread:
+            refuse(
+                oid,
+                "aggregation",
+                f"aggregation keys {unread} are never read; an aggregation is {{op, field}}",
+                "OUTCOME_KEY_UNREAD",
+            )
+        op = aggregation.get("op", aggregation.get("type", aggregation.get("operation", "count")))
+        if op not in OUTCOME_AGGREGATION_OPS:
+            refuse(
+                oid,
+                "aggregation.op",
+                f"aggregation '{op}' is not computed; use one of "
+                f"{', '.join(sorted(OUTCOME_AGGREGATION_OPS))}, and derive anything else "
+                "from the exported datasets",
+                "OUTCOME_AGGREGATION_UNSUPPORTED",
+            )
+        if op != "count" and not (aggregation.get("field") or aggregation.get("select")):
+            refuse(
+                oid,
+                "aggregation.field",
+                f"a {op} needs a field; without one the outcome is skipped",
+                "OUTCOME_FIELD_MISSING",
+            )
+        missingness = outcome.missingness or {}
+        unread = sorted(set(missingness) - OUTCOME_MISSINGNESS_KEYS)
+        if unread:
+            refuse(
+                oid,
+                "missingness",
+                f"missingness keys {unread} are never read",
+                "OUTCOME_KEY_UNREAD",
+            )
+        policy = missingness.get("policy", "exclude")
+        if policy not in OUTCOME_MISSINGNESS_POLICIES:
+            refuse(
+                oid,
+                "missingness.policy",
+                f"missingness policy '{policy}' is not applied; "
+                f"use {' or '.join(sorted(OUTCOME_MISSINGNESS_POLICIES))}",
+                "OUTCOME_KEY_UNREAD",
+            )
+        window = outcome.window or {}
+        unread = sorted(set(window) - OUTCOME_WINDOW_KEYS)
+        if unread:
+            refuse(
+                oid,
+                "window",
+                f"window keys {unread} are never read; a window is {{time_field, start, end}}",
+                "OUTCOME_KEY_UNREAD",
+            )
+    return errors
+
+
 def _validate_run_length(protocol: Any, warnings: list[dict[str, Any]]) -> list[dict[str, str]]:
     """Refuse a declared run length or termination the engine would not honour.
 
@@ -1934,6 +2063,7 @@ class StudyCompiler:
         errors.extend(_validate_actor_sources(domain, openness, warnings))
         errors.extend(_validate_triggers(openness))
         errors.extend(_validate_retention(openness))
+        errors.extend(_validate_outcomes(loaded["outcomes"], domain))
         errors.extend(_validate_run_length(loaded["protocol"], warnings))
         errors.extend(_validate_engine_fields(openness, self.source))
         warnings.extend(_advise_rounds_without_repeat(openness))
