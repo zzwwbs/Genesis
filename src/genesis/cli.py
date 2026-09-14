@@ -236,10 +236,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit("compile requires --output")
         source, output = Path(args.path).resolve(), Path(args.output).resolve()
         workspace = Path(os.path.commonpath([source, output]))
-        if workspace == Path(workspace.anchor):
-            # A source under /Users and output under /tmp share only `/`; using
-            # it as a service workspace would attempt to create `/.genesis`.
-            # Explicit CLI package compilation is safe to perform directly.
+        if not (workspace / ".genesis").is_dir():
+            # The directory the two paths share is a workspace only if one was
+            # initialised there. Treating any shared ancestor as one created
+            # `.genesis` wherever they happened to meet -- a home directory, or on
+            # macOS `/private`, which is not writable -- and testing only for `/`
+            # missed every other case. Without a workspace, compile directly.
             from genesis.compiler import StudyCompiler
             from genesis.elicitation import WorkflowRegistry
             from genesis.service import _workflows_root

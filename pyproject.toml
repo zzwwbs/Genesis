@@ -47,6 +47,11 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.isort]
+# studies/ is gitignored, so without this ruff sorts it as first-party in a local
+# checkout and third-party on a clean clone, and the two disagree on import order.
+known-first-party = ["genesis", "studies"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

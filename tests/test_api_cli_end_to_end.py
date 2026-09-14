@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -46,3 +47,20 @@ def test_cli_compiles_across_filesystem_roots(tmp_path: Path, capsys) -> None:
     result = json.loads(capsys.readouterr().out)
     assert result["study_id"] == "platform-governance"
     assert (output / "integrity_manifest.json").is_file()
+
+
+def test_cli_compile_never_creates_a_workspace_where_paths_happen_to_meet(
+    tmp_path: Path, capsys
+) -> None:
+    """The shared ancestor became a workspace even when none was initialised there.
+
+    On macOS a checkout under /private/tmp and pytest's /private/var temp dir met
+    at /private, and compile tried to create /private/.genesis.
+    """
+    source = Path(__file__).parent / "golden_studies" / "platform_governance"
+    shared = tmp_path / "shared"
+    package = shared / "package"
+    shutil.copytree(source, package)
+    main(["compile", str(package), "--output", str(shared / "build")])
+    assert json.loads(capsys.readouterr().out)["study_id"] == "platform-governance"
+    assert not (shared / ".genesis").exists()

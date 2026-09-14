@@ -15,7 +15,13 @@ from typing import Any
 import pytest
 
 from genesis.runtime import _plain
-from studies.clickbait_2x2 import (
+
+# studies/ and genesis-workspace/ are gitignored: the study code and its package
+# exist only in a local checkout that has them. On a clean clone -- CI -- this
+# module skips rather than failing to collect on files the repository never carried.
+pytest.importorskip("studies.clickbait_2x2", reason="studies/ is local-only")
+
+from studies.clickbait_2x2 import (  # noqa: E402
     DETECTION_THRESHOLD,
     DISCOVERY_SHARE,
     SANCTION_ONSET_PHASE,
@@ -26,7 +32,8 @@ from studies.clickbait_2x2 import (
     top_3_leaderboard,
 )
 
-SCHEMAS = Path("genesis-workspace/.genesis/specifications/clickbait-2x2-v4/schemas")
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMAS = ROOT / "genesis-workspace/.genesis/specifications/clickbait-2x2-v4/schemas"
 
 
 class _Context:
