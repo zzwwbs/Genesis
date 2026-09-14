@@ -75,7 +75,7 @@ def test_governance_golden_runs_protocol_end_to_end(tmp_path: Path, monkeypatch)
     monkeypatch.setattr("genesis.service.OpenAICompatibleProvider", GoldenProvider)
     service = _workspace_for(tmp_path, "platform_governance")
     try:
-        result = service.execute_protocol("platform-governance-run")
+        result = service.execute_protocol("platform-governance-run", replications=2)
         assert result["status"] == "completed"
         assert len(result["runs"]) == 4  # 2 conditions x 2 replications
         for trial_id in result["runs"]:

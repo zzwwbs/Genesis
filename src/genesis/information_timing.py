@@ -304,12 +304,35 @@ def model_effect_problems(
             continue
         field = str(effect.get("field", ""))
         if not model_call:
-            ignored = sorted({"from", "key"} & set(effect))
-            if ignored:
+            # ``from`` names an output the runtime reads, which only a model
+            # call has. ``key`` is different: it says the write lands under the
+            # acting actor, and that is what makes a fanned-out write compose --
+            # ``whole_field_writes`` counts a keyed op as composable only when
+            # the key is the actor. Refusing it here left a per-actor
+            # computational process with no way to declare a composable keyed
+            # write at all: declaring the key was rejected, and omitting it made
+            # the write whole-field and so refused under simultaneous timing.
+            if "from" in effect:
                 problems.append(
-                    f"effect on '{field}' declares {', '.join(ignored)}, which only a model "
-                    "call's effects use; this executor computes its own writes"
+                    f"effect on '{field}' declares from, which only a model call's effects "
+                    "use; this executor computes its own writes"
                 )
+            key = effect.get("key")
+            if key is not None:
+                if key != "actor":
+                    problems.append(
+                        f"effect on '{field}' has key '{key}'; only 'actor' is supported"
+                    )
+                elif not _acts_per_actor(process):
+                    problems.append(
+                        f"effect on '{field}' writes under the acting actor, so the process "
+                        "must run one invocation per actor; declare actors that fan out"
+                    )
+                elif states and states.get(field) not in {"object", "json", None}:
+                    problems.append(
+                        f"effect on '{field}' writes under a key, so '{field}' must be an "
+                        f"object, not {states.get(field)}"
+                    )
             continue
         unknown = sorted(set(effect) - MODEL_EFFECT_KEYS)
         if unknown:

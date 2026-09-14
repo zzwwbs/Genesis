@@ -165,6 +165,82 @@ def split_prompt_roles(template: str) -> tuple[str | None, str]:
     return sections.get("system"), sections["user"]
 
 
+# Provenance the engine attaches to the records a context carries. Every one is
+# derived from the run id, and a protocol's run id is
+# `<experiment>-<condition>-<replication>`, so a model shown them could read
+# which experimental condition it is in. Removed from what a model is sent;
+# study code, the stored record and the context digest are untouched.
+MODEL_HIDDEN_FIELDS = frozenset(
+    {
+        "instance_id",
+        "producer_event",
+        "producer_process",
+        "lineage",
+        "invocation_id",
+        "event_id",
+        "run_id",
+        "experiment_id",
+        "schema_ref",
+        "owner",
+        "visibility",
+        "lifecycle_scope",
+    }
+)
+# The context namespaces the engine fills with such records. State is written by
+# the study itself and is shown as the study wrote it.
+ENGINE_NAMESPACES = ("inputs", "events", "exchanges")
+
+
+def _without_provenance(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        if "artifact_type" in value and "value" in value:
+            return {
+                k: _without_provenance(v) for k, v in value.items() if k not in MODEL_HIDDEN_FIELDS
+            }
+        return {
+            k: (_grouped_inputs(v) if k == "inputs" else _without_provenance(v))
+            for k, v in value.items()
+            if k not in MODEL_HIDDEN_FIELDS
+        }
+    if isinstance(value, list | tuple):
+        return [_without_provenance(item) for item in value]
+    return value
+
+
+def _grouped_inputs(inputs: Any) -> Any:
+    """Input records grouped by type, in round order, without their instance-id keys."""
+    if not isinstance(inputs, Mapping):
+        return _without_provenance(inputs)
+    grouped: dict[str, list[Any]] = {}
+    for key in sorted(inputs, key=lambda k: (_phase_of(inputs[k]), str(k))):
+        record = inputs[key]
+        kind = str(record.get("artifact_type")) if isinstance(record, Mapping) else "record"
+        grouped.setdefault(kind, []).append(_without_provenance(record))
+    return grouped
+
+
+def _phase_of(record: Any) -> float:
+    phase = record.get("phase") if isinstance(record, Mapping) else None
+    return float(phase) if isinstance(phase, int | float) and not isinstance(phase, bool) else -1.0
+
+
+def model_view(context: Any) -> Any:
+    """What a model is shown of its context: values, not the run's identity."""
+    plain = _plain(context)
+    if not isinstance(plain, dict):
+        return plain
+    view = dict(plain)
+    for namespace in ENGINE_NAMESPACES:
+        if namespace not in view:
+            continue
+        view[namespace] = (
+            _grouped_inputs(view[namespace])
+            if namespace == "inputs"
+            else _without_provenance(view[namespace])
+        )
+    return view
+
+
 def render_prompt(
     template: str, context: Any, actor_ids: Sequence[str], phase: Any
 ) -> tuple[str | None, str]:
@@ -329,10 +405,21 @@ class ProviderExecutor:
         return outputs
 
     def execute(self, invocation: ProcessInvocation) -> ProcessResult:
-        context_value = getattr(invocation.context, "data", invocation.context)
+        context_value = model_view(getattr(invocation.context, "data", invocation.context))
         system, prompt = render_prompt(
             self.prompt_template, context_value, invocation.actor_ids, invocation.phase
         )
+        # Backstop for a field the view did not cover. Only a protocol-shaped
+        # run id -- one containing the condition id -- names the condition, and
+        # only such an id is distinctive enough to redact as a substring: a
+        # short run id such as "r" would otherwise rewrite ordinary text.
+        run_id = str(getattr(invocation, "run_id", "") or "")
+        condition = getattr(invocation, "condition", None)
+        condition_id = str(condition.get("id") or "") if isinstance(condition, Mapping) else ""
+        if run_id and len(condition_id) >= 3 and condition_id in run_id:
+            for secret in (run_id, condition_id):
+                prompt = prompt.replace(secret, "[run]")
+                system = system.replace(secret, "[run]") if system is not None else None
         request = ProviderRequest(
             model=self.model,
             prompt=prompt,

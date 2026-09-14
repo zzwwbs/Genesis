@@ -21,7 +21,7 @@ time_model:
 # - id: baseline
 #   factors: {governance: none, visibility: low}
 #
-# A factor id is readable from any predicate as condition.<factor_id>.
+# A factor id is readable from any predicate as condition.factors.<factor_id>.
 #
 # phases:                      # named spans, readable as protocol.phase
 # - id: pre-intervention
@@ -31,7 +31,16 @@ time_model:
 #   start: 20
 #   end: 40
 #
-# replications: 3              # repeats per condition
+# NOT declared here -- these are execution settings, chosen when the study is run:
+#   how many replications (draws) to take, how many worlds to initialise, and any
+#   cap on events that guards against runaway spend. They say how much of the
+#   study to realise, not what it is, so keeping them out is what lets the build
+#   digest mean one study rather than one sample size -- and lets a finished study
+#   be extended with more draws later against the identical build.
+#
+# There is no checkpoint or retention policy to declare: the runtime has never
+# read one, so declaring it promised a durability guarantee that did not exist.
+#
 # matching:                    # aligns streams so cells are comparable
 #   enabled: true
 #   shared_streams: [population, activation-order]
@@ -39,8 +48,10 @@ time_model:
 # random_streams:
 # - id: population
 #   purpose: [initial population draw]
-#   seed_policy: replication-condition-block
+#   # Seeding is derived from the run's identity, not declared: nothing
+#   # reads a seed_policy, so writing one records an intent the engine
+#   # does not act on. Sharing a stream across cells is `matching`.
 # termination:
 # - {type: end_time, at: 40, early_stopping: false}
-# budgets: {max_events: 1000000}
-# model_freezing: true
+# model_freezing: true         # pin the models and schemas for the whole study --
+#                              # a claim about stability, so it belongs here

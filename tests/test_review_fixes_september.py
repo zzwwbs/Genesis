@@ -601,8 +601,10 @@ def test_manifest_seed_check_accepts_manifests_without_a_matching_block() -> Non
         )
 
 
-def test_unenforced_protocol_budgets_are_reported_at_compilation(tmp_path) -> None:
-    """A budget the runtime ignores must not read as an applied constraint."""
+def test_a_protocol_declaring_budgets_is_refused_with_somewhere_to_put_them(tmp_path) -> None:
+    """Budgets used to be warned about key by key, because only max_events was
+    enforced and the rest read as constraints the runtime would apply. The whole
+    section is now retired: a cap guards spend, which the run decides."""
     import json as _json
 
     import yaml
@@ -628,15 +630,14 @@ def test_unenforced_protocol_budgets_are_reported_at_compilation(tmp_path) -> No
     for name, value in files.items():
         (source / f"{name}.yaml").write_text(yaml.safe_dump(value, sort_keys=False))
 
-    build = StudyCompiler(source).compile(tmp_path / "build")
-    report = _json.loads((build.path / "validation_report.json").read_text())
-    codes = {warning["code"] for warning in report.get("warnings", [])}
-    paths = {warning["path"] for warning in report.get("warnings", [])}
+    import pytest as _pytest
 
-    assert "BUDGET_NOT_ENFORCED" in codes
-    assert "protocol.budgets/max_reads_per_user_round" in paths
-    # The enforced budget is not flagged.
-    assert "protocol.budgets/max_events" not in paths
+    with _pytest.raises(ValueError) as raised:
+        StudyCompiler(source).compile(tmp_path / "build")
+    assert "SPEC_KEY_RETIRED:protocol.budgets" in str(raised.value)
+    assert "pass max_events to the run" in str(raised.value)
+    assert not (tmp_path / "build" / "validation_report.json").exists()
+    assert _json is not None
 
 
 # ---------------------------------------------------------------------------
@@ -3293,7 +3294,7 @@ def test_a_purge_during_artifact_iteration_says_so(tmp_path) -> None:
                     {
                         "artifact_id": f"a{version}",
                         "run_id": "r",
-                        "payload": _json.dumps({"n": version, "response": "raw"}).encode(),
+                        "payload": _json.dumps({"n": version, "raw_response": "raw"}).encode(),
                     }
                 ],
             )

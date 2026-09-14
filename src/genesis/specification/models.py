@@ -166,6 +166,22 @@ class ExecutorBinding(StrictModel):
 class OutputSpec(StrictModel):
     artifact_type: StableId
     schema_ref: StableId
+    # Output fields that name the acting actor. The engine writes them, over
+    # whatever the executor returned: an identity the engine already holds must
+    # not depend on a model repeating it back.
+    actor_fields: list[str] | None = None
+    # Output fields that name the round the output was produced in, written by
+    # the engine for the same reason.
+    phase_fields: list[str] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_undeclared_engine_fields(self, handler: Any) -> Any:
+        # Left out when undeclared, so existing packages hash as before.
+        data = handler(self)
+        for name in ("actor_fields", "phase_fields"):
+            if isinstance(data, dict) and not data.get(name):
+                data.pop(name, None)
+        return data
 
 
 class TracePolicy(StrictModel):
@@ -551,13 +567,16 @@ class ProtocolSpec(CanonicalArtifact):
     conditions: list[dict[str, Any]] = Field(default_factory=list)
     factors: list[ProtocolFactor] = Field(default_factory=list)
     phases: list[ProtocolPhase] = Field(default_factory=list)
-    replications: int = Field(default=1, ge=1)
+    # No ``replications``: how many draws to take says how much of the study to
+    # realise, not what the study is, so it belongs to the run. Keeping it here
+    # made the build hash mean "one sample size" rather than "one study", and
+    # made a count that a researcher simply states pass through LLM elicitation.
     matching: dict[str, Any] = Field(default_factory=dict)
     random_streams: list[dict[str, Any]] = Field(default_factory=list)
     model_freezing: bool = True
-    budgets: dict[str, Any] = Field(default_factory=dict)
-    checkpoints: dict[str, Any] = Field(default_factory=dict)
-    replay_retention: dict[str, Any] = Field(default_factory=dict)
+    # No ``budgets``/``checkpoints``/``replay_retention``. A cap on events is a
+    # spend guard the run sets; the other two were never read by anything, so
+    # they promised a durability policy the runtime does not implement.
 
     @model_validator(mode="after")
     def validate_design(self) -> ProtocolSpec:

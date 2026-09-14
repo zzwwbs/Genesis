@@ -58,6 +58,8 @@
     nav.tabs button:hover { color: #fff; background: rgba(255,255,255,.04); }
     nav.tabs button.active { color: #fff; border-bottom-color: #86a8ee; font-weight: 650; }
     .app-header-meta { margin-left: auto; color: #b9c5d8; font-size: 12px; }
+    .header-study { display: flex; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
+    .header-study input { width: 18ch; min-height: 30px; padding: 2px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,.22); background: rgba(255,255,255,.08); color: #fff; font-size: 12px; }
     .app-main { padding: 22px 28px 40px; max-width: 1680px; margin: 0 auto; }
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
@@ -198,6 +200,12 @@
     .review-tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--line); overflow-x: auto; }
     .review-tab { min-height: 36px; margin: 0; padding: 7px 9px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--ink-faint); font-size: 12px; white-space: nowrap; }
     .review-tab.active { border-bottom-color: var(--accent); color: var(--accent-strong); }
+    #intent-badge { display: inline-block; min-width: 16px; padding: 0 5px; margin-left: 5px; border-radius: 8px; background: #b4232b; color: #fff; font-size: 11px; font-weight: 700; }
+    #intent-findings { padding: 10px 12px; display: grid; gap: 10px; }
+    .intent-finding { padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid #b4232b; border-radius: 6px; }
+    .intent-finding h4 { margin: 0 0 6px; font-size: 13px; }
+    .intent-finding p { margin: 0 0 4px; font-size: 12px; }
+    .intent-finding label { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; }
     #elicitation-preview-panel { margin: 0; padding: 15px; }
     #analysis-output { max-height: 62vh; overflow: auto; }
     #elicitation-preview-panel pre { max-height: 490px; margin: 0; }
@@ -213,7 +221,10 @@
     @media (max-width: 900px) {
       .app-header { padding: 0 14px; gap: 8px; }
       .brand { min-width: 0; }
-      .brand-copy span, .app-header-meta { display: none; }
+      /* The header meta now carries the study every tab acts on, so it must
+         survive the narrow layout; only the decorative brand line goes. */
+      .brand-copy span { display: none; }
+      .header-study input { width: 10ch; }
       nav.tabs { margin-left: auto; }
       nav.tabs button { padding-inline: 10px; font-size: 12px; }
       .app-main { padding: 14px 10px 28px; }
@@ -254,7 +265,13 @@
       <button class="tab-button" data-tab="run" onclick="switchTab('run')">Run</button>
       <button class="tab-button" data-tab="outputs" onclick="switchTab('outputs')">Outputs</button>
     </nav>
-    <div class="app-header-meta">Local workspace</div>
+    <!-- The study every tab acts on. This used to be a text box on the Run tab
+         that handlers on three other tabs quietly read: a researcher who
+         imported a package saw the checklist, the process map and the export
+         address the default 'web-study' instead, with no sign of it. -->
+    <div class="app-header-meta">
+      <label class="header-study">Study <input id="study-id" value="web-study" oninput="onStudyChanged()" aria-label="Study identifier every tab acts on"></label>
+    </div>
   </header>
 
   <main class="app-main">
@@ -373,9 +390,14 @@
             <button class="review-tab" role="tab" aria-selected="false" data-review-tab="full" onclick="showElicitationTab('full')">YAML</button>
             <button class="review-tab" role="tab" aria-selected="false" data-review-tab="meta" onclick="showElicitationTab('meta')">Evidence</button>
             <button class="review-tab" role="tab" aria-selected="false" data-review-tab="validation" onclick="showElicitationTab('validation')">Validation</button>
+            <button class="review-tab" role="tab" aria-selected="false" data-review-tab="intent" onclick="showElicitationTab('intent')">Intent<span id="intent-badge" hidden></span></button>
           </div>
           <div id="elicitation-preview-panel">
             <div id="review-empty" class="review-empty">A deterministic preview will appear here after the stage draft is generated.</div>
+            <!-- The intent check asks whether the draft follows from what the
+                 researcher actually said. A contradiction blocks approval until
+                 it is acknowledged, so it needs real controls, not a <pre>. -->
+            <div id="intent-findings" hidden></div>
             <pre id="elicitation-preview-tab" hidden></pre>
             <details id="draft-editor" hidden><summary>Edit draft YAML</summary>
               <select id="draft-editor-file" onchange="loadDraftEditorFile()"></select>
@@ -401,7 +423,8 @@
         <h3>Specification checks</h3>
         <p class="muted">Review checklist coverage and the accepted patch history.</p>
         <button onclick="refreshChecklist()">Show checklist</button>
-        <button onclick="reviewPatch()">Review patch</button>
+        <button onclick="inspectPackage()">Inspect package</button>
+        <pre id="specification-output">No check run yet.</pre>
       </section>
     </div>
   </section>
@@ -410,8 +433,8 @@
   <section id="tab-run" class="tab-panel">
     <fieldset>
       <legend>Task 2 — Compile and run</legend>
-      <p class="muted">Compilation stays disabled until the reviewed specification is approved; it makes no LLM calls. Replays and parallel protocols use the same run records.</p>
-      <label>Study ID <input id="study-id" value="web-study"></label>
+      <p class="muted">Compilation stays disabled until the study named in the header is approved; it makes no LLM calls. Replays and parallel protocols use the same run records.</p>
+      <p class="muted" id="compile-availability">Checking whether this study can be compiled…</p>
       <div>
         <button id="compile" onclick="compileStudy()" disabled>Compile approved draft</button>
         <button id="run" onclick="runStudy()" disabled>Execute experiment</button>
@@ -419,6 +442,28 @@
         <button onclick="artifactReplay()">Artifact-replay run</button>
       </div>
       <pre id="run-output">No build or run loaded.</pre>
+      <div class="panel">
+        <h3>Read the build back</h3>
+        <p class="muted">Ask a reader who was never told what this study is for to say what it actually does: what reaches each actor, what each condition changes, and anything that would silently produce an empty or arbitrary result. Advisory, never a gate — and it costs one model call, so it runs only when you ask.</p>
+        <label>Read with <select id="readback-profile-id" aria-label="Model profile for the readback"></select></label>
+        <button onclick="readbackBuild()">Read this build back</button>
+        <pre id="readback-output">No reading yet. Compile the study, then ask.</pre>
+      </div>
+      <div class="panel">
+        <h3>Execute the protocol</h3>
+        <p class="muted">The build fixes what the study is — its conditions, its matching, its streams. How much of it to realise is decided here, and nothing multiplies unless you ask for it.</p>
+        <label>Draws per cell <input id="protocol-replications" type="number" min="1" step="1" value="1" oninput="invalidateProtocolPlan()"></label>
+        <label>Worlds <input id="protocol-worlds" placeholder="leave empty for the population the package carries" oninput="invalidateProtocolPlan()"></label>
+        <p class="muted">Comma-separated data sources the build already carries. Each world is its own experiment, so worlds draw differently — asking whether a result holds in another ecosystem. Whether the cells inside one world share their dice is decided by the protocol's matching declaration, not here.</p>
+        <label>Conditions <input id="protocol-conditions" placeholder="leave empty for every declared condition" oninput="invalidateProtocolPlan()"></label>
+        <label>Stop each run after <input id="protocol-max-events" type="number" min="1" step="1" placeholder="no cap" oninput="invalidateProtocolPlan()"> events</label>
+        <p class="muted">A guard against runaway spend, not part of the design. A run that hits it stops early and is recorded as stopped by its cap, so a truncated cell is not mistaken for a complete one.</p>
+        <div>
+          <button onclick="planProtocol()">Plan — costs nothing</button>
+          <button class="primary" id="protocol-execute" onclick="executeProtocol()" disabled>Execute protocol</button>
+        </div>
+        <pre id="protocol-output">Plan first: it reports how many runs these settings would dispatch, and writes nothing.</pre>
+      </div>
       <div class="panel">
         <h3>Run inventory</h3>
         <button onclick="listRuns()">List runs</button>
@@ -469,6 +514,41 @@
       document.querySelectorAll('.tab-button').forEach(button => button.classList.toggle('active', button.dataset.tab === name));
       document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === `tab-${name}`));
       location.hash = `#${name}`;
+      if (name === 'run') refreshCompileAvailability();
+    }
+    // Compile was rendered disabled and nothing in this file ever enabled it,
+    // so the Run tab's primary action could not be reached by any path --
+    // neither after an elicitation approval nor after importing a package.
+    // Whether a study can be compiled is a fact about the study, so ask.
+    async function refreshCompileAvailability() {
+      const note = document.getElementById('compile-availability');
+      const study = id();
+      if (!study) {
+        document.getElementById('compile').disabled = true;
+        note.textContent = 'Name a study in the header to compile it.';
+        return;
+      }
+      try {
+        const spec = await request(`/specifications/${encodeURIComponent(study)}`);
+        const approved = spec.status === 'approved';
+        document.getElementById('compile').disabled = !approved;
+        note.textContent = approved
+          ? `'${study}' is approved at version ${spec.version} and can be compiled.`
+          : `'${study}' is ${spec.status}. A specification must be approved before it compiles.`;
+      } catch (e) {
+        document.getElementById('compile').disabled = true;
+        // Reporting every failure as "no such study" hid the real one: a
+        // timeout or a network fault said the study did not exist.
+        note.textContent = /NOT_FOUND|not found/i.test(e.message)
+          ? `No specification named '${study}' in this workspace.`
+          : `Could not tell whether '${study}' can be compiled: ${e.message}`;
+      }
+    }
+    function onStudyChanged() {
+      // The identity changed, so anything keyed to the old one is stale.
+      invalidateProtocolPlan();
+      document.getElementById('run').disabled = true;
+      if (document.getElementById('tab-run').classList.contains('active')) refreshCompileAvailability();
     }
     (function initTabs() {
       const requested = (location.hash || '').replace('#', '');
@@ -547,6 +627,14 @@
         if (specId) body.specification_id = specId;
         const result = await request('/imports', {method:'POST', body:JSON.stringify(body), headers:{'Content-Type':'application/json'}});
         show('import-output', result);
+        // The header names the study every tab acts on, and an import is a
+        // move to a different one; leaving it behind pointed the Run and
+        // Outputs tabs at whatever was named before.
+        const imported = result && (result.specification_id || result.id);
+        if (imported) {
+          document.getElementById('study-id').value = imported;
+          onStudyChanged();
+        }
       } catch (e) { show('import-output', e.message); }
     }
     const STABLE_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
@@ -601,21 +689,25 @@
     async function loadElicitationProfiles() {
       try {
         const profiles = await request('/llm/profiles');
-        const select = document.getElementById('elicitation-profile-id');
-        select.innerHTML = '';
         const list = profiles.items || profiles;
-        if (!list || !list.length) {
-          const option = document.createElement('option');
-          option.value = '';
-          option.textContent = 'Save a model profile first (Models tab)';
-          select.appendChild(option);
-          return;
-        }
-        for (const profile of list) {
-          const option = document.createElement('option');
-          option.value = profile.id;
-          option.textContent = `${profile.id} (${profile.model})`;
-          select.appendChild(option);
+        // Both the elicitation and the build readback pick a saved profile.
+        for (const id of ['elicitation-profile-id', 'readback-profile-id']) {
+          const select = document.getElementById(id);
+          if (!select) continue;
+          select.innerHTML = '';
+          if (!list || !list.length) {
+            const option = document.createElement('option');
+            option.value = '';
+            option.textContent = 'Save a model profile first (Models tab)';
+            select.appendChild(option);
+            continue;
+          }
+          for (const profile of list) {
+            const option = document.createElement('option');
+            option.value = profile.id;
+            option.textContent = `${profile.id} (${profile.model})`;
+            select.appendChild(option);
+          }
         }
       } catch (e) { /* session start provides an actionable error */ }
     }
@@ -717,7 +809,19 @@
         item.type = 'button';
         item.disabled = state === 'not_started' && stage.id !== session.current_stage;
         item.onclick = () => viewElicitationStage(stage.id);
-        item.innerHTML = `<span class="stage-number">${state === 'approved' ? '✓' : index + 1}</span><span><span class="stage-name">${stage.title}</span><span class="stage-state-badge ${state}">${state.replaceAll('_', ' ')}</span></span>`;
+        const number = document.createElement('span');
+        number.className = 'stage-number';
+        number.textContent = state === 'approved' ? '✓' : String(index + 1);
+        const name = document.createElement('span');
+        name.className = 'stage-name';
+        name.textContent = stage.title == null ? '' : String(stage.title);
+        const badge = document.createElement('span');
+        badge.className = `stage-state-badge ${state}`;
+        badge.textContent = state.replaceAll('_', ' ');
+        const group = document.createElement('span');
+        group.appendChild(name);
+        group.appendChild(badge);
+        item.replaceChildren(number, group);
         list.appendChild(item);
       });
     }
@@ -845,7 +949,19 @@
         card.className = 'suggestion-card';
         card.dataset.option = index + 1;
         card.type = 'button';
-        card.innerHTML = `<span><strong>${item.label}</strong><br><span class="muted">${item.value}</span></span>`;
+        // Built as nodes, not markup: label and value are model-produced text
+        // arriving over the wire, and interpolating them into innerHTML ran
+        // whatever they contained in the workspace's own origin.
+        const wrapper = document.createElement('span');
+        const label = document.createElement('strong');
+        label.textContent = item.label == null ? '' : String(item.label);
+        const value = document.createElement('span');
+        value.className = 'muted';
+        value.textContent = item.value == null ? '' : String(item.value);
+        wrapper.appendChild(label);
+        wrapper.appendChild(document.createElement('br'));
+        wrapper.appendChild(value);
+        card.replaceChildren(wrapper);
         card.onclick = () => {
           resetSuggestionSelection();
           selectedSuggestionIndex = index;
@@ -874,12 +990,17 @@
         });
         document.getElementById('draft-editor').hidden = !files.options.length;
         loadDraftEditorFile();
-        showElicitationTab('diff');
+        // An unacknowledged contradiction blocks approval, so open on it rather
+        // than letting the researcher find out when the gate refuses.
+        refreshIntentBadge();
+        showElicitationTab(document.getElementById('intent-badge').hidden ? 'diff' : 'intent');
       } else {
         elicitationPreview = null;
         document.getElementById('draft-editor').hidden = true;
         document.getElementById('review-empty').style.display = 'block';
         document.getElementById('elicitation-preview-tab').hidden = true;
+        document.getElementById('intent-findings').hidden = true;
+        refreshIntentBadge();
       }
     }
     async function elicitationRequestTimeout(profileId = elicitationSession.model_profile_id) {
@@ -928,7 +1049,13 @@
     }
     async function approveElicitation() {
       if (!requireElicitationSession()) return;
-      const mutate = prepareElicitationMutation('approve', {approved_by:'researcher'});
+      // Carry whatever the researcher ticked in the Intent tab. The service
+      // refuses the approval if a contradiction is still unacknowledged, so
+      // this is the only way past that gate -- and it takes a deliberate act.
+      const mutate = prepareElicitationMutation('approve', {
+        approved_by: 'researcher',
+        acknowledged_findings: acknowledgedIntentFindings()
+      });
       await performElicitationAction('Recording explicit stage approval…', async () => {
         const session = await mutate();
         renderElicitation(session);
@@ -991,6 +1118,88 @@
       panel.classList.toggle('drawer-open', open);
       if (open) document.getElementById('elicitation-stage-rail').classList.remove('drawer-open');
     }
+    // A contradiction is a judgement about what the researcher meant, not a
+    // decidable rule, so it is acknowledged rather than corrected: the gate
+    // makes it impossible to approve one without having seen it, and does not
+    // argue about who is right. Unsupported findings are advisory only.
+    function renderIntentFindings() {
+      const panel = document.getElementById('intent-findings');
+      panel.replaceChildren();
+      const check = (elicitationPreview && elicitationPreview.intent_check) || null;
+      // Only 'ok' means a check ran. Special-casing 'unavailable' alone made
+      // every other status -- disabled, not_applicable, anything added later --
+      // fall through to "nothing contradicts what you said", which is an
+      // all-clear the system never gave.
+      if (!check || check.status !== 'ok') {
+        const note = document.createElement('p');
+        note.className = 'muted';
+        note.textContent = !check
+          ? 'No intent check on this draft yet. Generate a stage draft to run one.'
+          : `No intent check ran (${check.status}${check.reason ? ': ' + check.reason : ''}). `
+            + 'Nothing here says the draft matches what you said; approval is not blocked by it.';
+        panel.appendChild(note);
+        return;
+      }
+      const items = check.findings || [];
+      if (!items.length) {
+        const note = document.createElement('p');
+        note.className = 'muted';
+        note.textContent = 'Nothing in this draft contradicts or goes beyond what you said.';
+        panel.appendChild(note);
+        return;
+      }
+      const acknowledged = new Set(check.acknowledged || []);
+      for (const finding of items) {
+        const item = document.createElement('section');
+        item.className = 'intent-finding';
+        const heading = document.createElement('h4');
+        heading.textContent = finding.verdict === 'contradicted'
+          ? 'Contradicts what you said'
+          : 'Goes beyond what you said';
+        item.appendChild(heading);
+        for (const [label, value] of [
+          ['Declaration', finding.declaration],
+          ['You said', finding.researcher_said],
+          ['The draft says', finding.draft_says],
+          ['Consequence', finding.consequence]
+        ]) {
+          if (!value) continue;
+          const row = document.createElement('p');
+          const strong = document.createElement('strong');
+          strong.textContent = `${label}: `;
+          row.append(strong, document.createTextNode(value));
+          item.appendChild(row);
+        }
+        if (finding.verdict === 'contradicted') {
+          const label = document.createElement('label');
+          const box = document.createElement('input');
+          box.type = 'checkbox';
+          box.className = 'intent-ack';
+          box.value = finding.id;
+          box.checked = acknowledged.has(finding.id);
+          label.append(box, document.createTextNode(' I have read this and want to proceed anyway'));
+          item.appendChild(label);
+        }
+        panel.appendChild(item);
+      }
+    }
+    function acknowledgedIntentFindings() {
+      return Array.from(document.querySelectorAll('#intent-findings .intent-ack'))
+        .filter(box => box.checked)
+        .map(box => box.value);
+    }
+    // The badge is the only thing that tells a researcher the tab has something
+    // in it; a blocking finding is otherwise invisible until approval refuses.
+    function refreshIntentBadge() {
+      const badge = document.getElementById('intent-badge');
+      const check = (elicitationPreview && elicitationPreview.intent_check) || null;
+      const blocking = ((check && check.findings) || []).filter(
+        finding => finding.verdict === 'contradicted'
+          && !((check.acknowledged || []).includes(finding.id))
+      ).length;
+      badge.hidden = !blocking;
+      badge.textContent = blocking ? ` ${blocking}` : '';
+    }
     function showElicitationTab(tab) {
       document.querySelectorAll('.review-tab').forEach(button => {
         const active = button.dataset.reviewTab === tab;
@@ -1000,7 +1209,10 @@
       if (!elicitationPreview) return;
       document.getElementById('review-empty').style.display = 'none';
       const target = document.getElementById('elicitation-preview-tab');
-      target.hidden = false;
+      const findings = document.getElementById('intent-findings');
+      findings.hidden = tab !== 'intent';
+      target.hidden = tab === 'intent';
+      if (tab === 'intent') { renderIntentFindings(); return; }
       if (tab === 'diff') target.textContent = Object.entries(elicitationPreview.diffs || {}).map(([name, diff]) => `--- ${name}\n${diff}`).join('\n\n') || 'No YAML changes in this stage.';
       else if (tab === 'full') target.textContent = Object.entries(elicitationPreview.yaml_files || {}).map(([name, text]) => `# ${name}\n${text}`).join('\n');
       else if (tab === 'validation') {
@@ -1010,8 +1222,16 @@
           ? '\nCOMPILER VALIDATION FAILED - fix the draft before approving:\n' +
             [...compileErrors, ...errors].map(e => '- ' + (e.code || '') + ': ' + (e.message || JSON.stringify(e))).join('\n') + '\n\n'
           : '';
-        target.textContent = block + JSON.stringify({
+        // compile_warnings are settled compile failures attributed to an earlier
+        // stage: written into every preview and, until now, displayed nowhere.
+        const compileWarnings = (elicitationPreview.validation && elicitationPreview.validation.compile_warnings) || [];
+        const early = compileWarnings.length
+          ? 'FROM AN EARLIER STAGE - these will block the final approval:\n' +
+            compileWarnings.map(e => '- ' + (e.code || '') + ': ' + (e.message || JSON.stringify(e))).join('\n') + '\n\n'
+          : '';
+        target.textContent = block + early + JSON.stringify({
           compile_errors: compileErrors,
+          compile_warnings: compileWarnings,
           errors,
           warnings: (elicitationPreview.validation && elicitationPreview.validation.warnings) || [],
           checklist: (elicitationPreview.validation && elicitationPreview.validation.checklist) || {},
@@ -1025,14 +1245,19 @@
         checklist_changes: elicitationPreview.checklist_changes || []
       }, null, 2);
     }
-    async function reviewPatch() {
+    // Was "Review patch": it GET a /draft endpoint that does not exist, so it
+    // threw before reaching its own fallback and could only ever print "Not
+    // Found" -- and the fallback read a `patch` key no API response carries.
+    // Inspection is what the service actually offers about a package.
+    async function inspectPackage() {
       try {
         const inspected = await request(`/specifications/${encodeURIComponent(id())}/inspect`, {method:'POST'});
-        const draft = await request(`/specifications/${encodeURIComponent(id())}/draft`);
-        const patch = (draft && draft.patch) || inspected.patch;
-        if (!patch) { show('analysis-output', {patch: 'No patch recorded for the current draft.'}); return; }
-        show('analysis-output', {operations: patch.operations, evidence: patch.evidence, assumptions: patch.assumptions, unresolved_questions: patch.unresolved_questions, affected_checklist_items: patch.affected_checklist_items});
-      } catch (e) { show('analysis-output', e.message); }
+        show('specification-output', {
+          status: inspected.status, version: inspected.version, valid: inspected.valid,
+          summary: inspected.summary, issues: inspected.issues,
+          guidance: inspected.guidance, suggestions: inspected.suggestions
+        });
+      } catch (e) { show('specification-output', e.message); }
     }
     async function dashboardView() {
       try {
@@ -1057,7 +1282,7 @@
         const justification = prompt('Justification (required for branch):', '') || undefined;
         const overridesText = prompt('Branch factor overrides as JSON (e.g. {"policy":"lenient"}) — optional:', '');
         let overrides = undefined;
-        if (overridesText) { try { overrides = JSON.parse(overridesText); } catch (_e) { show('analysis-output', 'Invalid JSON for overrides: ' + overridesText); return; } }
+        if (overridesText) { try { overrides = JSON.parse(overridesText); } catch (_e) { show('run-output', 'Invalid JSON for overrides: ' + overridesText); return; } }
         const run = selectedRun();
         let preview_token;
         if (mode === 'partial' || mode === 'branch') {
@@ -1076,17 +1301,17 @@
             evidence_requirements: preview.evidence_requirements,
             warnings: preview.warnings,
           }, null, 2);
-          show('analysis-output', {preview, preview_text: previewText});
+          show('run-output', {preview, preview_text: previewText});
           const confirmExecute = confirm('Review the replay preview above, then confirm execution. The preview shown in the output panel is NOT executed until you confirm here.');
-          if (!confirmExecute) { show('analysis-output', 'Replay preview discarded — nothing was executed.'); return; }
+          if (!confirmExecute) { show('run-output', 'Replay preview discarded — nothing was executed.'); return; }
           preview_token = preview.preview_token;
         }
         const body = {mode}; if (boundary) body.boundary = boundary; if (justification) body.justification = justification;
         if (overrides) body.overrides = overrides;
         if (preview_token) body.preview_token = preview_token;
         const result = await request(`/runs/${encodeURIComponent(run)}/replays`, {method:'POST', body:JSON.stringify(body)});
-        show('analysis-output', {replay_run_id: result.run_id, source_run_id: result.source_run_id, mode, boundary: boundary || 'none', overrides: overrides || undefined, executed: true});
-      } catch (e) { show('analysis-output', e.message); }
+        show('run-output', {replay_run_id: result.run_id, source_run_id: result.source_run_id, mode, boundary: boundary || 'none', overrides: overrides || undefined, executed: true});
+      } catch (e) { show('run-output', e.message); }
     }
     function renderTraceView(result) {
         const illustration = result.illustration || {};
@@ -1154,7 +1379,12 @@
           try {
             const run = await request(`/runs/${encodeURIComponent(selectedRun())}`);
             buildRef = (run && (run.build || run.build_path)) || '';
-          } catch (e) { buildRef = ''; }
+          } catch (e) {
+            // Falling through silently mapped a different build from the run
+            // the researcher had selected, and looked like a successful answer.
+            show('analysis-output', `Could not read run '${selectedRun()}': ${e.message}`);
+            return;
+          }
           if (!buildRef) buildRef = build ? (build.path || `builds/${id()}`) : `builds/${id()}`;
         }
         const result = await request(`/builds/${encodeURIComponent(buildRef)}/processes`);
@@ -1164,8 +1394,77 @@
     async function compileStudy() {
       try { build = await request('/compile', {method:'POST', body:JSON.stringify({specification_id:id(), output:`builds/${id()}`})}); document.getElementById('run').disabled = false; show('run-output', build); } catch (e) { show('run-output', e.message); }
     }
+    // The build a reading is about: whatever was just compiled, else the one
+    // named by the header. Targeting the header alone read back a different
+    // package from the one the researcher had in front of them.
+    function readbackBuildRef() {
+      return (build && (build.path || `builds/${id()}`)) || `builds/${id()}`;
+    }
+    async function readbackBuild() {
+      const profile = document.getElementById('readback-profile-id').value;
+      if (!profile) { show('readback-output', 'Save a model profile in the Models tab first.'); return; }
+      show('readback-output', 'Reading the compiled package…');
+      try {
+        const record = await request(`/builds/${encodeURIComponent(readbackBuildRef())}/readback`,
+          {method:'POST', body:JSON.stringify({model_profile_id: profile}),
+           timeoutMs: await elicitationRequestTimeout(profile)});
+        // Lead with the reading; the pinning is what makes it evidence, so keep
+        // it visible rather than burying it in a file beside the build.
+        show('readback-output', `${record.text}\n\n--- read by ${record.model_profile} of build ${record.build_hash.slice(0, 12)} (request ${record.request_digest})`);
+      } catch (e) { show('readback-output', e.message); }
+    }
     async function runStudy() {
       try { const runId = `${id()}-run`; await request('/runs', {method:'POST', body:JSON.stringify({id:runId, study_id:id(), build:`builds/${id()}`})}).catch(e => { if (!e.message.startsWith('ALREADY_EXISTS')) throw e; }); const result = await request(`/runs/${runId}/execute`, {method:'POST'}); show('run-output', result); } catch (e) { show('run-output', e.message); }
+    }
+    // The settings the last plan was quoted for. Execute stays disabled until a
+    // plan has been seen for exactly these settings, so the multiplication is
+    // always reported before it is paid for rather than inferred from the bill.
+    let quotedProtocolSettings = null;
+    function protocolSettings() {
+      const list = value => value.split(',').map(item => item.trim()).filter(Boolean);
+      const settings = {};
+      const draws = document.getElementById('protocol-replications').value.trim();
+      if (draws) settings.replications = Number(draws);
+      const worlds = list(document.getElementById('protocol-worlds').value);
+      if (worlds.length) settings.initializations = worlds;
+      const conditions = list(document.getElementById('protocol-conditions').value);
+      if (conditions.length) settings.only_conditions = conditions;
+      const cap = document.getElementById('protocol-max-events').value.trim();
+      if (cap) settings.max_events = Number(cap);
+      return settings;
+    }
+    function invalidateProtocolPlan() {
+      quotedProtocolSettings = null;
+      document.getElementById('protocol-execute').disabled = true;
+    }
+    async function ensureRunRecord() {
+      await request('/runs', {method:'POST', body:JSON.stringify({id:runId(), study_id:id(), build:`builds/${id()}`})})
+        .catch(e => { if (!e.message.startsWith('ALREADY_EXISTS')) throw e; });
+    }
+    async function planProtocol() {
+      const settings = protocolSettings();
+      try {
+        await ensureRunRecord();
+        const plan = await request(`/runs/${runId()}/protocol`, {method:'POST', body:JSON.stringify({...settings, plan:true})});
+        quotedProtocolSettings = JSON.stringify([id(), runId(), settings]);
+        document.getElementById('protocol-execute').disabled = false;
+        show('protocol-output', plan);
+      } catch (e) { invalidateProtocolPlan(); show('protocol-output', e.message); }
+    }
+    async function executeProtocol() {
+      const settings = protocolSettings();
+      if (quotedProtocolSettings !== JSON.stringify([id(), runId(), settings])) {
+        invalidateProtocolPlan();
+        show('protocol-output', 'The settings changed since the plan. Plan again before executing.');
+        return;
+      }
+      try {
+        show('protocol-output', 'Dispatching…');
+        // A protocol can run for a long time; the default request timeout is
+        // meant for interactive calls, not for a study.
+        const result = await request(`/runs/${runId()}/protocol`, {method:'POST', body:JSON.stringify(settings), timeoutMs: 6 * 60 * 60 * 1000});
+        show('protocol-output', result);
+      } catch (e) { show('protocol-output', e.message); }
     }
     const runId = () => `${id()}-run`;
     const selectedRun = () => {
@@ -1188,7 +1487,17 @@
           option.textContent = `${run.id} (${run.status || 'unknown'})`;
           select.appendChild(option);
         }
-        if (previous && [...select.options].some(o => o.value === previous)) select.value = previous;
+        if (previous && [...select.options].some(o => o.value === previous)) {
+          select.value = previous;
+        } else {
+          // A protocol's template run is a container: it holds the build the
+          // trials were expanded from and never executes, so it carries no
+          // events and no outcomes. It sorts first, so the Outputs tab opened
+          // on an empty trace and exported an empty bundle. Land on a run that
+          // actually has something in it.
+          const executed = runs.find(run => run.status === 'completed');
+          if (executed) select.value = executed.id;
+        }
         show('analysis-output', {runs_available: runs.length, selected: selectedRun()});
       } catch (e) { show('analysis-output', e.message); }
     }
@@ -1203,7 +1512,7 @@
       } catch (e) { show('analysis-output', e.message); }
     }
     async function refreshChecklist() {
-      try { const result = await request(`/specifications/${encodeURIComponent(id())}/checklist`); const summary = result.items.filter(i => i.required).map(i => `${i.id}: ${i.status}`).join('\n'); show('analysis-output', {required_items: summary, count: result.items.length}); } catch (e) { show('analysis-output', e.message); }
+      try { const result = await request(`/specifications/${encodeURIComponent(id())}/checklist`); const summary = result.items.filter(i => i.required).map(i => `${i.id}: ${i.status}`).join('\n'); show('specification-output', {required_items: summary, count: result.items.length}); } catch (e) { show('specification-output', e.message); }
     }
     async function runOutcomes() {
       try { const result = await request(`/runs/${encodeURIComponent(selectedRun())}/outcomes`); show('analysis-output', result); } catch (e) { show('analysis-output', e.message); }
@@ -1228,16 +1537,16 @@
       try { const result = await request('/exports', {method:'POST', body:JSON.stringify({run_id:selectedRun(), output:`exports/${id()}`})}); show('analysis-output', result); } catch (e) { show('analysis-output', e.message); }
     }
     async function listRuns() {
-      try { const result = await request('/runs'); show('analysis-output', result); } catch (e) { show('analysis-output', e.message); }
+      try { const result = await request('/runs'); show('run-output', result); } catch (e) { show('run-output', e.message); }
     }
     async function listExperiments() {
-      try { const result = await request('/experiments'); show('analysis-output', result); } catch (e) { show('analysis-output', e.message); }
+      try { const result = await request('/experiments'); show('run-output', result); } catch (e) { show('run-output', e.message); }
     }
     async function listBuilds() {
-      try { const result = await request('/builds'); show('analysis-output', result); } catch (e) { show('analysis-output', e.message); }
+      try { const result = await request('/builds'); show('run-output', result); } catch (e) { show('run-output', e.message); }
     }
     async function artifactReplay() {
-      try { const result = await request(`/runs/${encodeURIComponent(selectedRun())}/replays`, {method:'POST', body:JSON.stringify({mode:'artifact'})}); show('analysis-output', result); } catch (e) { show('analysis-output', e.message); }
+      try { const result = await request(`/runs/${encodeURIComponent(selectedRun())}/replays`, {method:'POST', body:JSON.stringify({mode:'artifact'})}); show('run-output', result); } catch (e) { show('run-output', e.message); }
     }
   </script>
 </body>

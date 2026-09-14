@@ -62,20 +62,22 @@ study_id: '{{study_id}}'
 #     reputation: {field: __key__, in: actor.ids}
 #     items: {field: creator, in: actor.ids}
 #       # field: '__key__' matches the record's key; otherwise a field name.
-#       # in: actor.ids | state.<field> | '*' | a literal list.
+#       # in: actor.ids | state.<field>, or a list of those.
+#       # A bare '*' and a list of literal values are refused: name the
+#       # state that holds the values instead.
 #   cardinality:               # how many records survive; keep: first | last
 #     items: {limit: 1, keep: last, by: phase}
 #   available_when:            # time- or condition-gate one allowed path
 #     leaderboard:
 #       all:
-#       - {path: condition.visibility, op: eq, value: high}
+#       - {path: condition.factors.visibility, op: eq, value: high}
 #       - {path: protocol.phase, op: gte, value: 1}
 #   project:                   # hand over only part of each record
 #     leaderboard: {drop: [reason]}     # or {keep: [title, clicks]}
 #
 # availability:                # a path-level gate outside any one policy
 # - path: state.leaderboard
-#   available_when: {path: condition.visibility, op: eq, value: high}
+#   available_when: {path: condition.factors.visibility, op: eq, value: high}
 #
 # updates:                     # which state each declared effect may change
 # - state: reputation
@@ -89,4 +91,5 @@ study_id: '{{study_id}}'
 # PREDICATE GRAMMAR (used by available_when here and by trigger/when in Layer 1):
 #   {path: <dotted path>, op: eq|ne|gt|gte|lt|lte|in|truthy, value: <literal>}
 #   compose with {all: [...]}, {any: [...]}, {not: {...}} -- one combinator only.
-#   Paths outside state use a namespace: condition.<factor_id>, protocol.phase.
+#   Paths outside state use a namespace: condition.factors.<factor_id>, protocol.phase.
+#   (condition.<factor_id> resolves to nothing, so a gate written that way never opens.)

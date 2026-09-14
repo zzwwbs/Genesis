@@ -26,7 +26,6 @@ def _study_payload(title: str = "lifecycle study") -> dict[str, Any]:
         "protocol": {
             "time_model": {"type": "rounds", "end": 2},
             "conditions": [{"id": "base"}, {"id": "alt"}],
-            "replications": 2,
         },
         "outcomes": [],
         "models": [],

@@ -9,13 +9,12 @@ from genesis.compiler import StudyCompiler
 from genesis.service import GenesisService
 
 
-def _setup(tmp_path: Path, *, conditions: list[dict] | None = None, replications: int = 2) -> Path:
+def _setup(tmp_path: Path, *, conditions: list[dict] | None = None) -> Path:
     workspace = tmp_path / "workspace"
     service = GenesisService(workspace)
     protocol = {
         "time_model": {"type": "rounds", "end": 3},
         "conditions": conditions or [{"id": "base"}, {"id": "alt"}],
-        "replications": replications,
     }
     draft = service.create_specification(
         {
@@ -50,7 +49,9 @@ def test_build_emits_protocol_json_and_verifies(tmp_path: Path) -> None:
     assert StudyCompiler.verify_build(build_path)
     protocol = json.loads((build_path / "protocol.json").read_text())
     assert protocol["conditions"] == [{"id": "base"}, {"id": "alt"}]
-    assert protocol["replications"] == 2
+    # The build fixes the condition space and says nothing about how many draws
+    # to take of it; that is chosen per run.
+    assert "replications" not in protocol
 
 
 def test_execute_run_freezes_an_immutable_manifest(tmp_path: Path) -> None:
@@ -75,7 +76,7 @@ def test_protocol_controller_expands_conditions_and_replications(tmp_path: Path)
     workspace = _setup(tmp_path)
     service = GenesisService(workspace)
     try:
-        result = service.execute_protocol("experiment-1")
+        result = service.execute_protocol("experiment-1", replications=2)
         assert result["status"] == "completed"
         assert len(result["runs"]) == 4  # 2 conditions x 2 replications
         assert result["runs"] == [
@@ -125,7 +126,7 @@ def test_parallel_protocol_preserves_per_run_scheduling_semantics(tmp_path: Path
     workspace = _setup(tmp_path)
     service = GenesisService(workspace)
     try:
-        sequential = service.execute_protocol("experiment-1")
+        sequential = service.execute_protocol("experiment-1", replications=2)
         assert sequential["status"] == "completed"
         sequential_signatures = {
             run_id: [
@@ -142,7 +143,9 @@ def test_parallel_protocol_preserves_per_run_scheduling_semantics(tmp_path: Path
                 "build": service.get_run("experiment-1")["build"],
             }
         )
-        parallel = service.execute_protocol("experiment-2", parallel=True, max_workers=4)
+        parallel = service.execute_protocol(
+            "experiment-2", parallel=True, max_workers=4, replications=2
+        )
         assert parallel["status"] == "completed"
         assert len(parallel["runs"]) == len(sequential["runs"])
         for run_id in parallel["runs"]:
@@ -175,7 +178,7 @@ def test_parallel_protocol_process_pool_preserves_semantics(tmp_path: Path) -> N
             }
         )
         result = service.execute_protocol(
-            "experiment-3", parallel=True, max_workers=2, worker_kind="process"
+            "experiment-3", parallel=True, max_workers=2, worker_kind="process", replications=2
         )
         assert result["status"] == "completed"
         assert len(result["runs"]) == 4
@@ -292,6 +295,7 @@ def test_bounded_dispatch_limits_in_flight_workers(tmp_path: Path) -> None:
             parallel=True,
             max_workers=2,
             worker_kind="thread",
+            replications=2,
             executor_overrides={"tick": slow_tick},
         )
         assert result["status"] == "completed"

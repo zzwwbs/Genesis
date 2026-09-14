@@ -39,6 +39,13 @@ COMPARISON_OPS: dict[str, Any] = {
 }
 
 
+def _hashable(value: Any) -> Any:
+    """A deduplication key part: the value, or its canonical JSON when unhashable."""
+    if isinstance(value, dict | list | set | tuple):
+        return ("json", json.dumps(value, sort_keys=True, default=str))
+    return value
+
+
 def _number(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return float("nan")
@@ -286,7 +293,9 @@ def materialize_datasets(
             seen: set[tuple[Any, ...]] = set()
             unique: list[dict[str, Any]] = []
             for row in rows:
-                key = tuple(row.get(key) for key in deduplicate_on)
+                # A field may hold a record or a list, which cannot be hashed;
+                # its canonical JSON identifies it just as well.
+                key = tuple(_hashable(row.get(key)) for key in deduplicate_on)
                 if key in seen:
                     continue
                 seen.add(key)

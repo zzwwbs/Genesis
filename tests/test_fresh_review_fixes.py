@@ -288,7 +288,9 @@ def test_retention_redacts_only_raw_responses_of_declaring_processes(tmp_path: P
         rows = {row["artifact_id"]: json.loads(row["payload"]) for row in store.iter_artifacts("r")}
         assert set(rows) == {"raw", "word", "other"}
         assert rows["raw"]["raw_response"] == "<purged-by-retention>"
-        assert rows["raw"]["outputs"]["response"] == "<purged-by-retention>"
+        # Declared outputs remain, whatever their field is called: redacting any
+        # key named "response" overwrote a study's own output (2026-09-14 H2).
+        assert rows["raw"]["outputs"]["response"] == "sk"
         assert rows["word"]["value"] == {"text": "a response word"}
         assert rows["other"]["raw_response"] == "kept raw"
         assert store.retention_purge("r", {"compose"}) == 0  # idempotent

@@ -62,10 +62,9 @@ STAGE_DECISIONS = {
     "experiment-design": (
         "time-and-termination",
         "conditions-and-interventions",
-        "replication-and-randomness",
+        "randomness-and-matching",
         "model-and-schema-freezing",
         "outcome-plan",
-        "operational-controls",
     ),
 }
 
@@ -727,6 +726,9 @@ def test_complete_five_stage_api_flow_recovers_revises_and_compiles(
     for stage_id in ("theory", "domain", "experiment-design"):
         assert session["current_stage"] == stage_id
         assert session["stages"][stage_id]["status"] == "needs_review"
+        # Re-approval needs no new message, so the browser must be offered it
+        # (2026-09-14 M15: only submit_message was listed).
+        assert "approve" in session["allowed_actions"]
         session = mutate("approve", {"approved_by": "researcher"})
     assert session["status"] == "completed"
     assert all(item["status"] == "approved" for item in session["stages"].values())

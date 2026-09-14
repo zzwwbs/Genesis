@@ -190,3 +190,13 @@ def test_reproducibility_bundle_preserves_empirical_population(tmp_path: Path) -
             importer.close()
     finally:
         service.close()
+
+
+def test_a_data_source_outside_the_package_fails_compilation(tmp_path: Path) -> None:
+    """It compiled clean and could never run: the build embeds only package data (L4)."""
+    source = _write_package(tmp_path, mode="empirical", data_source="../outside.csv")
+    (source.parent / "outside.csv").write_text("id\nu1\n")
+    with pytest.raises(ValidationIssue) as excinfo:
+        StudyCompiler(source).compile(tmp_path / "escaped-build")
+    codes = {issue.code for issue in excinfo.value.issues}
+    assert "DATA_SOURCE_INVALID" in codes

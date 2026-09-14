@@ -43,7 +43,6 @@ PAYLOAD = {
     "protocol": {
         "time_model": {"type": "rounds", "end": 2},
         "factors": [{"id": "policy", "levels": ["strict", "lenient"], "branchable": True}],
-        "replications": 2,
     },
     "outcomes": [
         {
@@ -152,7 +151,7 @@ def test_approved_package_run_branch_export_import_identity_chain(
                 "build": compiled["path"],
             }
         )
-        result = service.execute_protocol("conformance-experiment")
+        result = service.execute_protocol("conformance-experiment", replications=2)
         assert result["status"] == "completed"
         assert len(result["runs"]) == 4  # 2 factors x 2 replications
         trial_ids = sorted(result["runs"])

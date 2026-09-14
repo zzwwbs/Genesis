@@ -687,3 +687,23 @@ def test_events_dataset_preserves_state_version_field() -> None:
     plan = {"datasets": [{"id": "from-events", "source": {"kind": "events"}}]}
     rows = materialize_datasets(plan, {"events": event_rows, "artifacts": [], "state": []})
     assert rows["from-events"] == event_rows
+
+
+def test_deduplicating_on_a_structured_field_does_not_crash() -> None:
+    """A dict or list value raised "unhashable type" mid-evaluation (2026-09-14 L6)."""
+    events = [
+        {"event_id": "e1", "phase": 1, "state_delta": {"rows": [{"who": {"id": "u1"}}]}},
+        {"event_id": "e2", "phase": 1, "state_delta": {"rows": [{"who": {"id": "u1"}}]}},
+        {"event_id": "e3", "phase": 1, "state_delta": {"rows": [{"who": {"id": "u2"}}]}},
+    ]
+    plan = {
+        "datasets": [
+            {
+                "id": "people",
+                "source": {"kind": "events", "path": "state_delta.rows"},
+                "deduplicate_on": ["who"],
+            }
+        ]
+    }
+    rows = materialize_datasets(plan, {**_sources(), "events": events})["people"]
+    assert sorted(row["who"]["id"] for row in rows) == ["u1", "u2"]

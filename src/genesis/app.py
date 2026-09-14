@@ -8,9 +8,10 @@ import logging
 import re
 import tempfile
 import uuid
+from collections.abc import Callable
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI, Header, Request
 from fastapi.encoders import jsonable_encoder
@@ -123,6 +124,45 @@ def _service_error(exc: Exception) -> JSONResponse:
     )
 
 
+def _integer_option(name: str, value: Any, default: int | None = None) -> int | None:
+    """A request integer, refused as a client error rather than failing as a 500.
+
+    ``int()`` on a bad value raised a bare ValueError with no error code, which
+    the service error mapper reports as an internal fault with a traceback.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int | str):
+        raise ValueError(f"VALIDATION_ERROR: {name} must be an integer, not {value!r}")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"VALIDATION_ERROR: {name} must be an integer, not {value!r}") from exc
+
+
+def _boolean_option(name: str, value: Any, default: bool = False) -> bool:
+    """A request flag that must be a boolean.
+
+    ``bool("false")`` is True, so a client sending the string enabled parallel
+    dispatch -- and its spend -- while asking for the opposite.
+    """
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"VALIDATION_ERROR: {name} must be true or false, not {value!r}")
+    return value
+
+
+def _replay_mode(value: Any) -> ReplayMode:
+    try:
+        return ReplayMode(value)
+    except ValueError as exc:
+        modes = ", ".join(mode.value for mode in ReplayMode)
+        raise ValueError(
+            f"VALIDATION_ERROR: replay mode must be one of {modes}, not {value!r}"
+        ) from exc
+
+
 def _expected_version(value: str | None) -> int:
     if value is None:
         raise ValueError("VALIDATION_ERROR: If-Match version is required")
@@ -184,11 +224,14 @@ def create_app(
         payload: dict[str, Any], idempotency_key: str | None = Header(None, alias="Idempotency-Key")
     ) -> Any:
         key = f"study:{idempotency_key}" if idempotency_key else None
+        payload_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode()
+        ).hexdigest()
         if key:
             try:
-                cached = service.persistence.get_idempotency(key)
-            except Exception:
-                cached = None
+                cached = service.persistence.get_idempotency(key, payload_hash)
+            except Exception as exc:
+                return _service_error(exc)
             if cached is not None:
                 return cached
         study_id = payload.get("id")
@@ -199,7 +242,7 @@ def create_app(
         except Exception as exc:
             return _service_error(exc)
         if key:
-            service.persistence.record_idempotency(key, result)
+            service.persistence.record_idempotency(key, result, payload_hash)
         return result
 
     @app.get("/studies/{study_id}")
@@ -318,6 +361,28 @@ def create_app(
     def list_builds() -> Any:
         try:
             return service.list_builds()
+        except Exception as exc:
+            return _service_error(exc)
+
+    @app.post("/builds/{build_ref:path}/readback")
+    def build_readback(build_ref: str, payload: dict[str, Any] | None = None) -> Any:
+        """Say what this compiled build actually does, to a reader blind to its intent.
+
+        Advisory and never a gate: it costs a model call, so it is asked for
+        rather than run at every compile, and the reading is recorded beside the
+        build so an accepted one is part of the evidence.
+        """
+        options = dict(payload or {})
+        try:
+            unknown = sorted(set(options) - {"model_profile_id"})
+            if unknown:
+                raise ValueError(
+                    f"INVALID_FIELD: unsupported readback options: {', '.join(unknown)}"
+                )
+            profile = options.get("model_profile_id")
+            if not profile:
+                raise ValueError("INVALID_FIELD: readback requires a model_profile_id")
+            return service.readback_build(build_ref, model_profile_id=str(profile))
         except Exception as exc:
             return _service_error(exc)
 
@@ -467,16 +532,17 @@ def create_app(
         except Exception as exc:
             return _service_error(exc)
 
-    for action in ("pause", "resume", "cancel"):
+    # Each route binds its action in a closure. A default argument would bind it
+    # too, but FastAPI publishes every parameter as a query field, so
+    # POST /runs/r/pause?_action=cancel cancelled the run.
+    def transition_route(target: str) -> Callable[..., Any]:
+        async def endpoint(run_id: str, request: Request) -> Any:
+            return transition(run_id, target, request.headers.get("If-Match"))
 
-        async def endpoint(run_id: str, request: Request, _action: str = action) -> Any:
-            return transition(
-                run_id,
-                {"pause": "paused", "resume": "running", "cancel": "cancelled"}[_action],
-                request.headers.get("If-Match"),
-            )
+        return endpoint
 
-        app.post(f"/runs/{{run_id}}/{action}")(endpoint)
+    for action, target in (("pause", "paused"), ("resume", "running"), ("cancel", "cancelled")):
+        app.post(f"/runs/{{run_id}}/{action}")(transition_route(target))
 
     @app.get("/experiments")
     def list_experiments() -> Any:
@@ -513,6 +579,46 @@ def create_app(
                     f"INVALID_FIELD: unsupported execute options: {', '.join(unknown)}"
                 )
             return service.execute_run(run_id, max_concurrency=options.get("max_concurrency"))
+        except Exception as exc:
+            return _service_error(exc)
+
+    @app.post("/runs/{run_id}/protocol")
+    def execute_protocol(run_id: str, payload: dict[str, Any] | None = None) -> Any:
+        """Realise a study: worlds x conditions x replications, all chosen here.
+
+        ``plan: true`` returns the arithmetic without dispatching, so the Run
+        view can show what a choice costs before anything is spent on it.
+        """
+        options = dict(payload or {})
+        allowed = {
+            "replications",
+            "initializations",
+            "only_conditions",
+            "max_events",
+            "plan",
+            "parallel",
+            "max_workers",
+        }
+        try:
+            unknown = sorted(set(options) - allowed)
+            if unknown:
+                raise ValueError(
+                    f"INVALID_FIELD: unsupported protocol options: {', '.join(unknown)}"
+                )
+            replications = options.get("replications")
+            max_events = options.get("max_events")
+            return service.execute_protocol(
+                run_id,
+                replications=_integer_option("replications", replications),
+                initializations=options.get("initializations"),
+                only_conditions=options.get("only_conditions"),
+                max_events=_integer_option("max_events", max_events),
+                plan_only=_boolean_option("plan", options.get("plan")),
+                parallel=_boolean_option("parallel", options.get("parallel")),
+                max_workers=cast(
+                    int, _integer_option("max_workers", options.get("max_workers"), 4)
+                ),
+            )
         except Exception as exc:
             return _service_error(exc)
 
@@ -570,14 +676,17 @@ def create_app(
         except Exception as exc:
             return _service_error(exc)
 
-    for suffix in ("events", "artifacts", "outcomes"):
-
-        @app.post(f"/runs/{{run_id}}/{suffix}", status_code=201)
-        def append_collection(run_id: str, payload: dict[str, Any], _field: str = suffix) -> Any:
+    def append_route(field: str) -> Callable[..., Any]:
+        def append_collection(run_id: str, payload: dict[str, Any]) -> Any:
             try:
-                return service.append_run_collection(run_id, _field, payload)
+                return service.append_run_collection(run_id, field, payload)
             except Exception as exc:
                 return _service_error(exc)
+
+        return append_collection
+
+    for suffix in ("events", "artifacts", "outcomes"):
+        app.post(f"/runs/{{run_id}}/{suffix}", status_code=201)(append_route(suffix))
 
     @app.post("/runs/import", status_code=201)
     def import_run(payload: dict[str, Any]) -> Any:
@@ -588,7 +697,14 @@ def create_app(
             result = service.import_run(
                 source,
                 run_id=payload.get("run_id"),
-                size_limit_bytes=int(payload.get("size_limit_bytes") or 500 * 1024 * 1024),
+                size_limit_bytes=cast(
+                    int,
+                    _integer_option(
+                        "size_limit_bytes",
+                        payload.get("size_limit_bytes") or None,
+                        500 * 1024 * 1024,
+                    ),
+                ),
             )
             return {**result, "status": "imported"}
         except Exception as exc:
@@ -600,7 +716,7 @@ def create_app(
         try:
             return service.replay_preview(
                 run_id,
-                mode=ReplayMode(body.get("mode", "full")),
+                mode=_replay_mode(body.get("mode", "full")),
                 artifact_ids=tuple(body.get("artifact_ids", ())),
                 boundary=body.get("boundary"),
                 overrides=body.get("overrides"),
@@ -615,7 +731,7 @@ def create_app(
         try:
             return service.replay_run(
                 run_id,
-                mode=ReplayMode(body.get("mode", "full")),
+                mode=_replay_mode(body.get("mode", "full")),
                 artifact_ids=tuple(body.get("artifact_ids", ())),
                 boundary=body.get("boundary"),
                 overrides=body.get("overrides"),
@@ -757,7 +873,11 @@ def create_app(
                 expected_version=body.get("expected_version"),
                 idempotency_key=idempotency_key,
                 mutation=lambda: service.approve_elicitation_stage(
-                    session_id, approved_by=str(body.get("approved_by", "researcher"))
+                    session_id,
+                    approved_by=str(body.get("approved_by", "researcher")),
+                    acknowledged_findings=[
+                        str(item) for item in (body.get("acknowledged_findings") or [])
+                    ],
                 ),
             )
         except Exception as exc:

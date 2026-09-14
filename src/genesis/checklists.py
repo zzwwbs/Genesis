@@ -105,7 +105,7 @@ CHECKLIST_ITEMS: list[dict[str, Any]] = [
     {
         "id": "proto-conditions",
         "layer": 4,
-        "question": ("Which conditions are varied and held constant, and how many replications?"),
+        "question": "Which conditions are varied, and what is held constant across them?",
         "required": False,
         "rule": "protocol-conditions-declared",
         "write_targets": ["protocol.yaml"],
@@ -214,8 +214,10 @@ def evaluate_rules(spec_dir: str | Path) -> dict[str, str]:
         elif rule == "initialization-declared-or-empty":
             statuses[item["id"]] = "complete" if domain.initialization else "not_applicable"
         elif rule == "protocol-conditions-declared":
+            # A draw count used to count as evidence of a design here. It never
+            # was one: repeating a single cell says nothing about what varies.
             statuses[item["id"]] = (
-                "complete" if protocol.conditions or protocol.replications > 1 else "not_applicable"
+                "complete" if protocol.conditions or protocol.factors else "not_applicable"
             )
         elif rule == "outcomes-declared":
             statuses[item["id"]] = "complete" if outcomes.outcomes else "unresolved"

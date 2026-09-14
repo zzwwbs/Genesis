@@ -16,7 +16,6 @@ import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from itertools import chain
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
@@ -28,7 +27,7 @@ from genesis import __version__
 from genesis.analysis import AnalysisEngine, AnalysisExporter, OutcomePlan
 from genesis.assistant import StudyAssistant
 from genesis.checklists import CHECKLIST_ITEMS, checklist_record, persist_checklist
-from genesis.compiler import StudyCompiler
+from genesis.compiler import RETIRED_KEYS, StudyCompiler
 from genesis.elicitation import (
     ElicitationAssistant,
     ElicitationEngine,
@@ -59,13 +58,24 @@ from genesis.execution_manifest import (
     scientific_config_digest,
 )
 from genesis.extensions import ExtensionManifest, ExtensionRegistry
+from genesis.intent_check import SYSTEM as INTENT_SYSTEM
+from genesis.intent_check import (
+    assemble_intent_request,
+    blocking_findings,
+    parse_intent_findings,
+)
 from genesis.outcome_plan import (
     _INCOMPLETE_ROUND,
     compile_outcome_plan,
     materialize_datasets,
     outcome_plan_digest,
 )
-from genesis.persistence import ObjectRef, PersistenceCoordinator
+from genesis.persistence import (
+    ObjectRef,
+    PersistenceCoordinator,
+    _redact_raw_responses,
+    retention_purges,
+)
 from genesis.providers import (
     DEFAULT_MAX_RETRIES,
     AnswerPoolProvider,
@@ -73,6 +83,8 @@ from genesis.providers import (
     ProviderExecutor,
     ProviderRequest,
 )
+from genesis.readback import BUILD_PARTS, assemble_readback_request, readback_record
+from genesis.readback import SYSTEM as READBACK_SYSTEM
 from genesis.replay import ReplayMode
 from genesis.runtime import (
     STATE_VALUE_TYPES,
@@ -152,6 +164,9 @@ class SpecificationPatch(StrictModel):
                 raise ValueError(f"PATCH_PATH: unsupported patch path '{operation.path}'")
 
 
+# Internal marker on a legacy derived row naming the event it was derived from.
+_DERIVED_FROM = "__derived_from_event__"
+_PACKAGE_SECTIONS = ("study", "openness", "theory", "domain", "protocol", "outcomes", "models")
 _FORM_FIELDS: frozenset[str] = frozenset(
     {
         "id",
@@ -195,13 +210,9 @@ _FORM_FIELDS: frozenset[str] = frozenset(
         "conditions",
         "factors",
         "phases",
-        "replications",
         "matching",
         "random_streams",
         "model_freezing",
-        "budgets",
-        "checkpoints",
-        "replay_retention",
         "outcomes",
         "datasets",
     }
@@ -240,13 +251,9 @@ _PROTOCOL_BLOCK_FIELDS = frozenset(
         "conditions",
         "factors",
         "phases",
-        "replications",
         "matching",
         "random_streams",
         "model_freezing",
-        "budgets",
-        "checkpoints",
-        "replay_retention",
     }
 )
 
@@ -351,6 +358,94 @@ def _hash_join(
         for match in matches:
             merged.append({**row, **match})
     return merged
+
+
+_DEFAULT_WORLD = "__package__"
+
+
+def _empirical_mode(build_path: Path) -> bool:
+    """Whether this build seeds an actor population from a data asset."""
+    path = build_path / "initialization.json"
+    if not path.is_file():
+        return False
+    try:
+        declared = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(declared, dict) and str(declared.get("mode", "")) == "empirical"
+
+
+def _resolve_initializations(
+    declared: list[Mapping[str, Any] | str] | None, build_path: Path
+) -> list[dict[str, Any]]:
+    """Normalize the worlds to realise into ``{id, data_source}`` entries.
+
+    ``None`` means one world: whatever the package's own initialization says.
+    Anything else is an explicit list, so the number of worlds is never implied
+    -- a researcher who wants three states three, and one who says nothing runs
+    one. Each named asset must already be in the build, so choosing a world at
+    run time never loosens the package's provenance.
+    """
+    if declared is None:
+        return [{"id": _DEFAULT_WORLD}]
+    if not declared:
+        raise ValueError("RUN_PROTOCOL: initializations is empty; omit it to use the package's own")
+    worlds: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in declared:
+        if isinstance(entry, str):
+            world = {"id": Path(entry).stem, "data_source": entry}
+        elif isinstance(entry, Mapping) and entry.get("data_source"):
+            world = {
+                "id": str(entry.get("id") or Path(str(entry["data_source"])).stem),
+                "data_source": str(entry["data_source"]),
+            }
+        else:
+            raise ValueError("RUN_PROTOCOL: each initialization needs a data_source")
+        if world["id"] in seen or world["id"] == _DEFAULT_WORLD:
+            raise ValueError(f"RUN_PROTOCOL: duplicate or reserved world id '{world['id']}'")
+        # ``build_path / x`` is just x when x is absolute, and follows ``..``
+        # out of the build when it is not, so an existence check alone let any
+        # readable JSON on the machine become the run's population -- and be
+        # recorded in the manifest as the study's provenance. The asset must
+        # resolve inside the build the run names.
+        # Naming a world for a package that seeds nothing recorded a data
+        # source in the manifest that no run ever read, so the provenance named
+        # an asset the study never used.
+        if not _empirical_mode(build_path):
+            raise ValueError(
+                f"RUN_PROTOCOL: world '{world['id']}' names a data source, but this build "
+                "does not initialise from data; a world only means something for an "
+                "empirically initialised package"
+            )
+        asset = (build_path / str(world["data_source"])).resolve()
+        inside = asset.is_relative_to(build_path.resolve())
+        if not inside or not asset.is_file():
+            raise ValueError(
+                f"RUN_PROTOCOL: world '{world['id']}' names '{world['data_source']}', which the "
+                "build does not carry; add the asset to the package and recompile"
+            )
+        seen.add(world["id"])
+        worlds.append(world)
+    return worlds
+
+
+def _refuse_retired_protocol_settings(protocol: Mapping[str, Any]) -> None:
+    """Refuse a build that declares settings the run now decides.
+
+    Such a build still carries them and nothing reads them, so it would quietly
+    run one draw where it says three, and uncapped where it declares a cap --
+    losing a spend guard the package stated. Checked wherever a run is
+    dispatched, not only when a protocol is expanded: for a while the protocol
+    route refused a build that the direct run path ran happily.
+    """
+    stale = [key for key in ("replications", "budgets") if protocol.get(key) not in (None, {}, 1)]
+    if stale:
+        raise ValueError(
+            f"RUN_PROTOCOL: this build declares {', '.join(stale)}, which the run now "
+            "decides and which nothing would read; recompile the specification and pass "
+            "replications/max_events to the run"
+        )
 
 
 def _load_empirical_data(path: Path, data_ref: str) -> dict[str, Any]:
@@ -630,6 +725,24 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     return value
 
 
+def _validated_max_events(value: Any, code: str) -> int | None:
+    """The event cap as a positive int, or None.
+
+    Only the protocol route used to check this, and it checked a value it then
+    stored uncoerced: a cap of "5" passed the check as an int and was stored as
+    a string, so the plan reported a cap the run never applied. A cap of 0 or a
+    bool reached the runtime unexamined and produced a zero-event run reported
+    as complete.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{code}: max_events must be a whole number of events")
+    if value < 1:
+        raise ValueError(f"{code}: max_events must be at least 1")
+    return int(value)
+
+
 def _validated_block(payload: dict[str, Any], name: str, allowed: frozenset[str]) -> dict[str, Any]:
     """Return the nested authoring block for one artifact, rejecting unknown keys."""
     block = payload.get(name)
@@ -639,7 +752,12 @@ def _validated_block(payload: dict[str, Any], name: str, allowed: frozenset[str]
         raise ValueError(f"INVALID_FIELD: {name} must be an object")
     unsupported = sorted(set(block) - allowed)
     if unsupported:
-        raise ValueError(f"INVALID_FIELD: unsupported {name} field(s): {', '.join(unsupported)}")
+        # A key that used to be accepted gets the sentence saying where it went,
+        # so authoring and compilation refuse it for the same stated reason.
+        retired = RETIRED_KEYS.get(name, {})
+        hints = [f"{key} -- {retired[key]}" for key in unsupported if key in retired]
+        detail = "; ".join(hints) if hints else ", ".join(unsupported)
+        raise ValueError(f"INVALID_FIELD: unsupported {name} field(s): {detail}")
     return block
 
 
@@ -661,10 +779,25 @@ def _check_profile_drift(
         mismatches.append("model")
     compiled_endpoint = str(compiled.get("endpoint_ref", "") or "")
     runtime_base = str(configured.get("base_url", "") or "")
-    if compiled_endpoint and runtime_base and compiled_endpoint != runtime_base:
+    # endpoint_ref is documented as a name resolved from local configuration,
+    # and is resolved to a profile before this runs. Comparing that name with a
+    # base URL could never match, so a package bound to a named profile was
+    # refused on every run. Only an endpoint written as a URL is compared.
+    if (
+        "://" in compiled_endpoint
+        and runtime_base
+        and compiled_endpoint.rstrip("/") != runtime_base.rstrip("/")
+    ):
         mismatches.append("endpoint")
-    if dict(configured.get("parameters", {})) != dict(compiled.get("parameters", {})):
-        mismatches.append("parameters")
+    # A run sends the profile's parameters merged with the package's, the
+    # package's winning. Only a key the profile adds reaches the request without
+    # the package having set it; a profile that merely omits a package key sends
+    # exactly what the package declares, and requiring equality refused it.
+    added = sorted(
+        set(dict(configured.get("parameters", {}))) - set(dict(compiled.get("parameters", {})))
+    )
+    if added:
+        mismatches.append(f"parameters ({', '.join(added)} not set by the package)")
     if mismatches:
         raise ValueError(
             f"MODEL_PROFILE_DRIFT: runtime profile '{profile_id}' differs from the "
@@ -1124,7 +1257,13 @@ class GenesisService:
             }
             for manifest in self._extensions.manifests()
         ]
-        self._extension_store.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
+        # Written beside and swapped in, never truncated in place. The reader
+        # treats unparseable JSON as "no extensions" and returns silently, so a
+        # crash mid-write would have dropped every registered extension on the
+        # next start with nothing to say it happened.
+        staging = self._extension_store.with_name(f".{self._extension_store.name}.tmp")
+        staging.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
+        os.replace(staging, self._extension_store)
 
     def _load_extensions(self) -> None:
         """Restore resolvable (module:attribute) extensions across restarts.
@@ -1354,6 +1493,65 @@ class GenesisService:
         if api_key is not None:
             stored["api_key"] = api_key
         return stored
+
+    def _runtime_profile(self, model_id: str, compiled: Mapping[str, Any]) -> dict[str, Any]:
+        """The local profile a compiled model runs on: its endpoint_ref, else its id.
+
+        endpoint_ref is documented as a name resolved from local configuration;
+        nothing resolved it, so a model bound to a named profile ran on whatever
+        profile shared its id. A name with no profile is refused rather than
+        falling back, since falling back is exactly what went unnoticed.
+        """
+        named = str(compiled.get("endpoint_ref") or "")
+        if not named or "://" in named:
+            return self._full_model_profile(model_id)
+        try:
+            return self._full_model_profile(named)
+        except KeyError as exc:
+            raise ValueError(
+                f"MODEL_PROFILE: model '{model_id}' is bound to endpoint_ref '{named}', "
+                "but no local model profile has that id"
+            ) from exc
+
+    def _check_model_profiles_current(
+        self, run: Mapping[str, Any], executor_overrides: Mapping[str, Any] | None = None
+    ) -> None:
+        """Preflight: each model the run will call resolves to an undrifted profile.
+
+        Only models bound by processes the run will actually dispatch to a
+        provider -- the same set the executors are built for. A process whose
+        executor is supplied directly calls no profile, so it needs none.
+        """
+        build_ref = run.get("build") or run.get("build_path")
+        if not build_ref:
+            return
+        build_path = self.resolve_path(build_ref)
+        profiles_path = build_path / "model_profiles.json"
+        processes_path = build_path / "processes.json"
+        if not profiles_path.is_file() or not processes_path.is_file():
+            return
+        overridden = set(executor_overrides or {})
+        used = {
+            str(binding.get("model_profile"))
+            for process in json.loads(processes_path.read_text())
+            if isinstance(process, dict) and str(process.get("id")) not in overridden
+            for binding in [process.get("executor")]
+            if isinstance(binding, dict) and isinstance(binding.get("model_profile"), str)
+        }
+        if not used:
+            return
+        build_hash = str(
+            json.loads((build_path / "build_manifest.json").read_text()).get("build_hash", "")
+        )
+        for compiled in json.loads(profiles_path.read_text()):
+            if not isinstance(compiled, dict) or str(compiled.get("id")) not in used:
+                continue
+            if str(compiled.get("provider") or "") not in {"openai-compatible", "answer-pool"}:
+                continue
+            model_id = str(compiled["id"])
+            _check_profile_drift(
+                model_id, self._runtime_profile(model_id, compiled), compiled, build_hash
+            )
 
     def _full_model_profile(self, profile_id: str) -> dict[str, Any]:
         """Stored record including any pasted api_key (never exposed to reads)."""
@@ -1588,13 +1786,9 @@ class GenesisService:
                 conditions=pick(protocol_block, "conditions", []),
                 factors=pick(protocol_block, "factors", []),
                 phases=pick(protocol_block, "phases", []),
-                replications=pick(protocol_block, "replications", 1),
                 matching=pick(protocol_block, "matching", {}),
                 random_streams=pick(protocol_block, "random_streams", []),
                 model_freezing=pick(protocol_block, "model_freezing", True),
-                budgets=pick(protocol_block, "budgets", {}),
-                checkpoints=pick(protocol_block, "checkpoints", {}),
-                replay_retention=pick(protocol_block, "replay_retention", {}),
             ),
             "outcomes": artifact(
                 outcomes=payload.get("outcomes", []),
@@ -2160,7 +2354,69 @@ class GenesisService:
             "manifest": build.manifest,
         }
 
+    def readback_build(self, build_ref: str | Path, *, model_profile_id: str) -> dict[str, Any]:
+        """Read a compiled build back as prose, blind to the study's intent (gap D).
+
+        Compilation says the package is well formed; the intent check says a
+        declaration follows from what the researcher said. This says what the
+        thing they are about to run actually does, to a reader who was never
+        told what it was for -- which is the reading a reviewer will give it.
+
+        Generated on request rather than at every compile: it costs a model call
+        and is worth asking once a package is finished. Advisory always; it is
+        recorded beside the build so an accepted reading is part of the evidence,
+        never a gate the researcher has to argue with.
+        """
+        build_path = self.resolve_path(build_ref)
+        manifest_path = build_path / "build_manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError(f"BUILD_NOT_FOUND: no build manifest under {build_ref}")
+        parts = {
+            name: (build_path / name).read_text()
+            for name in BUILD_PARTS
+            if (build_path / name).is_file()
+        }
+        request = assemble_readback_request(parts)
+        provider = self._elicitation_provider(model_profile_id)
+        response = provider.generate(
+            ProviderRequest(
+                model=str(self.get_model_profile(model_profile_id)["model"]),
+                system=READBACK_SYSTEM,
+                prompt=request,
+                parameters={"temperature": 0.1},
+            )
+        )
+        record = readback_record(
+            str(response.text),
+            build_ref=str(build_ref),
+            build_hash=str(json.loads(manifest_path.read_text()).get("build_hash", "")),
+            model_profile=model_profile_id,
+            request_digest=hashlib.sha256(request.encode()).hexdigest()[:16],
+        )
+        (build_path / "readback.json").write_text(json.dumps(record, indent=2))
+        return record
+
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a run, accepting a build reference in the spelling one was asked for.
+
+        ``/compile`` takes its output as a workspace-relative path
+        ('builds/my-study') and records the build under the absolute one, so a
+        researcher who names the build the same way they created it was told
+        FK_VIOLATION: unknown build. Persistence has no workspace root and
+        cannot resolve that; this layer does, so it normalises here.
+        """
+        build = payload.get("build")
+        if isinstance(build, str) and build and not Path(build).is_absolute():
+            # resolve_path refuses a relative path that climbs out of the
+            # workspace, which is the right answer for a build reference too.
+            payload = {**payload, "build": str(self.resolve_path(build))}
+        if "max_events" in payload:
+            # Every route into a run passes through here, so the cap is checked
+            # once for all of them rather than only on the protocol route.
+            payload = {
+                **payload,
+                "max_events": _validated_max_events(payload["max_events"], "RUN_CREATE"),
+            }
         return self.persistence.create_run(payload)
 
     def get_run(self, run_id: str) -> dict[str, Any]:
@@ -2190,6 +2446,20 @@ class GenesisService:
             "generated_at": datetime.now(UTC).isoformat(),
             "genesis_version": __version__,
             "condition": dict(run.get("condition", {})),
+        }
+        # What this run chose about how much of the study to realise. These are
+        # not part of the build -- two runs of one build may differ here -- but
+        # a reader handed only the package cannot tell what was actually run
+        # without them. Stated explicitly, including the nulls, so "no cap" is
+        # something the record says rather than something absence implies.
+        run_world = (
+            run.get("initialization") if isinstance(run.get("initialization"), Mapping) else None
+        )
+        run_cap = int(run["max_events"]) if isinstance(run.get("max_events"), int) else None
+        manifest["realisation"] = {
+            "replication": int(run.get("replication", 1)),
+            "max_events": run_cap,
+            "initialization": dict(run_world) if run_world else None,
         }
         protocol: dict[str, Any] = {}
         build_manifest: dict[str, Any] = {}
@@ -2229,6 +2499,11 @@ class GenesisService:
             init_path = build_path / "initialization.json"
             if init_path.is_file():
                 data_provenance["initialization"] = json.loads(init_path.read_text())
+            # What the package declares is not what this run was seeded from: a
+            # run may name its own world. Recording only the declaration left a
+            # reader unable to tell which population produced these numbers.
+            if isinstance(run.get("initialization"), Mapping):
+                data_provenance["run_initialization"] = dict(run["initialization"])
             if data_provenance:
                 manifest["data_provenance"] = data_provenance
             models_path = build_path / "model_profiles.json"
@@ -2318,6 +2593,17 @@ class GenesisService:
                 outcome_plan_digest=str(manifest.get("outcome_plan_digest", "")),
                 origin_experiment_id=run.get("experiment_id"),
                 executor_code_digest=executor_code_digest(code_identity),
+                # A capped run may stop before its declared termination, and a
+                # run seeded from another world ran on other data. Neither is
+                # the same effective configuration as a run without them, and
+                # the experiment id that used to carry the world is dropped
+                # from the scientific digest as lineage.
+                max_events=run_cap,
+                initialization_digest=(
+                    hashlib.sha256(canonical_json(dict(run_world)).encode()).hexdigest()
+                    if run_world
+                    else ""
+                ),
             )
             manifest["execution"] = execution
             manifest["scientific_config_digest"] = scientific_config_digest(execution)
@@ -2581,8 +2867,8 @@ class GenesisService:
                 raise ValueError(
                     f"MODEL_PROFILE: compiled process references unknown profile {profile_id}"
                 )
-            configured = self._full_model_profile(profile_id)
             profile = model_profiles[profile_id]
+            configured = self._runtime_profile(profile_id, profile)
             provider_kind = str(profile.get("provider") or "")
             if provider_kind not in {"openai-compatible", "answer-pool"}:
                 raise ValueError(f"MODEL_PROVIDER: unsupported provider {profile.get('provider')}")
@@ -2726,6 +3012,15 @@ class GenesisService:
         # becomes "running", so such a failure leaves the run as it was.
         self._check_build_unchanged(run)
         self._check_executor_code_unchanged(run)
+        # Unpinned study code refuses the dispatch, so it belongs with the other
+        # preflight checks. Raised from inside _dispatch_run it fired after the
+        # transition, leaving the run persisted as failed and un-runnable --
+        # the opposite of what the comment two lines above promises.
+        self._check_run_code_pinned(run, executor_overrides)
+        self._check_build_settings_current(run)
+        # Profile drift refuses the dispatch; checked here it leaves the run as it
+        # was, where raised inside the dispatch it left the run failed.
+        self._check_model_profiles_current(run, executor_overrides)
         manifest = None
         if run.get("manifest") is None and resumed_from != "running":
             manifest = self._build_run_manifest(run)
@@ -2768,6 +3063,35 @@ class GenesisService:
                 f"{str(manifest['build_hash'])[:12]}, but {build_ref} now holds build "
                 f"{str(current)[:12]}; restore that build or start a new run"
             )
+
+    def _check_build_settings_current(self, run: Mapping[str, Any]) -> None:
+        """Refuse a build carrying retired execution settings, on any run path."""
+        build_ref = run.get("build") or run.get("build_path")
+        if not build_ref:
+            return
+        protocol_path = self.resolve_path(build_ref) / "protocol.json"
+        if not protocol_path.is_file():
+            return
+        try:
+            protocol = json.loads(protocol_path.read_text())
+        except (OSError, ValueError):
+            return
+        if isinstance(protocol, Mapping):
+            _refuse_retired_protocol_settings(protocol)
+
+    def _check_run_code_pinned(
+        self, run: Mapping[str, Any], executor_overrides: Mapping[str, Any] | None
+    ) -> None:
+        """Preflight form of the pinned-code check, reading the run's own build."""
+        build_ref = run.get("build") or run.get("build_path")
+        if not build_ref:
+            return
+        processes_path = self.resolve_path(build_ref) / "processes.json"
+        if not processes_path.is_file():
+            return
+        self._check_executor_code_pinned(
+            run, json.loads(processes_path.read_text()), executor_overrides
+        )
 
     @staticmethod
     def _check_executor_code_pinned(
@@ -2981,9 +3305,25 @@ class GenesisService:
                     isinstance(initialization, dict)
                     and str(initialization.get("mode", "")) == "empirical"
                 ):
-                    data_ref = str(initialization.get("data_source", ""))
+                    # A run may name its own world: the package declares the
+                    # assets and their provenance, the run chooses among them.
+                    chosen = run.get("initialization")
+                    data_ref = str(
+                        (chosen or {}).get("data_source")
+                        if isinstance(chosen, Mapping)
+                        else initialization.get("data_source", "")
+                    )
                     field = str(initialization.get("state_field", "population"))
-                    initial_state[field] = _load_empirical_data(build_path / data_ref, data_ref)
+                    # Enforced here as well as when a protocol resolves its
+                    # worlds: a run created directly carries an initialization
+                    # that never passed through that path.
+                    asset = (build_path / data_ref).resolve()
+                    if not asset.is_relative_to(build_path.resolve()) or not asset.is_file():
+                        raise ValueError(
+                            f"RUN_INITIALIZATION: '{data_ref}' is not an asset of the build this "
+                            "run names; a run may only be seeded from the package's own data"
+                        )
+                    initial_state[field] = _load_empirical_data(asset, data_ref)
 
             protocol = json.loads((build_path / "protocol.json").read_text())
 
@@ -3088,10 +3428,11 @@ class GenesisService:
                     if build_ref and isinstance(protocol.get("time_model", {}).get("end"), int)
                     else None
                 ),
+                # A cap on events is a guard against runaway spend, not a
+                # statement about the design, so the run sets it and the package
+                # does not. It rides on the run record like the world does.
                 max_events=(
-                    int(protocol.get("budgets", {}).get("max_events"))
-                    if build_ref and isinstance(protocol.get("budgets", {}).get("max_events"), int)
-                    else None
+                    int(run["max_events"]) if isinstance(run.get("max_events"), int) else None
                 ),
                 condition=dict(run.get("condition", {"id": run.get("condition_id", "base")})),
                 matching=dict(protocol.get("matching", {})) if build_ref else {},
@@ -3103,7 +3444,9 @@ class GenesisService:
             if latest["status"] == "running":
                 self.persistence.transition_run(run_id, "failed", latest["version"])
             raise
-        if execution_recorded:
+        # A run cut short by its event cap must say so even when nothing else
+        # about the execution was worth recording.
+        if execution_recorded or controller.budget_exhausted:
             self._record_execution_outcome(run_id, controller)
         self._record_process_instances(run_id, controller)
         latest = self.get_run(run_id)
@@ -3126,9 +3469,22 @@ class GenesisService:
             outcome["processes"] = dict(controller.execution_decisions)
         if controller.discarded_calls.get("calls"):
             outcome["discarded_calls"] = dict(controller.discarded_calls)
+        if getattr(controller, "budget_exhausted", False):
+            # The run stopped on its event cap rather than its declared
+            # termination, and was still marked completed. Without this, a
+            # truncated cell and a full one are indistinguishable in the record
+            # and would be compared as though they were the same study.
+            outcome["stopped_by"] = "max_events"
         if not outcome:
             return
         try:
+            if outcome.get("stopped_by") and not self.get_run(run_id).get("executions"):
+                # A study with no model profiles records no execution segment,
+                # and the merge below silently drops updates when there is none
+                # to merge into -- losing exactly the fact that matters most.
+                self.persistence.record_run_execution(
+                    run_id, {"started_at": datetime.now(UTC).isoformat(), "model_concurrency": {}}
+                )
             self.persistence.update_latest_run_execution(run_id, outcome)
         except Exception:  # noqa: BLE001 - operational metadata only
             # This record describes how the run executed, not what it produced;
@@ -3164,12 +3520,27 @@ class GenesisService:
         self,
         run_id: str,
         *,
+        replications: int | None = None,
+        initializations: list[Mapping[str, Any] | str] | None = None,
+        only_conditions: list[str] | None = None,
+        max_events: int | None = None,
+        plan_only: bool = False,
         executor_overrides: Mapping[str, Any] | None = None,
         parallel: bool = False,
         max_workers: int = 4,
         worker_kind: str | None = None,
     ) -> dict[str, Any]:
-        """Expand protocol.conditions x replications into runs (REP-004, AW-13).
+        """Expand worlds x conditions x replications into runs (REP-004, AW-13).
+
+        The build fixes what the study *is*: its condition space, its matching
+        policy, its streams. How much of it to realise is an execution decision
+        and is made here -- how many draws per world, how many worlds, and which
+        conditions to run now. That keeps the build digest meaning one study
+        rather than one sample size, and lets a study be extended later with
+        more draws against the identical build.
+
+        Both multipliers are inert unless asked for: one world, one draw.
+        ``plan_only`` returns the arithmetic without dispatching anything.
 
         The template run must reference a compiled build. Runs are dispatched
         sequentially by default; ``parallel`` dispatches through a bounded
@@ -3181,10 +3552,67 @@ class GenesisService:
         if not build_ref:
             raise ValueError("RUN_PROTOCOL: the template run must reference a build")
         build_path = self.resolve_path(build_ref)
+        # Runs recorded before build references were normalised still hold the
+        # relative spelling, which the experiment FK cannot resolve.
+        build_ref = str(build_path)
         protocol = json.loads((build_path / "protocol.json").read_text())
         protocol_hash = hashlib.sha256(
             json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+        # A build compiled before these moved to the run still carries them, and
+        # nothing reads them any more: such a build would quietly run one draw
+        # instead of the N it declares, and uncapped where it declared a cap.
+        # Say so rather than silently ignoring what the package states.
+        _refuse_retired_protocol_settings(protocol)
+        conditions = expand_protocol_conditions(protocol)
+        if only_conditions is not None:
+            if not only_conditions:
+                # Read as "run nothing", it dispatched nothing and reported
+                # completed, exactly as a finished study does. The empty world
+                # list is refused for the same reason.
+                raise ValueError(
+                    "RUN_PROTOCOL: only_conditions is empty; omit it to run every "
+                    "declared condition"
+                )
+            wanted = {str(item) for item in only_conditions}
+            unknown = wanted - {str(item.get("id")) for item in conditions}
+            if unknown:
+                raise ValueError(
+                    f"RUN_PROTOCOL: unknown condition(s) {', '.join(sorted(unknown))}; "
+                    f"the protocol declares {', '.join(str(c.get('id')) for c in conditions)}"
+                )
+            conditions = [item for item in conditions if str(item.get("id")) in wanted]
+        # How many draws, and of how many worlds, are execution decisions: they
+        # say how much of the study to realise, not what the study is. Neither
+        # multiplies unless asked for, and the package has no say -- a protocol
+        # carrying a count is refused at compile time, not honoured here.
+        draws = 1 if replications is None else int(replications)
+        if draws < 1:
+            raise ValueError("RUN_PROTOCOL: replications must be at least 1")
+        max_events = _validated_max_events(max_events, "RUN_PROTOCOL")
+        worlds = _resolve_initializations(initializations, build_path)
+        plan = {
+            "experiment_id": run_id,
+            "build": str(build_ref),
+            # The default world is an internal sentinel, not a name a researcher
+            # chose; reporting it verbatim made the plan read as if the study
+            # had a world called '__package__'.
+            "worlds": [
+                "the population the package carries"
+                if world["id"] == _DEFAULT_WORLD
+                else world["id"]
+                for world in worlds
+            ],
+            "conditions": [str(item.get("id")) for item in conditions],
+            "replications": draws,
+            "runs": len(worlds) * len(conditions) * draws,
+            "max_events": int(max_events) if max_events is not None else None,
+        }
+        if plan_only:
+            # The multiplication is reported before it is paid for, rather than
+            # inferred afterwards from the bill -- and planning writes nothing,
+            # so asking what a choice would cost does not commit to it.
+            return {**plan, "status": "planned", "runs_planned": plan["runs"]}
         try:
             self.persistence.create_experiment(
                 {
@@ -3198,30 +3626,74 @@ class GenesisService:
         except ValueError as exc:
             if not str(exc).startswith("ALREADY_EXISTS"):
                 raise
-        conditions = expand_protocol_conditions(protocol)
-        replications = int(protocol.get("replications", 1))
         trial_ids: list[str] = []
-        for condition in conditions:
-            if not isinstance(condition, dict) or not condition.get("id"):
-                raise ValueError("RUN_PROTOCOL: every condition requires a stable id")
-            condition_id = str(condition["id"])
-            for replication in range(1, replications + 1):
-                trial_id = f"{run_id}-{condition_id}-{replication}"
-                payload = {
-                    "id": trial_id,
-                    "study_id": template.get("study_id"),
-                    "build": build_ref,
-                    "experiment_id": run_id,
-                    "condition_id": condition_id,
-                    "condition": dict(condition),
-                    "replication": replication,
-                }
+        for world in worlds:
+            # A world is its own experiment. Matched seeds key on the experiment
+            # and deliberately exclude the condition, so this gives genuinely
+            # different draws across worlds while keeping the cells within one
+            # world drawn against the same dice -- which is what the contrast
+            # rests on.
+            experiment_id = run_id if world["id"] == _DEFAULT_WORLD else f"{run_id}-{world['id']}"
+            if experiment_id != run_id:
                 try:
-                    self.create_run(payload)
+                    self.persistence.create_experiment(
+                        {
+                            "id": experiment_id,
+                            "study_id": str(template.get("study_id", "")),
+                            "build_ref": build_ref,
+                            "protocol_hash": protocol_hash,
+                            "initialization": dict(world),
+                            "created_at": datetime.now(UTC).isoformat(),
+                        }
+                    )
                 except ValueError as exc:
                     if not str(exc).startswith("ALREADY_EXISTS"):
                         raise
-                trial_ids.append(trial_id)
+            for condition in conditions:
+                if not isinstance(condition, dict) or not condition.get("id"):
+                    raise ValueError("RUN_PROTOCOL: every condition requires a stable id")
+                condition_id = str(condition["id"])
+                for replication in range(1, draws + 1):
+                    trial_id = f"{experiment_id}-{condition_id}-{replication}"
+                    payload = {
+                        "id": trial_id,
+                        "study_id": template.get("study_id"),
+                        "build": build_ref,
+                        "experiment_id": experiment_id,
+                        "condition_id": condition_id,
+                        "condition": dict(condition),
+                        "replication": replication,
+                    }
+                    if world["id"] != _DEFAULT_WORLD:
+                        payload["initialization_id"] = world["id"]
+                        payload["initialization"] = dict(world)
+                    if max_events is not None:
+                        # A spend guard, so it rides on the run like the world
+                        # does: two runs of one build may be capped differently
+                        # without being different studies.
+                        payload["max_events"] = max_events
+                    try:
+                        self.create_run(payload)
+                    except ValueError as exc:
+                        if not str(exc).startswith("ALREADY_EXISTS"):
+                            raise
+                        # Extending a study re-names runs that already exist,
+                        # which is the point. But swallowing this also swallowed
+                        # a changed world or cap: the old run was dispatched and
+                        # reported as though the new settings had been applied.
+                        existing = self.get_run(trial_id)
+                        differs = {
+                            field
+                            for field in ("max_events", "initialization")
+                            if (existing.get(field) or None) != (payload.get(field) or None)
+                        }
+                        if differs:
+                            raise ValueError(
+                                f"RUN_PROTOCOL: run '{trial_id}' already exists and was realised "
+                                f"with a different {', '.join(sorted(differs))}; it cannot be "
+                                "re-run under new settings. Use a new experiment id."
+                            ) from exc
+                    trial_ids.append(trial_id)
 
         def dispatch_one(trial_id: str) -> tuple[bool, str]:
             try:
@@ -4052,6 +4524,10 @@ class GenesisService:
             "schemas.json",
             "package_closure.json",
             "theory_execution_plan.json",
+            # An accepted reading is evidence about this build, so it has to
+            # survive the round trip that carries it: the bundle gained it and
+            # the import dropped it, which loses it just as completely.
+            "readback.json",
         ):
             if (source_path / name).is_file():
                 (build_dir / name).write_bytes((source_path / name).read_bytes())
@@ -4091,10 +4567,13 @@ class GenesisService:
         # verify it (mirrors the compiler's per-file digest table).
         integrity: dict[str, str] = {}
         for path in sorted(build_dir.rglob("*")):
-            if path.is_file():
-                integrity[path.relative_to(build_dir).as_posix()] = hashlib.sha256(
-                    path.read_bytes()
-                ).hexdigest()
+            relative = path.relative_to(build_dir).as_posix()
+            # A reading of the build is advisory evidence about it, not part of
+            # it: the compiler writes the manifest before any reading exists, so
+            # hashing one here would both diverge from the original build and
+            # make a second reading invalidate the build it describes.
+            if path.is_file() and relative != "readback.json":
+                integrity[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
         if "build_manifest.json" in integrity:
             integrity["manifest_hash"] = integrity["build_manifest.json"]
         (build_dir / "integrity_manifest.json").write_text(
@@ -4471,6 +4950,21 @@ class GenesisService:
                     "condition_id": effective_condition["id"],
                     "condition": dict(effective_condition),
                     "replication": inherited_replication,
+                    # The world and the cap are part of what was realised, so a
+                    # branch that drops them re-runs a different configuration
+                    # while claiming to reproduce this one: a replay of a
+                    # world-b run was seeded from the package's world-a, and a
+                    # replay of a capped run ran uncapped and read complete.
+                    **(
+                        {"initialization": dict(source["initialization"])}
+                        if isinstance(source.get("initialization"), Mapping)
+                        else {}
+                    ),
+                    **(
+                        {"max_events": int(source["max_events"])}
+                        if isinstance(source.get("max_events"), int)
+                        else {}
+                    ),
                 }
             )
         except Exception as exc:
@@ -4564,13 +5058,11 @@ class GenesisService:
             if not invocation:
                 continue
             delta = event.get("state_delta")
-            # A None value marks a removed key, which the state model cannot
-            # represent; only real assignments are replayable.
-            state_effects = (
-                {key: value for key, value in delta.items() if value is not None}
-                if isinstance(delta, Mapping)
-                else {}
-            )
+            # Every entry is replayed, None included. The state store only ever
+            # assigns -- it has no operation that deletes a field -- so a None in
+            # a committed delta is a value the run assigned, and dropping it made
+            # the replay end in a different state than its source.
+            state_effects = dict(delta) if isinstance(delta, Mapping) else {}
             committed[(invocation, int(event.get("attempt", 1)))] = {
                 "state_effects": state_effects,
                 "events": tuple(
@@ -4795,7 +5287,7 @@ class GenesisService:
             # at once -- 342 MB at 40 rounds for an accumulating study.
             derived = self._legacy_derived_rows(event_stream(), artifact_row_stream())
             if derived:
-                sources["events"] = lambda: chain(derived, event_stream())
+                sources["events"] = lambda: self._with_derived_rows(event_stream(), derived)
         results: list[dict[str, Any]] = []
         # OUT-002: build every plan first, then evaluate them together, so a
         # relation is walked once rather than once per outcome reading it.
@@ -4911,6 +5403,9 @@ class GenesisService:
             delta = event.get("state_delta") or {}
             if not isinstance(delta, dict):
                 continue
+            # A derived row describes its source event; it does not carry the
+            # event's whole state delta, which a row reader would count again.
+            source = {key: value for key, value in event.items() if key != "state_delta"}
             for record in delta.get("analytics") or []:
                 if not isinstance(record, dict):
                     continue
@@ -4918,19 +5413,21 @@ class GenesisService:
                 if key in seen_analytic:
                     continue
                 seen_analytic.add(key)
-                flat = dict(event)
+                flat = dict(source)
                 flat.update(record)
                 flat["kind"] = "analytics"
                 flat["time"] = event.get("phase", 0)
+                flat[_DERIVED_FROM] = event.get("event_id")
                 derived_rows.append(flat)
             for record in delta.get("titles") or []:
                 if isinstance(record, dict) and record.get("article_id"):
                     if record["article_id"] in seen_articles:
                         continue
                     seen_articles.add(record["article_id"])
-                    flat = dict(event)
+                    flat = dict(source)
                     flat["article_count"] = 1
                     flat["kind"] = "publication"
+                    flat[_DERIVED_FROM] = event.get("event_id")
                     derived_rows.append(flat)
         seen_detections: set[str] = set()
         for row in artifact_rows:
@@ -4949,6 +5446,39 @@ class GenesisService:
         return derived_rows
 
     @staticmethod
+    def _with_derived_rows(
+        events: Iterable[Mapping[str, Any]], derived: list[dict[str, Any]]
+    ) -> Iterator[Mapping[str, Any]]:
+        """Raw events with each derived row placed after the evidence it summarises.
+
+        The derived rows were all put before the first raw event, so an ordered
+        or windowed reading of the stream saw every summary out of place. A row
+        derived from an event follows that event; one derived from an artifact
+        follows the last event of its round.
+        """
+        by_event: dict[Any, list[dict[str, Any]]] = {}
+        by_phase: dict[Any, list[dict[str, Any]]] = {}
+        for row in derived:
+            row = dict(row)
+            source = row.pop(_DERIVED_FROM, None)
+            if source is not None:
+                by_event.setdefault(source, []).append(row)
+            else:
+                by_phase.setdefault(row.get("phase"), []).append(row)
+        current_phase: Any = None
+        for event in events:
+            phase = event.get("phase")
+            if current_phase is not None and phase != current_phase:
+                yield from by_phase.pop(current_phase, [])
+            current_phase = phase
+            yield event
+            yield from by_event.pop(event.get("event_id"), [])
+        if current_phase is not None:
+            yield from by_phase.pop(current_phase, [])
+        for rows in (*by_event.values(), *by_phase.values()):
+            yield from rows
+
+    @staticmethod
     def _retention_purges_raw(processes: list[Mapping[str, Any]]) -> bool:
         return bool(GenesisService._purging_processes(processes))
 
@@ -4959,24 +5489,15 @@ class GenesisService:
         for process in processes:
             trace = process.get("trace_policy", {})
             retention = trace.get("retention") if isinstance(trace, Mapping) else None
-            if isinstance(retention, str) and "purge" in retention:
+            # An exact value, never a substring: "never-purge" purged.
+            if retention_purges(retention):
                 purging.add(str(process.get("id")))
         return purging
 
     @staticmethod
     def _redact_raw_responses(value: Any) -> Any:
-        """Replace raw provider-response fields with a purge marker (AW-20)."""
-        if isinstance(value, dict):
-            redacted: dict[str, Any] = {}
-            for key, item in value.items():
-                if key in {"response", "raw_response", "parsed_response"}:
-                    redacted[key] = "<purged-by-retention>"
-                else:
-                    redacted[key] = GenesisService._redact_raw_responses(item)
-            return redacted
-        if isinstance(value, list):
-            return [GenesisService._redact_raw_responses(item) for item in value]
-        return value
+        """Replace raw provider bodies with a purge marker (AW-20); outputs remain."""
+        return _redact_raw_responses(value)[0]
 
     def _elicitation_provider(self, profile_id: str) -> Any:
         profile = self._full_model_profile(profile_id)
@@ -5139,6 +5660,12 @@ class GenesisService:
         actions: list[str] = []
         if session.status == "awaiting_answer":
             actions.append("submit_message")
+            if progress.status == "needs_review":
+                # Advancing onto a stage marked for review leaves the session
+                # awaiting an answer, but the stage needs only re-approval of
+                # what it already published -- which the approve path accepts.
+                # Offering only a message forced a turn nobody needed.
+                actions.append("approve")
         elif session.status == "awaiting_approval":
             if progress.status == "draft_ready":
                 actions.append("draft")
@@ -5678,11 +6205,26 @@ class GenesisService:
             }
         )
 
-    def approve_elicitation_stage(self, session_id: str, *, approved_by: str) -> dict[str, Any]:
-        """Explicit researcher approval writing a new immutable package version (IEL-010/025)."""
+    def approve_elicitation_stage(
+        self,
+        session_id: str,
+        *,
+        approved_by: str,
+        acknowledged_findings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Explicit researcher approval writing a new immutable package version (IEL-010/025).
+
+        ``acknowledged_findings`` carries the ids of intent-check contradictions
+        the researcher has seen and decided to approve anyway. They are recorded
+        with the approval: a finding waved through, and why, is part of the
+        study's record rather than something the system forgets.
+        """
         session = self._elicitation_engine.require_session(session_id)
         if not approved_by or approved_by == "assistant" or approved_by == session.model_profile_id:
             raise ValueError("STAGE_APPROVAL_REQUIRED: only the researcher can approve a stage")
+        if acknowledged_findings:
+            self._acknowledge_intent_findings(session_id, acknowledged_findings)
+            session = self._elicitation_engine.require_session(session_id)
         workflow, stage = self._elicitation_engine.stage_for(session)
         progress = session.stages[session.current_stage]
         if workflow.next_stage(session.current_stage) is None:
@@ -5752,6 +6294,20 @@ class GenesisService:
                     "SPECIFICATION_INVALID: "
                     + attribute_specification_error(validation["errors"][0], workflow, stage)
                 )
+            # Inspection runs _load, _validate and _validate_theory; compilation
+            # also builds the theory execution plan, checks feedback policy and
+            # resolves the schema catalog. Only the fresh-patch branch gated on
+            # a real compile, so reopening a stage and re-approving through this
+            # branch could finish a session with the specification approved and
+            # the package refusing to compile.
+            compile_errors = self._compile_errors_for(
+                self._specification_dir(session.specification_id)
+            )
+            if compile_errors and workflow.next_stage(session.current_stage) is None:
+                raise ValueError(
+                    "SPECIFICATION_INVALID: the package does not compile: "
+                    + attribute_specification_error(compile_errors[0], workflow, stage)
+                )
             updated = self.update_specification(session.specification_id, form, current["version"])
         else:
             if session.pending_patch is None or session.pending_preview is None:
@@ -5809,6 +6365,19 @@ class GenesisService:
             # and still fail to compile. An intermediate stage cannot compile --
             # later layers are not elicited yet -- so this applies at the final
             # stage, where the package is meant to be whole.
+            # Acknowledge-to-proceed: a contradiction between what the researcher
+            # said and what the draft declares does not block approval, but it
+            # cannot be passed in silence either.
+            unacknowledged = blocking_findings(preview.get("intent_check"))
+            if unacknowledged:
+                first = unacknowledged[0]
+                raise ValueError(
+                    "INTENT_UNACKNOWLEDGED: the draft contradicts what you said about "
+                    f"'{first['declaration']}' — you said "
+                    f'"{first.get("researcher_said") or "(see the finding)"}", the draft '
+                    f"declares {first['draft_says']}. Revise the draft, or approve again "
+                    f"acknowledging {', '.join(item['id'] for item in unacknowledged)}."
+                )
             compile_errors = preview.get("validation", {}).get("compile_errors") or []
             if compile_errors and workflow.next_stage(session.current_stage) is None:
                 first = compile_errors[0]
@@ -5928,9 +6497,13 @@ class GenesisService:
                 if stage_ids.index(downstream) <= current_index:
                     continue
                 progress = session.stages.get(downstream)
+                # A stage still being answered is affected as much as one already
+                # drafted; leaving "clarifying" out gave its researcher no sign
+                # that the layer under it had changed.
                 if progress is None or progress.status not in {
                     "approved",
                     "awaiting_approval",
+                    "clarifying",
                     "draft_ready",
                     "needs_review",
                 }:
@@ -5972,6 +6545,40 @@ class GenesisService:
                         }
                     )
         return result
+
+    def _compile_errors_for(self, directory: Path) -> list[dict[str, Any]]:
+        """What a real compilation of this package would refuse.
+
+        The preview runs this over a candidate copy; re-approval needs the same
+        answer about the package on disk, and inspection is not it.
+        """
+        from genesis.compiler import ValidationIssue
+
+        with tempfile.TemporaryDirectory() as staging:
+            try:
+                StudyCompiler(
+                    directory, theory_templates=self._workflow_registry.theory_templates()
+                ).compile(Path(staging) / "build")
+            except ValidationIssue as exc:
+                return [
+                    {
+                        "code": getattr(issue, "code", "COMPILE"),
+                        "path": getattr(issue, "json_pointer", ""),
+                        "source_file": getattr(issue, "source_file", ""),
+                        "message": getattr(issue, "message", str(issue)),
+                    }
+                    for issue in exc.issues
+                ]
+            except (OSError, ValueError) as exc:
+                return [
+                    {
+                        "code": "PACKAGE_INVALID",
+                        "path": "",
+                        "source_file": "package",
+                        "message": str(exc),
+                    }
+                ]
+        return []
 
     def _inspect_current_package(self, session: Any) -> dict[str, Any]:
 
@@ -6142,8 +6749,107 @@ class GenesisService:
             live_directory=self._specification_dir(session.specification_id),
         )
         preview["invalidations"] = self._predicted_invalidations(workflow, patch)
+        # Carry forward acknowledgements already made against identical findings,
+        # so regenerating a preview does not silently re-arm the gate.
+        preview["intent_check"] = self._intent_check(
+            session, stage, preview, dict((session.pending_preview or {}).get("intent_check") or {})
+        )
         self._elicitation_store.put_pending_preview(session_id, preview)
         return self.get_elicitation(session_id)
+
+    def _acknowledge_intent_findings(self, session_id: str, finding_ids: list[str]) -> None:
+        """Record that the researcher has seen these contradictions and accepts them."""
+        session = self._elicitation_engine.require_session(session_id)
+        preview = dict(session.pending_preview or {})
+        check = dict(preview.get("intent_check") or {})
+        known = {
+            str(finding.get("id"))
+            for finding in check.get("findings", []) or ()
+            if isinstance(finding, Mapping)
+        }
+        unknown = sorted({str(item) for item in finding_ids} - known)
+        if unknown:
+            # Acknowledging an id this preview does not carry would silently do
+            # nothing, leaving the researcher believing they had cleared it.
+            raise ValueError(
+                "INTENT_ACK_UNKNOWN: no finding in the current preview has id "
+                f"{', '.join(unknown)}; regenerate the preview and use the ids it reports"
+            )
+        check["acknowledged"] = sorted(
+            {*(str(item) for item in check.get("acknowledged", []) or ()), *finding_ids}
+        )
+        preview["intent_check"] = check
+        self._elicitation_store.put_pending_preview(session_id, preview)
+
+    def _intent_check(
+        self,
+        session: Any,
+        stage: Any,
+        preview: Mapping[str, Any],
+        previous: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Ask whether the drafted stage says what the researcher said (gap A).
+
+        Advisory by construction: any failure to run, or to parse a reply, is
+        recorded and the preview proceeds. A check that can break the flow would
+        be routed around, and then it protects nothing.
+
+        An identical question is never asked twice. Approval re-previews before
+        it trusts anything, and a second reading of the same draft returns
+        different findings with different ids -- which silently voided the
+        acknowledgement the researcher had just given, and paid for a model call
+        to do it.
+        """
+        acknowledged = [str(item) for item in previous.get("acknowledged", []) or ()]
+        if os.environ.get("GENESIS_INTENT_CHECK", "1") not in {"1", "true", "TRUE"}:
+            return {"status": "disabled", "findings": [], "acknowledged": acknowledged}
+        owned = {path.strip("/") for path in stage.owned_paths}
+        files = preview.get("yaml_files") or {}
+        under_review = {
+            name: text for name, text in files.items() if name.removesuffix(".yaml") in owned
+        }
+        upstream = {
+            name: text for name, text in files.items() if name.removesuffix(".yaml") not in owned
+        }
+        if not under_review:
+            return {"status": "not_applicable", "findings": [], "acknowledged": acknowledged}
+        request = assemble_intent_request(
+            [(turn.stage_id, turn.answer or "") for turn in session.turns],
+            stage.id,
+            under_review,
+            upstream,
+        )
+        digest = hashlib.sha256(request.encode()).hexdigest()[:16]
+        if previous.get("status") == "ok" and previous.get("request_digest") == digest:
+            # Same turns, same draft: the answer cannot have changed, and asking
+            # again would renumber the findings under the researcher.
+            return {**dict(previous), "acknowledged": acknowledged}
+        try:
+            provider = self._elicitation_provider(session.model_profile_id)
+            response = provider.generate(
+                ProviderRequest(
+                    model=str(self.get_model_profile(session.model_profile_id)["model"]),
+                    system=INTENT_SYSTEM,
+                    prompt=request,
+                    parameters={"temperature": 0.1},
+                )
+            )
+            findings = parse_intent_findings(str(response.text))
+        except Exception as exc:  # advisory: never fail the preview
+            return {
+                "status": "unavailable",
+                "reason": f"{type(exc).__name__}: {exc}"[:400],
+                "findings": [],
+                "acknowledged": acknowledged,
+            }
+        known = {finding["id"] for finding in findings}
+        return {
+            "status": "ok",
+            "model_profile": session.model_profile_id,
+            "request_digest": digest,
+            "findings": findings,
+            "acknowledged": [item for item in acknowledged if item in known],
+        }
 
     def cancel_elicitation(self, session_id: str) -> dict[str, Any]:
         self._elicitation_engine.cancel(session_id)
@@ -6276,11 +6982,16 @@ class GenesisService:
         """List exported content and enumerate sensitive classes before writing (AW-20)."""
         run = self.get_run(run_id)
         artifacts = self.artifacts_for_run(run_id)
-        raw_responses = 0
-        for artifact in artifacts:
-            payload = artifact["payload"]
-            if isinstance(payload, dict) and "response" in payload.get("outputs", {}):
-                raw_responses += 1
+        # A record holds a provider body wherever the purge would replace one;
+        # looking only for an output named "response" counted none of them.
+        raw_responses = sum(1 for artifact in artifacts if _redact_raw_responses(artifact)[1])
+        build_ref = run.get("build") or run.get("build_path")
+        processes_file = self.resolve_path(build_ref) / "processes.json" if build_ref else None
+        purges = bool(
+            processes_file is not None
+            and processes_file.is_file()
+            and self._retention_purges_raw(json.loads(processes_file.read_text()))
+        )
         return {
             "run_id": run_id,
             "status": run["status"],
@@ -6302,7 +7013,7 @@ class GenesisService:
                 "credentials_stored": False,
             },
             "retention_policy": {
-                "purge_raw_responses": raw_responses > 0,
+                "purge_raw_responses": purges,
             },
         }
 
@@ -6367,6 +7078,22 @@ class GenesisService:
         extras: dict[str, str] = {
             "run_manifest.json": json.dumps(run.get("manifest") or {}, indent=2, sort_keys=True)
         }
+        # How the run actually went, as distinct from how it was configured.
+        # The manifest is frozen before execution, so a run stopped early by its
+        # event cap can only say so here -- and a bundle that omitted it let a
+        # truncated run be read as a complete one.
+        executions = run.get("executions")
+        if executions:
+            extras["run_execution.json"] = json.dumps(executions, indent=2, sort_keys=True)
+        # An accepted reading of the build is evidence -- it is pinned to a
+        # build hash and a model profile precisely so it can be cited -- and it
+        # travelled nowhere, so the bundle carried no record that anyone had
+        # read the package back.
+        build_for_readback = run.get("build") or run.get("build_path")
+        if build_for_readback:
+            reading = self.resolve_path(build_for_readback) / "readback.json"
+            if reading.is_file():
+                extras["readback.json"] = reading.read_text()
         build_ref = run.get("build") or run.get("build_path")
         processes: list[Mapping[str, Any]] = []
         package_closure_digest = ""
@@ -7102,6 +7829,26 @@ class GenesisService:
         target = self._specification_dir(spec_id)
         if target.exists():
             raise ValueError(f"ALREADY_EXISTS: specification '{spec_id}' already exists")
+        # Every sibling import path refuses links; this one copied through them, so
+        # a package member linked to a file outside the package pulled that
+        # file's content into the specification, its builds and their exports.
+        members = [source_path / f"{name}.yaml" for name in _PACKAGE_SECTIONS] + [
+            path
+            for relative in ("prompts", "schemas", "data", "extensions", "integrity.json")
+            for path in (
+                [source_path / relative, *(source_path / relative).rglob("*")]
+                if (source_path / relative).is_dir()
+                else [source_path / relative]
+            )
+        ]
+        linked = sorted(
+            path.relative_to(source_path).as_posix() for path in members if path.is_symlink()
+        )
+        if linked:
+            raise ValueError(
+                f"IMPORT_LINK: package member '{linked[0]}' is a symbolic link; a package "
+                "is imported only from regular files inside it"
+            )
         integrity_path = source_path / "integrity.json"
         if integrity_path.is_file():
             try:
@@ -7109,7 +7856,12 @@ class GenesisService:
             except json.JSONDecodeError as exc:
                 raise ValueError("IMPORT_INTEGRITY: package integrity manifest is invalid") from exc
             for relative, digest in manifest.items():
-                asset = source_path / relative
+                asset = (source_path / str(relative)).resolve()
+                if not asset.is_relative_to(source_path.resolve()) or not asset.is_file():
+                    raise ValueError(
+                        f"IMPORT_INTEGRITY: package member '{relative}' is not a file inside "
+                        "the package"
+                    )
                 actual = hashlib.sha256(asset.read_bytes()).hexdigest()
                 if actual != digest:
                     raise ValueError(
@@ -7122,7 +7874,7 @@ class GenesisService:
         if total > size_limit_bytes:
             raise ValueError(f"IMPORT_LIMIT: package size {total} exceeds limit {size_limit_bytes}")
         target.mkdir(parents=True, exist_ok=True)
-        for name in ("study", "openness", "theory", "domain", "protocol", "outcomes", "models"):
+        for name in _PACKAGE_SECTIONS:
             shutil.copy(source_path / f"{name}.yaml", target / f"{name}.yaml")
         for relative in ("prompts", "schemas", "data", "extensions"):
             child = source_path / relative
@@ -7182,6 +7934,14 @@ class GenesisService:
             "models": [m.model_dump(mode="json") for m in models.models],
             "prompts": prompts,
             "schemas": GenesisService._read_schema_files(source_path),
+            # The form carries one extensions block, written to every section;
+            # leaving it out dropped whatever a package or an approved patch had
+            # recorded there.
+            "extensions": {
+                name: body
+                for section in (models, outcomes, protocol, domain, theory, openness, study)
+                for name, body in section.extensions.items()
+            },
         }
         return {
             key: value

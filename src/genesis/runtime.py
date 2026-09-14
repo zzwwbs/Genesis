@@ -26,7 +26,8 @@ from genesis.information_timing import (
 )
 
 # measurement imports runtime lazily, inside its functions, so this does not cycle.
-from genesis.measurement import gated_input_refs
+from genesis.measurement import withheld_sources, withhold_instances
+from genesis.state_encoding import identical
 
 _ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 
@@ -439,6 +440,11 @@ class ContextEnvelope:
     exposures: tuple[Mapping[str, Any], ...] = ()
 
 
+# The namespaces a context policy's allow entry may start with. Any other first
+# segment is read as a state id.
+CONTEXT_ROOTS = ("state", "inputs", "condition", "actor", "events", "feedback", "exchanges")
+
+
 class ContextEngine:
     def __init__(self, policies: Mapping[str, Any]):
         if isinstance(policies, list):
@@ -466,6 +472,8 @@ class ContextEngine:
         scope = definition.get("scope", {}) if isinstance(definition, Mapping) else {}
         aggregate = definition.get("aggregate", {}) if isinstance(definition, Mapping) else {}
         project = definition.get("project", {}) if isinstance(definition, Mapping) else {}
+        # CONTEXT_ROOTS names these keys; the compiler refuses an allow entry
+        # that starts with anything else and is not a declared state.
         source_root = {
             "state": state,
             "inputs": invocation.inputs,
@@ -575,7 +583,7 @@ class ContextEngine:
         conditions = definition.get("available_when", {})
         if not isinstance(conditions, Mapping) or not conditions:
             return True
-        conditions = (
+        conditions = _availability_rule(
             conditions.get(path, {}) if isinstance(conditions.get(path), Mapping) else conditions
         )
         phase = invocation.phase
@@ -615,6 +623,33 @@ class ContextEngine:
             if not _evaluate_condition(predicate, namespace):
                 return False
         return True
+
+
+# Keys an availability rule recognises besides a predicate.
+AVAILABILITY_KEYS = frozenset(
+    {"after_round", "before_round", "event", "recipient_match", "source_match_event", "predicate"}
+)
+# The keys a predicate is written with, per the documented grammar.
+PREDICATE_KEYS = frozenset({"path", "op", "value", "all", "any", "not"})
+
+
+def _availability_rule(conditions: Mapping[str, Any]) -> Mapping[str, Any]:
+    """An availability rule with any inline predicate moved under ``predicate``.
+
+    The documented grammar -- and the compiler, the timing analysis and the
+    measurement analysis -- write availability as a predicate directly:
+    ``{path, op, value}`` or ``all``/``any``/``not``. This reader looked for a
+    predicate only under ``predicate:``, so a rule written as documented matched
+    none of its keys, skipped every check, and left the item available in every
+    round of every condition. Round and event keys may sit beside it.
+    """
+    inline = {key: value for key, value in conditions.items() if key in PREDICATE_KEYS}
+    if not inline or "predicate" in conditions:
+        return conditions
+    return {
+        **{key: value for key, value in conditions.items() if key not in PREDICATE_KEYS},
+        "predicate": inline,
+    }
 
 
 # Names the mapping key itself as the scoping field, for relations stored as
@@ -705,6 +740,24 @@ def _field_value(item: Any, field: str) -> Any:
     return _resolve_path(item, field)
 
 
+def _project_nested(item: Any, paths: frozenset[str], project: Any) -> Any | None:
+    """Apply a nested projection to a record, or to each record in a list.
+
+    A nested field is as often a list of records as a single one -- the case
+    this whole feature exists for, an author's private text inside an article,
+    is a list -- and recursing only into mappings made the projection a silent
+    no-op there: declared, compiled, and handing over the field it promised to
+    withhold. Returns None when the value is neither, leaving it to the caller.
+    """
+    if isinstance(item, Mapping):
+        return project(item, paths)
+    if isinstance(item, list | tuple) and any(isinstance(entry, Mapping) for entry in item):
+        return [
+            project(entry, paths) if isinstance(entry, Mapping) else _plain(entry) for entry in item
+        ]
+    return None
+
+
 def _kept_paths(record: Mapping[str, Any], paths: frozenset[str]) -> dict[str, Any]:
     """The named paths of a record, nested as they were, in the record's own order."""
     heads: dict[str, set[str]] = {}
@@ -719,8 +772,8 @@ def _kept_paths(record: Mapping[str, Any], paths: frozenset[str]) -> dict[str, A
     for name, item in record.items():
         if name in whole:
             kept[name] = _plain(item)
-        elif name in heads and isinstance(item, Mapping):
-            nested = _kept_paths(item, frozenset(heads[name]))
+        elif name in heads:
+            nested = _project_nested(item, frozenset(heads[name]), _kept_paths)
             if nested:
                 kept[name] = nested
     return kept
@@ -740,10 +793,10 @@ def _dropped_paths(record: Mapping[str, Any], paths: frozenset[str]) -> dict[str
     for name, item in record.items():
         if name in whole:
             continue
-        if name in heads and isinstance(item, Mapping):
-            result[name] = _dropped_paths(item, frozenset(heads[name]))
-        else:
-            result[name] = _plain(item)
+        nested = (
+            _project_nested(item, frozenset(heads[name]), _dropped_paths) if name in heads else None
+        )
+        result[name] = _plain(item) if nested is None else nested
     return result
 
 
@@ -857,6 +910,42 @@ def _apply_scope(
             return {key: item for key, item in value.items() if key in selector}
         return {key: item for key, item in value.items() if entitled(item)}
     return value
+
+
+def _exchange_retention(policies: Mapping[str, Any]) -> dict[str, int]:
+    """Per process, how many of its exchanges any policy could still read.
+
+    Absent from the mapping means unbounded: either no cap is declared, or a
+    declared cap keeps the head or orders by a field, and trimming the tail
+    would discard what such a cap selects.
+    """
+    bounds: dict[str, int] = {}
+    unbounded: set[str] = set()
+    for policy in policies.values():
+        if not isinstance(policy, Mapping):
+            continue
+        caps = policy.get("cardinality") or {}
+        for path in policy.get("allow") or ():
+            parts = str(path).split(".")
+            if parts[0] != "exchanges" or len(parts) < 2:
+                continue
+            process_id = parts[1]
+            rule = caps.get(str(path)) if isinstance(caps, Mapping) else None
+            if rule is None:
+                unbounded.add(process_id)
+                continue
+            try:
+                limit, keep, by = _cap_rule(rule)
+            except ValueError:
+                unbounded.add(process_id)
+                continue
+            if keep != "last" or by is not None:
+                unbounded.add(process_id)
+                continue
+            bounds[process_id] = max(bounds.get(process_id, 0), limit)
+    return {
+        process_id: limit for process_id, limit in bounds.items() if process_id not in unbounded
+    }
 
 
 def _cap_rule(rule: Any) -> tuple[int, str, str | None]:
@@ -1061,7 +1150,11 @@ class StateStore:
                     candidate[field] = self.reducers[reducer_name](candidate.get(field), value)
                 else:
                     raise ValueError(f"unknown state operation: {op}")
-            effects = {k: v for k, v in candidate.items() if self._state.get(k) != v}
+            # ``!=`` calls 1, 1.0 and True equal; JSON writes three different
+            # byte strings, and the record's identity is digested from those.
+            # Filtering with it dropped a type change as "unchanged", so an
+            # invalid type never reached the schema check below.
+            effects = {k: v for k, v in candidate.items() if not identical(self._state.get(k), v)}
         if any(k not in self.schema or k not in declared for k in effects):
             raise PermissionError("state effect is not declared in the state model")
         for key, value in effects.items():
@@ -1291,6 +1384,11 @@ def _invocation_namespace(invocation: ProcessInvocation) -> dict[str, Any]:
         "condition": _plain(condition),
         "events": _plain(events),
         "phase": invocation.phase,
+        # The documented predicate grammar, the scheduler and the measurement
+        # gate all spell the round `protocol.phase`; this namespace offered only
+        # `phase`, so an availability gate written as documented resolved to
+        # nothing. It exposes no new information -- the value is `phase`.
+        "protocol": {"phase": invocation.phase},
         "time": invocation.time,
     }
     artifacts: dict[str, list[Any]] = {}
@@ -1315,6 +1413,21 @@ def _resolve_optional(source: Any, path: str) -> tuple[bool, Any]:
         else:
             return False, None
     return True, value
+
+
+def _declares_composable_write(declarations: Any) -> bool:
+    """Whether any declared effect is more than a whole-field ``set``.
+
+    A bare ``set`` writes the field whole, which is what handing the outputs
+    over already does; only a key or an accumulating operation needs the
+    declaration to be interpreted.
+    """
+    for declaration in declarations or ():
+        if not isinstance(declaration, Mapping):
+            continue
+        if declaration.get("key") or str(declaration.get("op", "set")) != "set":
+            return True
+    return False
 
 
 def model_call_effects(
@@ -1442,6 +1555,64 @@ class RuleExecutor:
         return _result_from_declaration(
             self.default, metadata={"mode": "rule", "matched_rule": None}
         )
+
+
+def _stamp_engine_fields(
+    result: ProcessResult,
+    process: Mapping[str, Any],
+    actor_ids: tuple[str, ...],
+    phase: int | float | None,
+) -> ProcessResult:
+    """Write each declared actor and phase field of an output from the invocation.
+
+    A detector drawn per article was asked to repeat back which article it
+    scored, was never shown the id, and wrote "unknown", "" or the title in most
+    calls -- so settlement joined its scores to nothing. A reflection written in
+    round 3 dated itself round 4. The engine knows both the actor and the round;
+    the output fields are set from them, and what the executor had written there
+    is kept in the metadata when it differed.
+    """
+    declared = [
+        decl
+        for decl in process.get("outputs") or ()
+        if isinstance(decl, Mapping) and (decl.get("actor_fields") or decl.get("phase_fields"))
+    ]
+    if not declared or not result.outputs:
+        return result
+    outputs = dict(result.outputs)
+    replaced: dict[str, dict[str, Any]] = {}
+    for decl in declared:
+        artifact_type = str(decl.get("artifact_type"))
+        value = outputs.get(artifact_type)
+        if not isinstance(value, Mapping):
+            continue
+        if decl.get("actor_fields") and len(actor_ids) != 1:
+            return replace(
+                result,
+                status="failed",
+                metadata={
+                    **_plain(result.metadata),
+                    "code": "OUTPUT_ACTOR_FIELD_AMBIGUOUS",
+                    "error": (
+                        f"output '{artifact_type}' declares actor fields, but the invocation "
+                        f"has {len(actor_ids)} actors; an actor field needs exactly one"
+                    ),
+                },
+            )
+        stamped = dict(_plain(value))
+        written: list[tuple[Any, Any]] = [
+            (name, actor_ids[0] if actor_ids else None) for name in decl.get("actor_fields") or ()
+        ]
+        written += [(name, phase) for name in decl.get("phase_fields") or ()]
+        for name, engine_value in written:
+            if stamped.get(name) != engine_value:
+                replaced.setdefault(artifact_type, {})[str(name)] = stamped.get(name)
+            stamped[str(name)] = engine_value
+        outputs[artifact_type] = stamped
+    metadata = dict(_plain(result.metadata))
+    if replaced:
+        metadata["engine_fields_replaced"] = replaced
+    return replace(result, outputs=outputs, metadata=metadata)
 
 
 class StateTransitionExecutor:
@@ -1627,6 +1798,10 @@ class Scheduler:
         self._event_consumed: dict[tuple[str, str], int] = {}
         self._scheduled: list[ScheduledProcess] = []
         self._completed_occurrences: set[tuple[str, int | float]] = set()
+        # Occurrences that have committed at least one turn. Derived from committed
+        # turns, so a resumed run rebuilds it from its events rather than from a
+        # memory of what was asked.
+        self._started_occurrences: set[tuple[str, int | float]] = set()
         # Earliest phase at which each process completed. A delayed edge asks
         # whether the producer ran at least ``lag`` rounds ago, which the
         # latest completion alone cannot answer for a repeating producer.
@@ -1764,6 +1939,13 @@ class Scheduler:
         delay = resolved_delays.get(str(dep), 0)
         if delay <= 0 and self._untriggered(str(dep), phase, state):
             return True
+        # A producer deferred to the next round because a dependent already ran
+        # without it is, for the rest of this round, not triggered. Waiting on it
+        # instead would strand the dependent's remaining actors for the round --
+        # the first actor went ahead without it, so the rest must too, or one
+        # batch would see two different worlds.
+        if delay <= 0 and self._deferred_this_round(str(dep), phase):
+            return True
         if dep not in self.completed:
             # A delayed edge inside a dependency cycle bootstraps on the first
             # phase so the cycle can start at all.
@@ -1778,6 +1960,59 @@ class Scheduler:
         if self._repeats(dep):
             return (str(dep), phase) in self._completed_occurrences
         return bool(self.completed[dep] <= phase)
+
+    def _dependencies_of(
+        self, process: Mapping[str, Any]
+    ) -> tuple[list[str], Mapping[str, int | float]]:
+        """A process's declared `after` edges and their resolved delays."""
+        deps = process.get("after", [])
+        dependencies_block = process.get("dependencies")
+        if not deps and isinstance(dependencies_block, Mapping):
+            declared_after = dependencies_block.get("after")
+            if isinstance(declared_after, list | tuple):
+                deps = list(declared_after)
+        # Resolved once per process at construction; recompute only for a
+        # process that did not pass through Scheduler.__init__.
+        if "_edge_delays" in process:
+            return list(deps), process["_edge_delays"]
+        declared = process.get("dependencies")
+        return list(deps), edge_delays(declared if isinstance(declared, Mapping) else process, deps)
+
+    def _overtaken_by_dependent(self, process_id: str, phase: int | float) -> bool:
+        """Whether a process that waits on this one has already run this round.
+
+        A repeating, condition-triggered process that is not triggered when a
+        dependent is considered does not hold that dependent back -- that is
+        what lets a round proceed. But if its trigger turns true later in the
+        same round, running it then would put it after a process declared to
+        run after it. It waits for the next round instead. Mid-round starts are
+        otherwise untouched: this applies only once something depending on the
+        process, by a zero-delay edge, has committed a turn in this round.
+        """
+        for other_id, other in self.processes.items():
+            if other_id == process_id:
+                continue
+            deps, delays = self._dependencies_of(other)
+            if (
+                process_id in deps
+                and delays.get(process_id, 0) <= 0
+                and (other_id, phase) in self._started_occurrences
+            ):
+                return True
+        return False
+
+    def _deferred_this_round(self, process_id: str, phase: int | float) -> bool:
+        """A repeating, condition-triggered process held to the next round."""
+        if not self._repeats(process_id) or (process_id, phase) in self._completed_occurrences:
+            return False
+        trigger = self.processes.get(process_id, {}).get("trigger", {})
+        if not isinstance(trigger, Mapping) or trigger.get("type") != "condition":
+            return False
+        return self._overtaken_by_dependent(process_id, phase)
+
+    def mark_started(self, process_id: str, phase: int | float) -> None:
+        """Record that an occurrence has committed a turn."""
+        self._started_occurrences.add((process_id, phase))
 
     def ready(
         self,
@@ -1796,21 +2031,7 @@ class Scheduler:
                 or p.get("phase", 0) > phase
             ):
                 continue
-            deps = p.get("after", [])
-            dependencies_block = p.get("dependencies")
-            if not deps and isinstance(dependencies_block, Mapping):
-                declared_after = dependencies_block.get("after")
-                if isinstance(declared_after, list | tuple):
-                    deps = list(declared_after)
-            # Resolved once per process at construction; recompute only for a
-            # process that did not pass through Scheduler.__init__.
-            if "_edge_delays" in p:
-                resolved_delays = p["_edge_delays"]
-            else:
-                declared = p.get("dependencies")
-                resolved_delays = edge_delays(
-                    declared if isinstance(declared, Mapping) else p, deps
-                )
+            deps, resolved_delays = self._dependencies_of(p)
             trigger = p.get("trigger", {})
             if (
                 isinstance(trigger, Mapping)
@@ -1826,6 +2047,8 @@ class Scheduler:
             if isinstance(trigger, Mapping) and trigger.get("type") == "condition":
                 predicate = cast(Mapping[str, Any], trigger.get("predicate"))
                 if not _evaluate_condition(predicate, trigger_state):
+                    continue
+                if self._deferred_this_round(pid, phase):
                     continue
             if any(
                 not self._dependency_satisfied(pid, p, dep, resolved_delays, phase, trigger_state)
@@ -1843,6 +2066,7 @@ class Scheduler:
     def complete(self, process_id: str, phase: int | float) -> None:
         self.completed[process_id] = phase
         self._completed_occurrences.add((process_id, phase))
+        self._started_occurrences.add((process_id, phase))
         previous = self._earliest_completion.get(process_id)
         if previous is None or phase < previous:
             self._earliest_completion[process_id] = phase
@@ -1950,6 +2174,10 @@ class RunController:
         # were not committed because the run stopped mid-batch (CON-013, CON-015).
         self.execution_decisions: dict[str, dict[str, Any]] = {}
         self.discarded_calls: dict[str, Any] = {"calls": 0, "unfinished": 0, "usage": {}}
+        # An event cap stops the run and marks it completed, which is
+        # indistinguishable from reaching the declared termination. A run that
+        # was cut short is not the study the researcher declared, so say so.
+        self.budget_exhausted = False
         self.state_store, self.persistence = state_store, persistence
         self.artifact_store = artifact_store
         self.output_schema_validator = output_schema_validator
@@ -2004,6 +2232,16 @@ class RunController:
             if isinstance(policy, Mapping)
             for path in policy.get("allow") or ()
             if str(path).startswith("exchanges.") and len(str(path).split(".")) > 1
+        )
+        # How many exchanges per actor group are worth keeping, per process.
+        # The declared cap was applied only when a prompt was built, so the log
+        # itself grew for the life of the run: a policy reading "the last three
+        # rounds" still held every round, at O(rounds x groups x context size).
+        # Only a cap that keeps the *tail* in recorded order can be applied
+        # here; one keeping the head, or ordering by a field, needs entries this
+        # trim would discard, so those stay unbounded and say so.
+        self._exchange_retention: dict[str, int] = _exchange_retention(
+            getattr(context_engine, "policies", {}) or {}
         )
         # The protocol's first phase; the floor for "a round that actually ran".
         self._phase_start: int = 0
@@ -2152,7 +2390,13 @@ class RunController:
         }
         if call.context is not None and bool(trace.get("record_context", True)):
             entry["context"] = _exchange_context(call.context.data)
-        self._exchange_log.setdefault((turn.process_id, tuple(call.actor_ids)), []).append(entry)
+        key = (turn.process_id, tuple(call.actor_ids))
+        entries = self._exchange_log.setdefault(key, [])
+        entries.append(entry)
+        keep = self._exchange_retention.get(turn.process_id)
+        if keep is not None and len(entries) > keep:
+            # Recorded oldest-first, so the readable tail is the end.
+            del entries[: len(entries) - keep]
 
     def _exchanges_for(self, turn: _ActorTurn) -> dict[str, list[dict[str, Any]]]:
         """This turn's own earlier exchanges, per process, oldest first.
@@ -2222,6 +2466,13 @@ class RunController:
                 entry["context"] = _exchange_context(event["context"])
             actors = tuple(str(actor) for actor in event.get("actors", ()) or ())
             log.setdefault((process_id, actors), []).append(entry)
+        # The same bound the live path keeps. Restoring every exchange handed a
+        # resumed run's models more history than the uninterrupted run shows, and
+        # held all of it for the rest of the run.
+        for (process_id, _actors), entries in log.items():
+            keep = self._exchange_retention.get(process_id)
+            if keep is not None and len(entries) > keep:
+                del entries[: len(entries) - keep]
         self._exchange_log = log
 
     def _recorded_invocation_outputs(self, run_id: str) -> dict[str, Any]:
@@ -2537,6 +2788,16 @@ class RunController:
                     str(event.get("event_id", "")), phase, event.get("state_delta")
                 )
                 completed_groups.setdefault((str(process_id), phase), set()).add(actors)
+                # A straight run crosses off one schedule request per actor turn,
+                # when the turn is taken -- before that turn's own effects land.
+                # The rebuild used to cross off one per *completed occurrence*,
+                # after replaying every effect, so a batch interrupted part-way
+                # kept its requests open and a resumed run took extra actor
+                # turns the uninterrupted run never did. Replayed here, in commit
+                # order, it counts exactly as the run did.
+                self.scheduler.consume_scheduled(str(process_id), phase)
+                if event.get("kind") == "process_completed":
+                    self.scheduler.mark_started(str(process_id), phase)
             for emitted in event.get("events", []):
                 self._event_history.append(
                     {
@@ -2568,7 +2829,6 @@ class RunController:
                 )
             )
             if expected.issubset(actor_groups):
-                self.scheduler.consume_scheduled(process_id, phase)
                 self.scheduler.complete(process_id, phase)
         self._event_count = len(completed)
 
@@ -2619,15 +2879,20 @@ class RunController:
         view = turn.view
         # A measurement used only under some conditions or rounds is not resolved
         # outside them, so the process cannot read it there at all.
-        input_refs = gated_input_refs(
-            turn.process, self.scheduler.processes, phase=turn.phase, condition=scope.condition
-        )
+        # Every declared input is resolved, and then the records a gated-off
+        # measurement produced are dropped -- by producer, never by type, so
+        # another process's records of the same type still arrive and the
+        # consumer keeps its own.
+        input_refs = turn.process.get("inputs") or []
         resolved_inputs = (
-            self.artifact_store.resolve(
-                list(input_refs),
-                actor_ids=turn.actor_ids,
-                phase=turn.phase,
-                visible=view.artifact_ids if view is not None else None,
+            withhold_instances(
+                self.artifact_store.resolve(
+                    list(input_refs),
+                    actor_ids=turn.actor_ids,
+                    phase=turn.phase,
+                    visible=view.artifact_ids if view is not None else None,
+                ),
+                withheld_sources(turn.process, phase=turn.phase, condition=scope.condition),
             )
             if self.artifact_store is not None and isinstance(input_refs, list | tuple)
             else {}
@@ -2790,6 +3055,8 @@ class RunController:
                         outputs=dict(retry_policy.get("fallback_outputs", {})),
                         metadata={**_plain(result.metadata), "skipped_fallback": True},
                     )
+            if result.status == "succeeded":
+                result = _stamp_engine_fields(result, turn.process, call.actor_ids, call.phase)
             # F3/SCH-002: every declared artifact output — including a
             # fallback — must satisfy its declared schema before any
             # state or artifact commit. This is the common
@@ -2955,6 +3222,14 @@ class RunController:
             ):
                 # A model call's declared operations are applied to committed
                 # state, not written whole from its outputs.
+                effects = model_call_effects(turn.process, result.outputs, turn.actor_ids)
+            elif _declares_composable_write(raw_state_effects):
+                # A process that declares a keyed or accumulating write means it
+                # for its own outputs too. Writing the field whole instead lost
+                # the key: fanned-out siblings overwrote one another under
+                # sequential timing, and collided at commit under simultaneous
+                # timing -- after every call had already run. The compiler calls
+                # such a declaration composable, so the runtime has to honour it.
                 effects = model_call_effects(turn.process, result.outputs, turn.actor_ids)
             else:
                 effects = {key: value for key, value in result.outputs.items() if key in declared}
@@ -3350,6 +3625,17 @@ class RunController:
         )
         return limit
 
+    def _stop_on_budget(self, *, work_remains: bool) -> None:
+        """Record why the run stopped when its event cap is reached.
+
+        One rule for both dispatch paths. Reaching the cap is not by itself a
+        truncation -- a run that finished on its last permitted event finished
+        -- so only a cap that denied work still waiting is recorded as one.
+        """
+        if work_remains:
+            self.budget_exhausted = True
+        self.status = "completed"
+
     def _run_batch_concurrently(
         self,
         scope: _RunScope,
@@ -3406,9 +3692,10 @@ class RunController:
                 if not pending:
                     if prepare_error is not None:
                         break
-                    # Defensive: the batch starts with budget left and stops once
-                    # it is spent, so this is not expected to be reached.
-                    self.status = "completed"
+                    # The caller checks the cap before a batch starts, so this is
+                    # not expected; if it is reached, the actors still queued
+                    # were denied by the cap and the run says so.
+                    self._stop_on_budget(work_remains=bool(queue))
                     stopped_cleanly = True
                     return False
                 turn, call, future = pending.popleft()
@@ -3420,8 +3707,9 @@ class RunController:
                 self._commit_turn(scope, turn, call, future.result())
                 executed.append(turn.process_id)
                 self._event_count += 1
+                self.scheduler.mark_started(turn.process_id, turn.phase)
                 if max_events is not None and self._event_count >= max_events:
-                    self.status = "completed"
+                    self._stop_on_budget(work_remains=bool(queue or pending))
                     stopped_cleanly = True
                     return False
             if prepare_error is not None:
@@ -3694,6 +3982,7 @@ class RunController:
             self.state_store = StateStore({key: type(value) for key, value in state.items()}, state)
         self._restore_persisted_frontier(run_id)
         if max_events is not None and self._event_count >= max_events:
+            self.budget_exhausted = True
             self.status = "completed"
             return []
         executed: list[str] = []
@@ -3813,7 +4102,18 @@ class RunController:
                     ]
                     batched = len(actor_groups) > 1 and bool(self._actor_queues[actor_key])
                     reads_from_view = batched and self._reads_from_view(item.process_id, process)
-                    if batched and (reads_from_view or timing_order == "shuffled"):
+                    # Actors drawn from state must be recorded as well as viewed
+                    # or shuffled ones: they are the case where re-expanding
+                    # after a pause can yield a different set, because the batch
+                    # may have written the field it draws from. A literal actor
+                    # list re-expands identically and needs no record.
+                    drawn_from_state = (
+                        isinstance(process.get("actors"), Mapping)
+                        and process["actors"].get("ids") is None
+                    )
+                    if batched and (
+                        reads_from_view or timing_order == "shuffled" or drawn_from_state
+                    ):
                         self._batch_orders[actor_key] = tuple(actor_groups)
                     if reads_from_view:
                         self._batch_views[actor_key] = self._open_batch_view(
@@ -3846,6 +4146,18 @@ class RunController:
                         executed_this_phase,
                     ),
                 )
+                # Asked before the turn is taken, never after it is committed.
+                # Checking afterwards fired on the last natural event too, so a
+                # run that finished on its own was recorded as cut short; asking
+                # here means the cap is only a truncation when there was still a
+                # turn waiting to be denied. Asked before either dispatch path:
+                # asked only on the serial one, a cap reached just before a
+                # concurrent batch let the batch submit nothing and record the
+                # run as finished.
+                if max_events is not None and self._event_count >= max_events:
+                    # Reached here only because a turn is waiting to be taken.
+                    self._stop_on_budget(work_remains=True)
+                    return executed
                 if batch_limit > 1:
                     template = _ActorTurn(
                         process_id=item.process_id,
@@ -3884,9 +4196,7 @@ class RunController:
                         break
                 executed.append(item.process_id)
                 self._event_count += 1
-                if max_events is not None and self._event_count >= max_events:
-                    self.status = "completed"
-                    return executed
+                self.scheduler.mark_started(item.process_id, phase)
                 actor_key = (item.process_id, phase)
                 if self._actor_queues.get(actor_key):
                     executed_this_phase.discard(item.process_id)

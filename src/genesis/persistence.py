@@ -27,32 +27,61 @@ from genesis.state_encoding import (
     should_write_base,
 )
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 _RUN_STATUSES = {"created", "running", "paused", "completed", "failed", "cancelled"}
 # A SHA-256 object digest as it appears inside stored JSON records.
 _DIGEST_PATTERN = re.compile(r"\b[0-9a-f]{64}\b")
 # Fields that carry raw provider responses (AW-20), as export redaction treats them.
-_RAW_RESPONSE_KEYS = frozenset({"response", "raw_response", "parsed_response"})
+_RAW_RESPONSE_KEYS = frozenset({"raw_response", "parsed_response"})
 _PURGED = "<purged-by-retention>"
+# Retention values that purge raw provider bodies, and those that keep them.
+RETENTION_PURGE = frozenset({"purge", "purge-raw-responses", "purge-raw-after-run"})
+RETENTION_KEEP = frozenset({"full", "retain", "keep"})
 
 
 def _redact_raw_responses(value: Any) -> tuple[Any, bool]:
-    """Replace raw-response fields with a purge marker; report whether any changed."""
-    if isinstance(value, dict):
-        changed = False
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            if key in _RAW_RESPONSE_KEYS and item not in (None, "", _PURGED):
-                redacted[key] = _PURGED
-                changed = True
-            else:
-                redacted[key], child_changed = _redact_raw_responses(item)
-                changed = changed or child_changed
-        return redacted, changed
+    """Replace the provider bodies of a record with a purge marker.
+
+    Only the places the engine writes a provider body are touched: a record's
+    own ``raw_response`` / ``parsed_response``, each ``provider_attempts`` entry,
+    and the same inside its ``metadata`` (an event) or ``payload`` (an exported
+    artifact row). Matching those keys at any depth -- and ``response`` with
+    them -- overwrote a study's declared output whose field happened to be
+    named ``response``. Lists are redacted element by element.
+    """
     if isinstance(value, list):
         results = [_redact_raw_responses(item) for item in value]
         return [item for item, _ in results], any(flag for _, flag in results)
-    return value, False
+    if not isinstance(value, dict):
+        return value, False
+    redacted = dict(value)
+    changed = False
+    for key in _RAW_RESPONSE_KEYS:
+        if key in redacted and redacted[key] not in (None, "", _PURGED):
+            redacted[key] = _PURGED
+            changed = True
+    attempts = redacted.get("provider_attempts")
+    if isinstance(attempts, list):
+        cleaned = []
+        for attempt in attempts:
+            if isinstance(attempt, dict):
+                attempt = dict(attempt)
+                for key in _RAW_RESPONSE_KEYS:
+                    if key in attempt and attempt[key] not in (None, "", _PURGED):
+                        attempt[key] = _PURGED
+                        changed = True
+            cleaned.append(attempt)
+        redacted["provider_attempts"] = cleaned
+    for nested in ("metadata", "payload"):
+        if isinstance(redacted.get(nested), dict):
+            redacted[nested], nested_changed = _redact_raw_responses(redacted[nested])
+            changed = changed or nested_changed
+    return redacted, changed
+
+
+def retention_purges(retention: Any) -> bool:
+    """Whether a trace policy's retention value purges raw provider bodies."""
+    return isinstance(retention, str) and retention in RETENTION_PURGE
 
 
 _RUN_TRANSITIONS = {
@@ -145,6 +174,11 @@ class ObjectStore:
     def collect_garbage(self, referenced: set[str]) -> int:
         removed = 0
         for path in self.root.glob("??/*"):
+            # Only a stored object is a candidate. A writer's temporary file
+            # lives beside the objects until it is moved into place, and deleting
+            # it broke that write; interrupted temporaries are cleanup_orphans'.
+            if path.name.startswith(".") or path.suffix == ".tmp":
+                continue
             digest = path.parent.name + path.name
             if digest not in referenced and path.is_file():
                 path.unlink()
@@ -246,6 +280,8 @@ class PersistenceCoordinator:
                     self._migration_8()
                 elif target == 9:
                     self._migration_9()
+                elif target == 10:
+                    self._migration_10()
                 self._validate_schema_version(target)
                 self.connection.execute(f"PRAGMA user_version = {target}")
                 self.connection.execute("COMMIT")
@@ -538,6 +574,17 @@ class PersistenceCoordinator:
         """
         if "form" not in self._table_columns("events"):
             self.connection.execute("ALTER TABLE events ADD COLUMN form TEXT")
+
+    def _migration_10(self) -> None:
+        """Index events and artifacts by run.
+
+        Neither table had an index on ``run_id``, so every per-run read -- the
+        commit path's predecessor lookup among them -- scanned every row of every
+        run, and a workspace's commits grew quadratic in its history. Additive and
+        idempotent.
+        """
+        self.connection.execute("CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS artifacts_by_run ON artifacts(run_id)")
 
     def _validate_schema(self) -> None:
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1915,51 +1962,65 @@ class PersistenceCoordinator:
             record = deepcopy(payload)
             build_hash = str(record["build_hash"])
             study_id = str(record["study_id"])
-            self._ensure_study(study_id, study_id)
-            package_version = int(record["package_version"])
-            if package_version == 0:
-                # Unversioned packages (direct source compiles) get a version-0
-                # lifecycle placeholder so the composite FK stays satisfiable.
-                existing = self.connection.execute(
-                    "SELECT 1 FROM package_versions WHERE study_id = ? AND version = 0",
-                    (study_id,),
-                ).fetchone()
-                if existing is None:
-                    self.connection.execute(
-                        """INSERT INTO package_versions(
-                               study_id, version, content_hash, parent_version, status,
-                               payload_json
-                           ) VALUES (?, ?, ?, NULL, 'draft', ?)""",
-                        (
-                            study_id,
-                            0,
-                            str(record.get("package_content_hash", "")),
-                            '{"title": "' + study_id + '"}',
-                        ),
-                    )
+            # One unit: the implied study and its version-0 placeholder were
+            # committed before the build row, so a refused build left a study
+            # behind that nothing had recorded. A savepoint, because a caller may
+            # already hold a transaction.
+            self.connection.execute("SAVEPOINT record_study_build")
             try:
+                self._record_study_build(record, build_hash, study_id)
+            except Exception:
+                self.connection.execute("ROLLBACK TO SAVEPOINT record_study_build")
+                self.connection.execute("RELEASE SAVEPOINT record_study_build")
+                raise
+            self.connection.execute("RELEASE SAVEPOINT record_study_build")
+            return deepcopy(record)
+
+    def _record_study_build(self, record: dict[str, Any], build_hash: str, study_id: str) -> None:
+        self._ensure_study(study_id, study_id)
+        package_version = int(record["package_version"])
+        if package_version == 0:
+            # Unversioned packages (direct source compiles) get a version-0
+            # lifecycle placeholder so the composite FK stays satisfiable.
+            existing = self.connection.execute(
+                "SELECT 1 FROM package_versions WHERE study_id = ? AND version = 0",
+                (study_id,),
+            ).fetchone()
+            if existing is None:
                 self.connection.execute(
-                    """INSERT INTO study_builds(
-                           build_hash, study_id, package_version, package_content_hash,
-                           compiler_version, created_at, payload_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO package_versions(
+                           study_id, version, content_hash, parent_version, status,
+                           payload_json
+                       ) VALUES (?, ?, ?, NULL, 'draft', ?)""",
                     (
-                        build_hash,
-                        str(record["study_id"]),
-                        int(record["package_version"]),
+                        study_id,
+                        0,
                         str(record.get("package_content_hash", "")),
-                        str(record["compiler_version"]),
-                        str(record["created_at"]),
-                        self._encode_record(record),
+                        '{"title": "' + study_id + '"}',
                     ),
                 )
-            except sqlite3.IntegrityError as exc:
-                if "FOREIGN KEY" in str(exc):
-                    raise ValueError(
-                        f"FK_VIOLATION: build references unknown study {record['study_id']}"
-                    ) from exc
-                raise ValueError(f"ALREADY_EXISTS: build '{build_hash}' already recorded") from exc
-            return deepcopy(record)
+        try:
+            self.connection.execute(
+                """INSERT INTO study_builds(
+                       build_hash, study_id, package_version, package_content_hash,
+                       compiler_version, created_at, payload_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    build_hash,
+                    str(record["study_id"]),
+                    int(record["package_version"]),
+                    str(record.get("package_content_hash", "")),
+                    str(record["compiler_version"]),
+                    str(record["created_at"]),
+                    self._encode_record(record),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            if "FOREIGN KEY" in str(exc):
+                raise ValueError(
+                    f"FK_VIOLATION: build references unknown study {record['study_id']}"
+                ) from exc
+            raise ValueError(f"ALREADY_EXISTS: build '{build_hash}' already recorded") from exc
 
     def list_study_builds(self, study_id: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
@@ -1975,20 +2036,41 @@ class PersistenceCoordinator:
                 ).fetchall()
             return [json.loads(row[0]) for row in rows]
 
-    def record_idempotency(self, key: str, response: dict[str, Any]) -> None:
+    # How many idempotency records are kept; the oldest beyond it are evicted.
+    IDEMPOTENCY_LIMIT = 10_000
+    _IDEMPOTENCY_ENVELOPE = "genesis.idempotency/1"
+
+    def record_idempotency(
+        self, key: str, response: dict[str, Any], payload_hash: str | None = None
+    ) -> None:
+        """Remember a request's result under its key, bound to what was requested.
+
+        Only the response was stored, so a key reused with a different body
+        returned the first result and never made the second; and every key was
+        kept forever. The request digest is stored with it, and the table is
+        bounded to the most recent ``IDEMPOTENCY_LIMIT`` keys.
+        """
+        record = {
+            "envelope": self._IDEMPOTENCY_ENVELOPE,
+            "payload_hash": payload_hash,
+            "response": response,
+        }
         with self._lock:
             self.connection.execute(
                 """INSERT OR REPLACE INTO idempotency(
                        idempotency_key, response_json, created_at
                    ) VALUES (?, ?, ?)""",
-                (
-                    key,
-                    json.dumps(response, sort_keys=True),
-                    datetime.now(UTC).isoformat(),
-                ),
+                (key, json.dumps(record, sort_keys=True), datetime.now(UTC).isoformat()),
+            )
+            self.connection.execute(
+                """DELETE FROM idempotency WHERE idempotency_key NOT IN (
+                       SELECT idempotency_key FROM idempotency
+                       ORDER BY created_at DESC LIMIT ?
+                   )""",
+                (self.IDEMPOTENCY_LIMIT,),
             )
 
-    def get_idempotency(self, key: str) -> dict[str, Any] | None:
+    def get_idempotency(self, key: str, payload_hash: str | None = None) -> dict[str, Any] | None:
         with self._lock:
             row = self.connection.execute(
                 "SELECT response_json FROM idempotency WHERE idempotency_key = ?",
@@ -1996,7 +2078,16 @@ class PersistenceCoordinator:
             ).fetchone()
             if row is None:
                 return None
-            return cast(dict[str, Any], json.loads(row[0]))
+            stored = json.loads(row[0])
+            if not (
+                isinstance(stored, dict) and stored.get("envelope") == self._IDEMPOTENCY_ENVELOPE
+            ):
+                return cast(dict[str, Any], stored)  # recorded before requests were bound
+            if payload_hash is not None and stored.get("payload_hash") not in (None, payload_hash):
+                raise ValueError(
+                    "IDEMPOTENCY_CONFLICT: the key was already used with a different payload"
+                )
+            return cast(dict[str, Any], stored["response"])
 
     def _require_study(self, study_id: str) -> None:
         row = self.connection.execute(
@@ -2108,23 +2199,20 @@ class PersistenceCoordinator:
                     )
                     rewritten += 1
                     replaced.append(payload_ref)
-                # Reference-aware collection of the payloads just replaced.
+                # Reference-aware collection of the payloads just replaced, by the
+                # one rule the file pass below also uses: checking four tables
+                # here and every reference there dropped the metadata row of an
+                # object a package snapshot still named, while keeping its file.
+                referenced = self._referenced_digests() if replaced else set()
                 for digest in replaced:
-                    still_used = self.connection.execute(
-                        """SELECT 1 FROM artifacts WHERE payload_ref = ? UNION ALL
-                           SELECT 1 FROM events WHERE payload_ref = ? UNION ALL
-                           SELECT 1 FROM states WHERE payload_ref = ? UNION ALL
-                           SELECT 1 FROM checkpoints WHERE payload_ref = ?""",
-                        (digest, digest, digest, digest),
-                    ).fetchone()
-                    if still_used is None:
+                    if digest not in referenced:
                         self.connection.execute("DELETE FROM objects WHERE digest = ?", (digest,))
                 self.connection.execute("COMMIT")
             except Exception:
                 self._rollback()
                 raise
             for digest in replaced:
-                if digest in self._referenced_digests():
+                if digest in referenced:
                     continue
                 self.object_store._metadata.pop(digest, None)
                 object_path = self.object_store.root / digest[:2] / digest[2:]

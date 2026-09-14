@@ -107,7 +107,8 @@ def test_compiler_merges_domain_availability_into_context_policies(tmp_path) -> 
         'schema_version: "1.0"\nstudy_id: av-study\ntheory_family: exploratory\n'
     )
     (source / "domain.yaml").write_text(
-        'schema_version: "1.0"\nstudy_id: av-study\nvisibility:\n'
+        'schema_version: "1.0"\nstudy_id: av-study\n'
+        "states:\n  - id: counter\n    value_type: integer\n    initial: 0\nvisibility:\n"
         "  - id: av-policy\n    allow: [counter]\navailability:\n"
         "  - path: counter\n    available_when: {after_round: 2}\n"
     )

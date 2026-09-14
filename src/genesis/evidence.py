@@ -3,8 +3,10 @@
 Exploration and reproducibility are distinct, capability-labelled bundles:
 ``exploration`` lets a researcher inspect retained evidence and previously
 calculated results, while ``reproducibility`` additionally requires the
-run-pinned package closure, build, execution manifest and checkpoint evidence
-so a compatible local runtime could reconstruct inputs. Each bundle carries a
+run-pinned package closure, build and execution manifest so a compatible local
+runtime could reconstruct inputs. It does not require checkpoint evidence: no
+bundle carries a checkpoint payload, so ``branch_at_checkpoint`` is reported
+unavailable for every export rather than sometimes. Each bundle carries a
 machine-readable capability evaluation; a requested full export fails with a
 completeness report rather than silently downgrading.
 """
@@ -35,6 +37,19 @@ CAPABILITY_ORDER = (
 class ExportMode:
     EXPLORATION = "exploration"
     REPRODUCIBILITY = "reproducibility"
+
+
+def file_digest(path: Path, *, chunk: int = 1 << 20) -> str:
+    """sha256 of a file read in bounded chunks.
+
+    The bundle manifest hashed members with ``read_bytes()``, holding the whole
+    state history in memory right after the export streamed it to avoid that.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(chunk):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def evaluate_capabilities(
@@ -134,7 +149,10 @@ def evaluate_capabilities(
         missing_branch,
         "recorded checkpoints support branching"
         if has_build and has_checkpoint_evidence
-        else "checkpoint evidence is not available in this bundle",
+        else (
+            "no bundle carries checkpoint payloads, so branching from one is "
+            "not offered by any export"
+        ),
     )
     return capabilities
 
@@ -162,7 +180,7 @@ def write_bundle_manifest(
         members.append(
             {
                 "path": relative,
-                "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "digest": file_digest(path),
                 "size": path.stat().st_size,
                 "media_type": _media_type(path),
             }
@@ -232,7 +250,7 @@ def verify_bundle_manifest(destination: Path) -> dict[str, Any]:
         if not asset.is_file() or asset.is_symlink():
             raise ValueError(f"IMPORT_BUNDLE: member '{relative}' is missing or a link")
         expected = str(member.get("digest", ""))
-        actual = hashlib.sha256(asset.read_bytes()).hexdigest()
+        actual = file_digest(asset)
         if actual != expected:
             raise ValueError(f"IMPORT_BUNDLE: member '{relative}' fails its digest")
         declared_size = member.get("size")

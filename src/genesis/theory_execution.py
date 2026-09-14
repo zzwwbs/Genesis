@@ -144,6 +144,29 @@ def compile_theory_execution(
         if isinstance(delay, Mapping):
             declarations.append(("delay", _declaration_id("delay", index, delay.get("id")), delay))
 
+    # The coverage report is keyed by declaration id across all three kinds.
+    # The schema accepts two declarations sharing one, and both executed -- but
+    # the report kept only the last, so a build recorded one resolved
+    # declaration where two ran. An explicit id can also collide with a
+    # generated one ('relation-0'). Only the first keeps the id.
+    seen_ids: set[str] = set()
+    unique: list[tuple[str, str, Mapping[str, Any]]] = []
+    for decl_type, decl_id, declaration in declarations:
+        if decl_id in seen_ids:
+            plan.issues.append(
+                TheoryExecutionIssue(
+                    "THEORY_DECLARATION_DUPLICATE",
+                    decl_type,
+                    decl_id,
+                    f"declaration id '{decl_id}' is already used by another theory "
+                    "declaration; ids name one relation, feedback or delay each",
+                )
+            )
+            continue
+        seen_ids.add(decl_id)
+        unique.append((decl_type, decl_id, declaration))
+    declarations = unique
+
     for decl_type, decl_id, declaration in declarations:
         binding = declaration.get("execution")
         if binding is None:

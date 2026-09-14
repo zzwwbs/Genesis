@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import tempfile
 from collections.abc import Mapping
@@ -20,7 +21,14 @@ from .execution_manifest import _exclusion_reason, build_package_closure
 from .information_timing import _predicate_paths, model_effect_problems, timing_diagnostics
 from .measurement import measurement_diagnostics
 from .providers import split_prompt_roles
-from .runtime import STATE_VALUE_TYPES, _cap_rule, _project_rule, _resolve_path, edge_delays
+from .runtime import (
+    STATE_VALUE_TYPES,
+    _cap_rule,
+    _project_rule,
+    _resolve_path,
+    edge_delays,
+    expand_protocol_conditions,
+)
 from .schema_validation import PackageSchemaCatalog, SchemaValidationError
 from .specification.models import (
     DomainSpec,
@@ -34,8 +42,34 @@ from .specification.models import (
 )
 from .theory_execution import compile_theory_execution
 
-# Protocol budget keys the runtime actually enforces.
-ENFORCED_BUDGETS = frozenset({"max_events"})
+# Keys a canonical artifact used to accept and no longer does. Strict models
+# reject an unknown key with a pydantic error that says only "extra inputs are
+# not permitted" -- true, but useless to a researcher whose package was valid
+# last month. A retired key gets a sentence saying where the thing went instead.
+#
+# These are refused, not dropped: silently ignoring a declared `replications: 3`
+# would quietly change how much of the study runs.
+RETIRED_KEYS: dict[str, dict[str, str]] = {
+    "protocol": {
+        "replications": (
+            "how many draws to take is chosen when the study is run, not when it "
+            "is specified; remove it here and pass replications to the run"
+        ),
+        "budgets": (
+            "an event cap guards against runaway spend rather than describing the "
+            "design; remove it here and pass max_events to the run"
+        ),
+        "checkpoints": (
+            "nothing has ever read this: the runtime takes no checkpoints from a "
+            "protocol declaration, so it promised a durability policy that does "
+            "not exist; remove it"
+        ),
+        "replay_retention": (
+            "nothing has ever read this: replay keeps what the run recorded, and "
+            "no retention policy is applied from here; remove it"
+        ),
+    },
+}
 
 CANONICAL: dict[str, type[StrictModel]] = {
     "study": StudySpec,
@@ -103,6 +137,163 @@ def _resolve_context_policies(domain: DomainSpec) -> list[dict[str, Any]]:
             merged["available_when"] = {**availability_map, **existing}
         policies.append(merged)
     return policies
+
+
+def _validate_availability_rules(domain: DomainSpec) -> list[dict[str, str]]:
+    """Refuse an availability rule the runtime would silently ignore.
+
+    A rule the runtime does not recognise skips every check and leaves the item
+    available always -- which is how gates written as bare predicates went open
+    unnoticed. A key must be a rule key, a predicate key, or an allowed path
+    carrying its own rule; anything else is a typo that reads as a gate.
+    """
+    from .runtime import AVAILABILITY_KEYS, PREDICATE_KEYS
+
+    known = AVAILABILITY_KEYS | PREDICATE_KEYS
+    errors: list[dict[str, str]] = []
+    for policy in domain.visibility:
+        definition = policy if isinstance(policy, dict) else policy.model_dump(mode="json")
+        when = definition.get("available_when") or {}
+        if not isinstance(when, Mapping):
+            continue
+        allowed = {str(path) for path in definition.get("allow") or ()}
+        for key, rule in when.items():
+            where = f"domain.visibility.{definition.get('id')}.available_when.{key}"
+            if key in known:
+                continue
+            if key not in allowed or not isinstance(rule, Mapping):
+                errors.append(
+                    {
+                        "code": "AVAILABILITY_RULE_INERT",
+                        "severity": "error",
+                        "path": where,
+                        "message": (
+                            f"'{key}' is neither an availability key ({', '.join(sorted(known))}) "
+                            "nor a path this policy allows; the runtime would ignore it and "
+                            "leave the item available always"
+                        ),
+                    }
+                )
+                continue
+            stray = sorted(set(rule) - known)
+            if stray:
+                errors.append(
+                    {
+                        "code": "AVAILABILITY_RULE_INERT",
+                        "severity": "error",
+                        "path": where,
+                        "message": (
+                            f"the rule for '{key}' has keys the runtime does not read: "
+                            f"{', '.join(stray)}; they would be ignored and the item left "
+                            "available always"
+                        ),
+                    }
+                )
+    return errors
+
+
+def _validate_context_allow(domain: DomainSpec) -> list[dict[str, str]]:
+    """Refuse a context allow entry that resolves to nothing.
+
+    The context engine reads an entry from one of its namespaces, or else as a
+    state id, and silently skips a path that is not there. So an entry naming an
+    artifact type, an attribute, or the protocol reads as a grant but delivers
+    nothing: the clickbait detector's policy allowed only `article`, and every
+    detector call was sent an empty context while scoring articles it never saw.
+    """
+    from .runtime import CONTEXT_ROOTS
+
+    states = {state.id for state in domain.states}
+    artifacts = {artifact.id for artifact in domain.artifacts}
+    attributes = {attribute.id for attribute in domain.attributes}
+    errors: list[dict[str, str]] = []
+    for policy in domain.visibility:
+        definition = policy if isinstance(policy, dict) else policy.model_dump(mode="json")
+        for entry in definition.get("allow") or ():
+            parts = str(entry).split(".")
+            head = parts[0]
+            if head in CONTEXT_ROOTS and (head != "state" or len(parts) == 1 or parts[1] in states):
+                continue
+            if head in states:
+                continue
+            if head == "state":
+                why = f"'{parts[1]}' is not a declared state"
+                hint = f"declared states: {', '.join(sorted(states)) or 'none'}"
+            elif head in artifacts:
+                why = f"'{head}' is an artifact type, not a state"
+                hint = "artifacts a process consumes reach its model through `inputs`"
+            elif head == "protocol":
+                why = "the protocol is not part of a model's context"
+                hint = (
+                    "the round reaches a prompt through {phase}; `protocol.phase` is read "
+                    "only by availability predicates"
+                )
+            elif head in attributes or head == "attributes":
+                why = f"'{head}' is an attribute, not a state"
+                hint = "actor attributes are not delivered through context; carry them in a state"
+            else:
+                why = f"'{head}' is neither a context namespace nor a declared state"
+                hint = f"namespaces: {', '.join(CONTEXT_ROOTS)}"
+            errors.append(
+                {
+                    "code": "CONTEXT_ALLOW_UNRESOLVED",
+                    "severity": "error",
+                    "path": f"domain.visibility.{definition.get('id')}.allow",
+                    "message": (
+                        f"allow entry '{entry}' resolves to nothing: {why}, so the policy "
+                        f"delivers nothing for it; {hint}"
+                    ),
+                }
+            )
+    return errors
+
+
+def _validate_prompt_context(
+    source: Path, openness: OpennessSpec, domain: DomainSpec
+) -> list[dict[str, str]]:
+    """Refuse a model prompt that never puts its authorised context in front of it.
+
+    The request a model receives is the rendered prompt and nothing else, and
+    context enters it only through `{context}` or `{context.<path>}`. A prompt
+    without either sends none of what the process's context policy allows, so
+    the policy -- and every condition gate on it -- is inert for that model.
+    Every clickbait prompt was a prompt specification saved as a dict repr, and
+    each model answered blind. A process whose policy allows nothing -- the
+    built-in private, public and none allow nothing -- may omit it.
+    """
+    from .information_timing import MODEL_CALL_MODES
+    from .providers import _PLACEHOLDER
+
+    grants = {
+        str(policy.get("id")): bool(policy.get("allow"))
+        for policy in _resolve_context_policies(domain)
+    }
+    errors: list[dict[str, str]] = []
+    for process in openness.processes:
+        if process.executor.mode not in MODEL_CALL_MODES or not process.prompt_ref:
+            continue
+        if not grants.get(str(process.context_policy or "none"), False):
+            continue
+        path = source / "prompts" / f"{process.prompt_ref}.txt"
+        if not path.is_file():
+            continue  # a missing template renders as the whole context
+        placeholders = {match.group(0) for match in _PLACEHOLDER.finditer(path.read_text())}
+        if any(item == "{context}" or item.startswith("{context.") for item in placeholders):
+            continue
+        errors.append(
+            {
+                "code": "PROMPT_OMITS_CONTEXT",
+                "severity": "error",
+                "path": f"prompts/{path.name}",
+                "message": (
+                    f"process '{process.id}' is granted context by '{process.context_policy}', "
+                    f"but its prompt '{process.prompt_ref}' contains neither {{context}} nor "
+                    "{context.<path>}, so the model is sent none of it; a prompt is plain text, "
+                    "and context reaches the model only through those placeholders"
+                ),
+            }
+        )
+    return errors
 
 
 def _validate_context_scope(domain: DomainSpec) -> list[dict[str, str]]:
@@ -222,6 +413,613 @@ def _policy_allows(domain: DomainSpec) -> list[tuple[str, str]]:
     return found
 
 
+def _retry_fallback_outputs(process: Any) -> Any:
+    """The outputs a retry policy substitutes when every attempt fails."""
+    policy = getattr(process, "retry_policy", None)
+    if isinstance(policy, Mapping):
+        return policy.get("fallback_outputs")
+    return getattr(policy, "fallback_outputs", None)
+
+
+def _validate_input_producers(
+    domain: DomainSpec, openness: OpennessSpec, warnings: list[dict[str, Any]] | None = None
+) -> list[dict[str, str]]:
+    """Refuse an input artifact no process produces.
+
+    An artifact exists only because some process outputs it, so an input naming
+    one nothing produces reads empty in every round of every condition. The
+    process still runs, the actor still answers, and the study still reports --
+    on an actor that was never shown the thing the design says it acts on. A
+    creator reading a prior-performance artifact nobody writes publishes forty
+    times with no feedback at all, which is not a finding about the phenomenon.
+    """
+    # ``outputs`` is the ordinary channel, not the only one: the runtime also
+    # produces from a recorded_artifact executor's declared outputs and from a
+    # retry policy's fallback outputs. Counting only the first refused packages
+    # whose producer used another -- and with the check disabled they compiled,
+    # ran and delivered the artifact. This refusal blocks a package outright, so
+    # missing a channel costs far more than accepting one it cannot interpret.
+    produced: set[str] = set()
+    for process in openness.processes:
+        produced.update(
+            str(output.artifact_type) for output in process.outputs or () if output.artifact_type
+        )
+        parameters = getattr(process.executor, "parameters", None) or {}
+        for channel in (parameters.get("outputs"), _retry_fallback_outputs(process)):
+            if isinstance(channel, Mapping | list | tuple):
+                produced.update(str(name) for name in channel)
+    # An input names an artifact *id*; an output declares an artifact *type*, and
+    # the two are often but not always the same string.
+    declared = {
+        str(artifact.id): str(artifact.artifact_type or artifact.id)
+        for artifact in domain.artifacts
+    }
+    errors: list[dict[str, str]] = []
+    warnings = [] if warnings is None else warnings
+    for process in openness.processes:
+        for name in process.inputs or ():
+            artifact = str(name)
+            # A reference to an undeclared artifact is already refused elsewhere;
+            # this is the declared-but-unproduced case.
+            if artifact not in declared:
+                continue
+            if artifact in produced:
+                continue
+            if declared[artifact] in produced:
+                # Tolerated, because a channel this check cannot read might key
+                # its output by the id. But the ordinary path keys inputs by the
+                # artifact's own id, so a consumer naming an id whose only
+                # producer declares the *type* receives nothing: probed, the
+                # matching-id case delivers one input and this case delivers
+                # none. Advisory rather than refused, because the whole point of
+                # the tolerance is that this check cannot see every producer.
+                warnings.append(
+                    {
+                        "code": "INPUT_ARTIFACT_TYPE_ONLY",
+                        "severity": "warning",
+                        "dependency_section": "openness",
+                        "path": f"openness.processes.{process.id}.inputs/{artifact}",
+                        "message": (
+                            f"process '{process.id}' reads artifact '{artifact}', which nothing "
+                            f"produces under that id; only its type "
+                            f"'{declared[artifact]}' is produced. Unless a producer keys its "
+                            "output by the id, this input is empty in every round"
+                        ),
+                    }
+                )
+                continue
+            errors.append(
+                {
+                    "code": "INPUT_ARTIFACT_UNPRODUCED",
+                    "severity": "error",
+                    "dependency_section": "openness",
+                    "path": f"openness.processes.{process.id}.inputs/{artifact}",
+                    "message": (
+                        f"process '{process.id}' reads artifact '{artifact}', which no "
+                        "process produces; it would be empty in every round"
+                    ),
+                }
+            )
+    return errors
+
+
+def _advise_unwritten_states(domain: DomainSpec, openness: OpennessSpec) -> list[dict[str, Any]]:
+    """Flag a declared state nothing writes and initialization does not seed."""
+    written = {
+        str(effect.get("field"))
+        for process in openness.processes
+        for effect in process.state_effects or ()
+        if isinstance(effect, Mapping) and effect.get("field")
+    }
+    seeded = str(getattr(domain.initialization, "state_field", "") or "")
+    advisories: list[dict[str, Any]] = []
+    for state in domain.states:
+        state_id = str(state.id)
+        if state_id in written or state_id == seeded:
+            continue
+        advisories.append(
+            {
+                "code": "STATE_NEVER_WRITTEN",
+                "severity": "warning",
+                "path": f"domain.states.{state_id}",
+                "message": (
+                    f"state '{state_id}' is declared but no process effect writes it and "
+                    "initialization does not seed it; anything reading it, including a "
+                    "theory feedback sourced from it, gets its initial value forever"
+                ),
+            }
+        )
+    return advisories
+
+
+TRIGGER_KEYS = frozenset({"phase", "repeat", "type", "predicate", "event"})
+# The scheduler resolves ordering from these two and nothing else.
+DEPENDENCY_KEYS = frozenset({"after", "delay"})
+
+
+def _validate_dependencies(openness: OpennessSpec) -> list[dict[str, str]]:
+    """Refuse a dependency key the scheduler never reads.
+
+    Ordering within a round comes from ``dependencies.after``. A block written
+    ``{requires: [...], same_round_results_visible: true}`` states the round's
+    chain clearly to a reader and says nothing to the scheduler, which then runs
+    the processes in whatever order it likes -- distribution before publication,
+    settlement before anyone has read anything. The study completes, every
+    declared step having run, and measures nothing.
+    """
+    errors: list[dict[str, str]] = []
+    for process in openness.processes:
+        block = process.dependencies if isinstance(process.dependencies, dict) else {}
+        unknown = sorted(set(block) - DEPENDENCY_KEYS)
+        if not unknown:
+            continue
+        hint = (
+            " (ordering is declared with 'after')"
+            if any(key in {"requires", "depends_on", "needs"} for key in unknown)
+            else ""
+        )
+        errors.append(
+            {
+                "code": "DEPENDENCY_KEY_UNKNOWN",
+                "severity": "error",
+                "path": f"openness.processes.{process.id}.dependencies",
+                "message": (
+                    f"dependencies declares {', '.join(unknown)}, which the scheduler never "
+                    f"reads; it reads only {', '.join(sorted(DEPENDENCY_KEYS))}{hint}"
+                ),
+            }
+        )
+    return errors
+
+
+def _validate_triggers(openness: OpennessSpec) -> list[dict[str, str]]:
+    """Refuse a trigger the scheduler cannot read.
+
+    The scheduler reads exactly five keys, and it compares ``phase`` against the
+    current round as a number. A trigger written ``{phase: round, rounds: 1-40}``
+    reads perfectly well to a person and puts the string "round" where an integer
+    belongs: the run dies on its first scheduling pass with a TypeError that
+    names neither the process nor the declaration. Any other key -- ``rounds``
+    most of all -- is simply never consulted, so a schedule written that way is
+    silently the default one.
+    """
+    errors: list[dict[str, str]] = []
+    for process in openness.processes:
+        trigger = process.trigger if isinstance(process.trigger, dict) else {}
+        if not trigger:
+            continue
+        where = f"openness.processes.{process.id}.trigger"
+        phase = trigger.get("phase")
+        if phase is not None and not isinstance(phase, int) or isinstance(phase, bool):
+            errors.append(
+                {
+                    "code": "TRIGGER_PHASE_INVALID",
+                    "severity": "error",
+                    "path": where,
+                    "message": (
+                        f"trigger phase is {phase!r}; it must be the integer round the "
+                        "process first runs in. To run in particular rounds, use "
+                        "{type: condition, predicate: {path: protocol.phase, op: in, "
+                        "value: [...]}}"
+                    ),
+                }
+            )
+        unknown = sorted(set(trigger) - TRIGGER_KEYS)
+        if unknown:
+            errors.append(
+                {
+                    "code": "TRIGGER_KEY_UNKNOWN",
+                    "severity": "error",
+                    "path": where,
+                    "message": (
+                        f"trigger declares {', '.join(unknown)}, which the scheduler never "
+                        f"reads; it reads only {', '.join(sorted(TRIGGER_KEYS))}"
+                    ),
+                }
+            )
+    return errors
+
+
+def _validate_run_length(protocol: Any, warnings: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Refuse a declared run length or termination the engine would not honour.
+
+    The runtime takes the run length from ``time_model.end`` only when it is a
+    whole number, and never reads ``termination``: ``end: 12.0`` compiled clean
+    and the run went on to the default 100 rounds, a model call in every one.
+    """
+    errors: list[dict[str, str]] = []
+    time_model = protocol.time_model
+    if time_model is None or time_model.type != "rounds":
+        return errors
+
+    def whole(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    for name in ("start", "end"):
+        value = getattr(time_model, name)
+        if value is not None and not whole(value):
+            errors.append(
+                {
+                    "code": "TIME_MODEL_INVALID",
+                    "severity": "error",
+                    "path": f"protocol.time_model.{name}",
+                    "message": (
+                        f"time_model.{name} is {value!r}; a rounds time model counts whole "
+                        "rounds, and any other value is ignored at run time"
+                    ),
+                }
+            )
+    if time_model.end is None:
+        warnings.append(
+            {
+                "code": "TIME_MODEL_END_DEFAULT",
+                "severity": "warning",
+                "path": "protocol.time_model.end",
+                "message": "no time_model.end is declared, so a run stops after 100 rounds",
+            }
+        )
+    for index, rule in enumerate(protocol.termination):
+        where = f"protocol.termination.{index}"
+        supported = (
+            isinstance(rule, dict)
+            and rule.get("type") == "end_time"
+            and set(rule) <= {"type", "at", "early_stopping"}
+            and not rule.get("early_stopping")
+        )
+        if not supported:
+            errors.append(
+                {
+                    "code": "TERMINATION_UNSUPPORTED",
+                    "severity": "error",
+                    "path": where,
+                    "message": (
+                        f"termination {rule!r} is not read by the engine; a run ends at "
+                        "time_model.end, and the only termination it honours is "
+                        "{type: end_time, at: <time_model.end>}"
+                    ),
+                }
+            )
+        elif rule.get("at") != time_model.end:
+            errors.append(
+                {
+                    "code": "TERMINATION_UNSUPPORTED",
+                    "severity": "error",
+                    "path": where,
+                    "message": (
+                        f"termination ends at {rule.get('at')!r} but time_model.end is "
+                        f"{time_model.end!r}; the run ends at time_model.end"
+                    ),
+                }
+            )
+    return errors
+
+
+def _validate_retention(openness: OpennessSpec) -> list[dict[str, str]]:
+    """Refuse a retention value the engine does not read as keep or purge.
+
+    Retention was matched as a substring, so "never-purge-this" purged every raw
+    provider body of its process; an unknown value now fails at compile.
+    """
+    from .persistence import RETENTION_KEEP, RETENTION_PURGE
+
+    errors: list[dict[str, str]] = []
+    for process in openness.processes:
+        retention = process.trace_policy.retention
+        if retention is None or retention in RETENTION_KEEP | RETENTION_PURGE:
+            continue
+        errors.append(
+            {
+                "code": "RETENTION_UNKNOWN",
+                "severity": "error",
+                "path": f"openness.processes.{process.id}.trace_policy.retention",
+                "message": (
+                    f"retention '{retention}' is not a value the engine reads; use one of "
+                    f"{', '.join(sorted(RETENTION_PURGE))} to purge raw provider responses, "
+                    f"or {', '.join(sorted(RETENTION_KEEP))} to keep them"
+                ),
+            }
+        )
+    return errors
+
+
+def _phase_lists(predicate: Any) -> list[list[Any]]:
+    """The value lists of every `protocol.phase in [...]` inside a predicate."""
+    if isinstance(predicate, Mapping):
+        found = []
+        if predicate.get("path") == "protocol.phase" and predicate.get("op") == "in":
+            value = predicate.get("value")
+            if isinstance(value, list):
+                found.append(value)
+        for key in ("all", "any"):
+            for item in predicate.get(key) or ():
+                found.extend(_phase_lists(item))
+        found.extend(_phase_lists(predicate.get("not")))
+        return found
+    return []
+
+
+def _advise_rounds_without_repeat(openness: OpennessSpec) -> list[dict[str, Any]]:
+    """Warn when a trigger lists several rounds but is not declared to repeat.
+
+    A condition trigger without `repeat: true` fires once, the first time its
+    predicate holds, so every later round in the list is ignored. The clickbait
+    reflection named rounds 3, 6, ..., 39 and ran in round 3 only; creators were
+    handed that one reflection at every later stage.
+    """
+    warnings: list[dict[str, Any]] = []
+    for process in openness.processes:
+        trigger = process.trigger if isinstance(process.trigger, dict) else {}
+        if trigger.get("type") != "condition" or trigger.get("repeat"):
+            continue
+        rounds = [value for value in _phase_lists(trigger.get("predicate")) if len(value) > 1]
+        if rounds:
+            warnings.append(
+                {
+                    "code": "TRIGGER_ROUNDS_WITHOUT_REPEAT",
+                    "severity": "warning",
+                    "path": f"openness.processes.{process.id}.trigger",
+                    "message": (
+                        f"the trigger lists rounds {rounds[0]} but does not declare "
+                        "repeat: true, so it fires once, in the first of them; add "
+                        "repeat: true to run in each"
+                    ),
+                }
+            )
+    return warnings
+
+
+def _validate_engine_fields(openness: OpennessSpec, source: Path) -> list[dict[str, str]]:
+    """Refuse an actor or phase field the engine could not write as declared."""
+    catalog = _schema_catalog(source)
+    kinds = {
+        "actor_fields": ("an actor id", {"string"}),
+        "phase_fields": ("a round", {"integer", "number"}),
+    }
+    errors: list[dict[str, str]] = []
+    for process in openness.processes:
+        for output in process.outputs:
+            schema = catalog.get(output.schema_ref)
+            properties = schema.get("properties") if isinstance(schema, dict) else None
+            closed = isinstance(schema, dict) and schema.get("additionalProperties") is False
+            for kind, (what, types) in kinds.items():
+                names = getattr(output, kind) or []
+                if not names:
+                    continue
+                where = f"openness.processes.{process.id}.outputs.{output.artifact_type}.{kind}"
+                problems = []
+                if kind == "actor_fields" and process.actors is None:
+                    problems.append(
+                        f"process '{process.id}' declares actor fields but no actors, "
+                        "so there is no actor id to write"
+                    )
+                fields: dict[str, Any] = properties if isinstance(properties, dict) else {}
+                # A closed schema with no properties block admits no field at all,
+                # so it is checked too; skipping it let the run fail mid-way.
+                for name in names if (fields or closed) else ():
+                    declared = fields.get(name)
+                    declared_type = declared.get("type") if isinstance(declared, dict) else None
+                    # A type may be a list (["string", "null"]); the field can hold
+                    # the engine's value when any listed type does.
+                    if isinstance(declared_type, list):
+                        admitted = bool({str(item) for item in declared_type} & types)
+                    else:
+                        admitted = declared_type is None or declared_type in types
+                    if declared is None and closed:
+                        problems.append(f"schema '{output.schema_ref}' has no field '{name}'")
+                    elif not admitted:
+                        problems.append(
+                            f"'{name}' is typed {declared_type!r} in schema "
+                            f"'{output.schema_ref}', but {what} is {' or '.join(sorted(types))}"
+                        )
+                errors.extend(
+                    {
+                        "code": "OUTPUT_ENGINE_FIELD_INVALID",
+                        "severity": "error",
+                        "path": where,
+                        "message": problem,
+                    }
+                    for problem in problems
+                )
+    return errors
+
+
+# The envelope _load_empirical_data wraps an imported asset in.
+EMPIRICAL_ENVELOPE = frozenset({"origin", "data_source", "rows"})
+
+
+def _validate_actor_sources(
+    domain: DomainSpec, openness: OpennessSpec, warnings: list[dict[str, Any]] | None = None
+) -> list[dict[str, str]]:
+    """Refuse an actor selector whose source names no declared state.
+
+    ``expand_actor_instances`` resolves ``actors.source`` as a dotted path into
+    run state, so a source naming nothing raises once the run has started and
+    the build has been paid for. The usual mistake is naming the collection
+    rather than the state that holds it -- ``creators`` where the state is
+    ``population`` and the path is ``population.creators``.
+    """
+    warnings = [] if warnings is None else warnings
+    states = {str(state.id) for state in domain.states}
+    # A state's declared initial names the keys it starts with. A process may
+    # add one before the draw, so this cannot refuse -- but naming a collection
+    # that is not there is the mistake this check exists for, and saying so at
+    # compile time beats aborting before round one.
+    declared_keys = {
+        str(state.id): set(state.initial)
+        for state in domain.states
+        if isinstance(state.initial, Mapping) and state.initial
+    }
+    seeded = str(getattr(domain.initialization, "state_field", "") or "")
+    if seeded:
+        states.add(seeded)
+    errors: list[dict[str, str]] = []
+    for process in openness.processes:
+        actors = process.actors
+        source = getattr(actors, "source", None) if actors is not None else None
+        if not isinstance(source, str) or not source:
+            continue
+        root, _, rest = source.partition(".")
+        if root in states:
+            # An empirically seeded state holds a fixed envelope -- origin,
+            # data_source, rows -- so a deeper path into it is decidable even
+            # though a deeper path into ordinary state is not. Naming the
+            # collection directly ('population.creators') resolves to nothing
+            # and aborts the run before its first round.
+            first = rest.split(".", 1)[0] if rest else ""
+            if rest and root != seeded and first and first not in declared_keys.get(root, {first}):
+                warnings.append(
+                    {
+                        "code": "ACTOR_SOURCE_UNDECLARED_KEY",
+                        "severity": "warning",
+                        "dependency_section": "domain",
+                        "path": f"openness.processes.{process.id}.actors.source",
+                        "message": (
+                            f"actor source '{source}' reads '{first}' from state '{root}', "
+                            f"whose declared initial holds "
+                            f"{', '.join(sorted(declared_keys[root]))}; unless a process writes "
+                            "it first, the run aborts before its first round"
+                        ),
+                    }
+                )
+            if rest and root == seeded and rest.split(".", 1)[0] not in EMPIRICAL_ENVELOPE:
+                errors.append(
+                    {
+                        "code": "ACTOR_SOURCE_UNKNOWN",
+                        "severity": "error",
+                        "dependency_section": "domain",
+                        "path": f"openness.processes.{process.id}.actors.source",
+                        "message": (
+                            f"actor source '{source}' reads '{rest}' from the empirically "
+                            f"seeded state '{root}', which holds only "
+                            f"{', '.join(sorted(EMPIRICAL_ENVELOPE))}; the records are under "
+                            f"'{root}.rows'"
+                        ),
+                    }
+                )
+            continue
+        known = ", ".join(sorted(states)) or "none"
+        errors.append(
+            {
+                "code": "ACTOR_SOURCE_UNKNOWN",
+                "severity": "error",
+                "dependency_section": "domain",
+                "path": f"openness.processes.{process.id}.actors.source",
+                "message": (
+                    f"actor source '{source}' starts from '{root}', which is not a declared "
+                    f"state (declared: {known}); name the state that holds the records, "
+                    "as a dotted path if they are nested"
+                ),
+            }
+        )
+    return errors
+
+
+def _advise_inert_deterministic_processes(openness: OpennessSpec) -> list[dict[str, Any]]:
+    """Flag a deterministic process that declares work its executor cannot do.
+
+    The mode's executor returns ``{}``. A package may still intend to supply the
+    callable as a run-time override, so this is advice rather than a refusal --
+    but without one, every declared output goes unproduced and every declared
+    effect writes from nothing, silently.
+    """
+    advisories: list[dict[str, Any]] = []
+    for process in openness.processes:
+        if process.executor.mode != "deterministic":
+            continue
+        declared = []
+        if process.outputs:
+            declared.append(f"{len(process.outputs)} output(s)")
+        if process.state_effects:
+            declared.append(f"{len(process.state_effects)} state effect(s)")
+        if not declared:
+            continue
+        advisories.append(
+            {
+                "code": "EXECUTOR_INERT",
+                "severity": "warning",
+                "path": f"openness.processes.{process.id}.executor",
+                "message": (
+                    f"process '{process.id}' declares {' and '.join(declared)} but its "
+                    "deterministic executor produces nothing; bind mode 'computational' "
+                    "with an entry_point, or supply a run-time executor override"
+                ),
+            }
+        )
+    return advisories
+
+
+def _advise_dead_context_policies(
+    domain: DomainSpec, openness: OpennessSpec
+) -> list[dict[str, Any]]:
+    """Flag a declared context policy no process binds.
+
+    A policy is only ever reached through a process's ``context_policy``, so an
+    unbound one grants nothing to anybody. On its own that is merely dead, but
+    it is the visible half of a real failure: the process the policy was written
+    for is bound to some *other* policy, and is therefore seeing something the
+    author never intended it to see. A detector written a title-and-body policy
+    and left bound to the broad platform policy still compiles, still validates,
+    and quietly reads the outcomes it is supposed to be measuring.
+    """
+    bound = {str(process.context_policy) for process in openness.processes}
+    advisories: list[dict[str, Any]] = []
+    for policy in domain.visibility:
+        policy_id = str(getattr(policy, "id", ""))
+        if not policy_id or policy_id in bound:
+            continue
+        advisories.append(
+            {
+                "code": "CONTEXT_POLICY_UNBOUND",
+                "severity": "warning",
+                "path": f"domain.visibility.{policy_id}",
+                "message": (
+                    f"context policy '{policy_id}' is bound by no process, so it grants "
+                    "nothing; check whether a process meant to use it is bound to a "
+                    "different policy, or remove it"
+                ),
+            }
+        )
+    return advisories
+
+
+def _advise_unfed_feedback_slots(domain: DomainSpec, theory: TheorySpec) -> list[dict[str, Any]]:
+    """Flag a ``feedback.<slot>`` allowance the theory never fills.
+
+    The opposite direction is already an error: a declared feedback binding whose
+    consumer policy does not allow its slot would inject into a view nobody can
+    read. This direction is the leftover -- a slot allowed, and scoped, and
+    capped, that no binding writes to, so it reads as a live channel and is not.
+    """
+    declared = {
+        str(binding.execution.context_slot)
+        for binding in theory.feedback
+        if binding.execution is not None and binding.execution.context_slot
+    }
+    advisories: list[dict[str, Any]] = []
+    for policy in domain.visibility:
+        policy_id = str(getattr(policy, "id", ""))
+        for path in policy.allow or ():
+            name = str(path)
+            if not name.startswith("feedback.") or name == "feedback":
+                continue
+            slot = name.split(".", 1)[1]
+            if slot in declared:
+                continue
+            advisories.append(
+                {
+                    "code": "FEEDBACK_SLOT_UNFED",
+                    "severity": "warning",
+                    "path": f"domain.visibility.{policy_id}.allow/{name}",
+                    "message": (
+                        f"policy '{policy_id}' allows feedback slot '{slot}', but no theory "
+                        "feedback declares that context_slot, so nothing is ever injected "
+                        "there"
+                    ),
+                }
+            )
+    return advisories
+
+
 def _validate_condition_factors(loaded: dict[str, Any]) -> list[dict[str, str]]:
     """Refuse a ``condition.<factor>`` path naming no declared factor.
 
@@ -231,18 +1029,40 @@ def _validate_condition_factors(loaded: dict[str, Any]) -> list[dict[str, str]]:
     result reads as "no effect" rather than as a broken package.
     """
     protocol = loaded["protocol"]
-    declared = {str(factor.id) for factor in protocol.factors}
-    for condition in protocol.conditions:
-        if isinstance(condition, Mapping):
-            declared.update(str(key) for key in (condition.get("factors") or {}))
+    # Derived from the same expansion the scheduler is given, never from a
+    # belief about its shape. The first version of this check assumed a factor
+    # sat at the top of the condition; it sits under ``factors`` whenever the
+    # protocol declares factors or nests them, so the check refused the spelling
+    # that fires and accepted the one that never does -- and a study whose
+    # treatment never arrived still ran, still reported, and read as a null
+    # result. Deriving both sides from one function is what stops that
+    # recurring.
+    resolvable: set[str] = set()
+    try:
+        expanded = expand_protocol_conditions(protocol.model_dump(mode="json"))
+    except ValueError:
+        # The protocol declares both factors and explicit conditions.
+        # PROTOCOL_CONDITIONS_AMBIGUOUS reports that; guessing which spelling
+        # such a package would resolve is not this check's business.
+        return []
+    for condition in expanded:
+        for key, value in condition.items():
+            if key == "factors" and isinstance(value, Mapping):
+                resolvable.update(f"condition.factors.{name}" for name in value)
+            else:
+                resolvable.add(f"condition.{key}")
     errors: list[dict[str, str]] = []
 
     def _check(predicate: Any, where: str) -> None:
         for path in _predicate_paths(predicate):
-            parts = str(path).split(".")
-            if parts[0] != "condition" or len(parts) < 2 or parts[1] in declared:
+            text = str(path)
+            if not text.startswith("condition."):
                 continue
-            known = ", ".join(sorted(declared)) or "none"
+            # A deeper read into a resolvable value is fine; what cannot be
+            # resolved at all is the gate that never opens.
+            if any(text == known or text.startswith(f"{known}.") for known in resolvable):
+                continue
+            known_paths = ", ".join(sorted(resolvable)) or "none"
             errors.append(
                 {
                     "code": "CONDITION_FACTOR_UNKNOWN",
@@ -250,9 +1070,9 @@ def _validate_condition_factors(loaded: dict[str, Any]) -> list[dict[str, str]]:
                     "dependency_section": "protocol",
                     "path": where,
                     "message": (
-                        f"reads '{path}', but the protocol declares no factor "
-                        f"'{parts[1]}' (declared: {known}); the predicate would be "
-                        "false in every condition"
+                        f"reads '{text}', which resolves in no condition this "
+                        f"protocol declares, so the gate it guards never opens; "
+                        f"readable here: {known_paths}"
                     ),
                 }
             )
@@ -263,6 +1083,16 @@ def _validate_condition_factors(loaded: dict[str, Any]) -> list[dict[str, str]]:
             _check(trigger.get("predicate"), f"openness.processes.{process.id}.trigger")
         for index, use in enumerate(process.measurement_use):
             _check(use.when, f"openness.processes.{process.id}.measurement_use.{index}.when")
+        # A rule executor evaluates its own `when` predicates, which read the
+        # condition the same way a trigger does; unchecked, a dead gate inside
+        # a rule fails exactly as silently as one on the process itself.
+        parameters = getattr(process.executor, "parameters", None) or {}
+        for index, rule in enumerate(parameters.get("rules") or ()):
+            if isinstance(rule, Mapping):
+                _check(
+                    rule.get("when"),
+                    f"openness.processes.{process.id}.executor.parameters.rules.{index}.when",
+                )
     domain = loaded["domain"]
     for policy in domain.visibility:
         for path, rule in (policy.available_when or {}).items():
@@ -522,8 +1352,23 @@ class StudyCompiler:
                 errors.append(f"MISSING_ARTIFACT: {path.name}")
                 continue
             try:
-                loaded[name] = model.model_validate(yaml.safe_load(path.read_text()) or {})
-            except (ValidationError, yaml.YAMLError) as exc:
+                document = yaml.safe_load(path.read_text()) or {}
+            except yaml.YAMLError as exc:
+                errors.append(f"SCHEMA_INVALID:{name}: {exc}")
+                continue
+            retired = RETIRED_KEYS.get(name, {})
+            if isinstance(document, Mapping) and retired:
+                found = sorted(set(document) & set(retired))
+                for key in found:
+                    errors.append(f"SPEC_KEY_RETIRED:{name}.{key}: {retired[key]}")
+                if found:
+                    # Validate without them, so the retirement is the only thing
+                    # reported rather than being buried under "extra inputs are
+                    # not permitted" for the same key.
+                    document = {k: v for k, v in document.items() if k not in found}
+            try:
+                loaded[name] = model.model_validate(document)
+            except ValidationError as exc:
                 errors.append(f"SCHEMA_INVALID:{name}: {exc}")
         if errors:
             raise ValueError("\n".join(errors))
@@ -742,6 +1587,29 @@ class StudyCompiler:
                     # only on the edge that actually carries it.
                     if not resolved_delays.get(str(dep)):
                         graph[process.id].add(dep)
+            if process.executor.mode == "deterministic":
+                # A deterministic executor is a no-op that returns {}; the engine
+                # never resolves a callable for it. Declaring one reads as an
+                # implementation and is decoration, so the process runs, produces
+                # nothing, and the study reports on a mechanism that never fired.
+                ignored = sorted(
+                    key
+                    for key in ("function", "entry_point")
+                    if process.executor.parameters.get(key)
+                )
+                if ignored:
+                    errors.append(
+                        {
+                            "code": "EXECUTOR_FUNCTION_IGNORED",
+                            "path": f"openness.processes.{process.id}.executor.parameters",
+                            "message": (
+                                f"deterministic executor declares {', '.join(ignored)}, which "
+                                "this mode ignores; use mode 'computational' with "
+                                "parameters.entry_point in module:attribute form, or supply "
+                                "the callable as a run-time executor override"
+                            ),
+                        }
+                    )
             if process.executor.mode in {"stochastic", "computational"}:
                 required_key = (
                     "function" if process.executor.mode == "stochastic" else "entry_point"
@@ -783,7 +1651,21 @@ class StudyCompiler:
                 )
             else:
                 asset = self.source / data_source
-                if not asset.is_file():
+                if not asset.resolve().is_relative_to(self.source.resolve()):
+                    # Compiled clean before, yet the build embeds only data the
+                    # package contains, so the run could never load it.
+                    errors.append(
+                        {
+                            "code": "DATA_SOURCE_INVALID",
+                            "path": "domain.initialization.data_source",
+                            "message": (
+                                f"data_source '{data_source}' is outside the package; the "
+                                "build carries only data inside it, so put the asset under "
+                                "data/"
+                            ),
+                        }
+                    )
+                elif not asset.is_file():
                     errors.append(
                         {
                             "code": "DATA_SOURCE_MISSING",
@@ -1011,24 +1893,6 @@ class StudyCompiler:
                             ),
                         }
                     )
-        # ``budgets`` sits next to enforced limits, so an unrecognised key
-        # reads as a constraint the runtime will apply. It will not: only the
-        # keys below are enforced, and the rest are inert annotations.
-        protocol_budgets = getattr(loaded["protocol"], "budgets", {}) or {}
-        if isinstance(protocol_budgets, dict):
-            for key in sorted(protocol_budgets):
-                if str(key) not in ENFORCED_BUDGETS:
-                    warnings.append(
-                        {
-                            "code": "BUDGET_NOT_ENFORCED",
-                            "severity": "warning",
-                            "path": f"protocol.budgets/{key}",
-                            "message": (
-                                f"budget '{key}' is recorded but not enforced by the runtime; "
-                                f"enforced budgets are {sorted(ENFORCED_BUDGETS)}"
-                            ),
-                        }
-                    )
         for process in openness.processes:
             if process.executor.mode == "generative" and process.id not in mapped_processes:
                 warnings.append(
@@ -1043,6 +1907,7 @@ class StudyCompiler:
                     }
                 )
         errors.extend(_validate_context_scope(domain))
+        errors.extend(_validate_availability_rules(domain))
         errors.extend(_validate_context_exchanges(domain, openness))
         # A trigger reads state fields bare, beside "condition" and "protocol".
         # A path written "state.<field>" resolves to nothing there, so the
@@ -1065,6 +1930,18 @@ class StudyCompiler:
                         }
                     )
         errors.extend(_validate_condition_factors(loaded))
+        errors.extend(_validate_input_producers(domain, openness, warnings))
+        errors.extend(_validate_actor_sources(domain, openness, warnings))
+        errors.extend(_validate_triggers(openness))
+        errors.extend(_validate_retention(openness))
+        errors.extend(_validate_run_length(loaded["protocol"], warnings))
+        errors.extend(_validate_engine_fields(openness, self.source))
+        warnings.extend(_advise_rounds_without_repeat(openness))
+        errors.extend(_validate_dependencies(openness))
+        warnings.extend(_advise_inert_deterministic_processes(openness))
+        warnings.extend(_advise_unwritten_states(domain, openness))
+        warnings.extend(_advise_dead_context_policies(domain, openness))
+        warnings.extend(_advise_unfed_feedback_slots(domain, loaded["theory"]))
         warnings.extend(_advise_unbounded_exchanges(domain))
         warnings.extend(_advise_unbounded_context(domain))
         warnings.extend(_advise_empirical_envelope(domain, openness))
@@ -1095,6 +1972,8 @@ class StudyCompiler:
                         "message": str(exc),
                     }
                 )
+        errors.extend(_validate_prompt_context(self.source, openness, domain))
+        errors.extend(_validate_context_allow(domain))
         # Feedback bindings are merged into processes after validation, so the
         # state a slot carries is passed in rather than read from the process.
         feedback_reads: dict[str, set[str]] = {}
@@ -1272,9 +2151,13 @@ class StudyCompiler:
             json.dumps(
                 {
                     **canonical,
+                    # Filtered as the build's templates and closure are: hashing a
+                    # prompt file the build excludes made build identity depend on
+                    # content the build does not carry.
                     "prompts": {
                         path.stem: path.read_text()
                         for path in sorted((self.source / "prompts").glob("*.txt"))
+                        if _exclusion_reason(Path("prompts") / path.name) is None
                     },
                     "schemas": _schema_catalog(self.source),
                     "data_manifest": _data_manifest(self.source),
@@ -1287,7 +2170,6 @@ class StudyCompiler:
         target = Path(output)
         if target.exists():
             raise ValueError("BUILD_EXISTS: refusing unsafe overwrite")
-        temp = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
         # Each entry reports the delay of THAT edge, not the process's delay
         # block copied onto every edge, so the inspectable graph matches what
         # the scheduler enforces.
@@ -1381,6 +2263,41 @@ class StudyCompiler:
                 }
                 for dep in after
             ]
+        # The declared edges were checked for immediate cycles, and the theory
+        # edges separately, but never the two merged: a declared a->b and a
+        # zero-lag theory b->a compiled, and the scheduler refused the build only
+        # when a run was created from it.
+        pending = {
+            pid: {
+                edge["dependency"]
+                for edge in edges
+                if not edge["delayed"] and edge["dependency"] in process_graph
+            }
+            for pid, edges in process_graph.items()
+        }
+        while pending:
+            ready = {pid for pid, deps in pending.items() if not deps}
+            if not ready:
+                cycle = sorted(pending)
+                raise ValidationIssue(
+                    [
+                        ValidationRecord(
+                            "GRAPH_IMMEDIATE_CYCLE",
+                            "error",
+                            "openness.yaml",
+                            "openness.processes",
+                            tuple(cycle),
+                            "declared dependencies and zero-lag theory edges together form "
+                            "an immediate cycle; these processes are in it or wait on it: "
+                            f"{', '.join(cycle)}",
+                            "Give one edge in the cycle a lag, or remove it.",
+                        )
+                    ]
+                )
+            for pid in ready:
+                pending.pop(pid)
+            for deps in pending.values():
+                deps.difference_update(ready)
         files = {
             "processes.json": compiled_processes,
             "model_profiles.json": [
@@ -1445,53 +2362,96 @@ class StudyCompiler:
             ]
         files["package_closure.json"] = package_closure.manifest
         files["build_manifest.json"] = manifest
-        integrity = {}
-        # Only data the closure admits is embedded, so a file excluded from the
-        # closure (an .env, an unsupported type) never reaches the build either.
-        for asset in package_closure.manifest["assets"]:
-            asset_path = Path(asset["path"])
-            if not asset_path.parts or asset_path.parts[0] != "data":
-                continue
-            destination = temp / asset_path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes((self.source / asset_path).read_bytes())
-            destination.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-        # Preserve original package asset bytes inside the build's closure dir.
-        closure_root = self.source
-        for asset in package_closure.manifest["assets"]:
-            source_asset = closure_root / Path(asset["path"])
-            destination = temp / "closure" / Path(asset["path"])
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(source_asset.read_bytes())
-            destination.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-        for filename, value in files.items():
-            path = temp / filename
-            path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
-            path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-            integrity[filename] = hashlib.sha256(path.read_bytes()).hexdigest()
-        integrity["manifest_hash"] = integrity["build_manifest.json"]
-        embedded_data = temp / "data"
-        if embedded_data.is_dir():
-            for asset in sorted(embedded_data.rglob("*")):
-                if asset.is_file():
-                    integrity[f"data/{asset.relative_to(embedded_data).as_posix()}"] = (
-                        hashlib.sha256(asset.read_bytes()).hexdigest()
-                    )
-        integrity_path = temp / "integrity_manifest.json"
-        integrity_path.write_text(json.dumps(integrity, sort_keys=True, indent=2) + "\n")
-        integrity_path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        # The temporary build exists only while it is written, and is removed on
+        # any failure. Removing its children one level deep raised on the nested
+        # closure and data directories, replacing the original error and leaking
+        # the directory; a validation error raised after it was made leaked it too.
+        temp = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
         try:
+            integrity = {}
+            # Only data the closure admits is embedded, so a file excluded from the
+            # closure (an .env, an unsupported type) never reaches the build either.
+            for asset in package_closure.manifest["assets"]:
+                asset_path = Path(asset["path"])
+                if not asset_path.parts or asset_path.parts[0] != "data":
+                    continue
+                destination = temp / asset_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((self.source / asset_path).read_bytes())
+                destination.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+            # Preserve original package asset bytes inside the build's closure dir.
+            closure_root = self.source
+            for asset in package_closure.manifest["assets"]:
+                source_asset = closure_root / Path(asset["path"])
+                destination = temp / "closure" / Path(asset["path"])
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(source_asset.read_bytes())
+                destination.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+            for filename, value in files.items():
+                path = temp / filename
+                path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+                path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+                integrity[filename] = hashlib.sha256(path.read_bytes()).hexdigest()
+            integrity["manifest_hash"] = integrity["build_manifest.json"]
+            embedded_data = temp / "data"
+            if embedded_data.is_dir():
+                for asset in sorted(embedded_data.rglob("*")):
+                    if asset.is_file():
+                        integrity[f"data/{asset.relative_to(embedded_data).as_posix()}"] = (
+                            hashlib.sha256(asset.read_bytes()).hexdigest()
+                        )
+            integrity_path = temp / "integrity_manifest.json"
+            integrity_path.write_text(json.dumps(integrity, sort_keys=True, indent=2) + "\n")
+            integrity_path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
             os.replace(temp, target)
-        except Exception:
-            for child in temp.iterdir():
-                if child.is_dir():
-                    for nested in child.rglob("*"):
-                        if nested.is_file():
-                            nested.unlink()
-                child.unlink()
-            temp.rmdir()
+        except BaseException:
+            shutil.rmtree(temp, ignore_errors=True)
             raise
         return StudyBuild(loaded["study"].study_id, build_hash, target, manifest)
+
+    @staticmethod
+    def _verify_closure(root: Path, authenticated: bool) -> None:
+        """Authenticate the copied package bytes under ``closure/``.
+
+        The integrity manifest covered only the build's own files, so a tampered
+        ``closure/study.yaml`` verified clean and was exported as the study that
+        ran. ``package_closure.json`` is itself in the manifest and records each
+        asset's digest, so every closure member is checked against it, and a
+        member it does not list is refused.
+        """
+        closure_dir = root / "closure"
+        present = (
+            {
+                path.relative_to(closure_dir).as_posix()
+                for path in closure_dir.rglob("*")
+                if path.is_file() or path.is_symlink()
+            }
+            if closure_dir.is_dir()
+            else set()
+        )
+        if not authenticated:
+            if present:
+                raise ValueError("BUILD_INTEGRITY: closure present without package_closure.json")
+            return
+        closure = json.loads((root / "package_closure.json").read_text())
+        listed: dict[str, str] = {
+            str(asset["path"]): str(asset["digest"]) for asset in closure.get("assets", [])
+        }
+        if not present:
+            return  # a build compiled without copying its closure carries none
+        unexpected = sorted(present - set(listed))
+        if unexpected:
+            raise ValueError(f"BUILD_INTEGRITY: unexpected closure member {unexpected[0]}")
+        for relative, digest in listed.items():
+            member = closure_dir / relative
+            if member.is_symlink() or not member.is_file():
+                raise ValueError(f"BUILD_INTEGRITY: closure/{relative} missing")
+            hasher = hashlib.sha256()
+            with member.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    hasher.update(chunk)
+            if hasher.hexdigest() != digest:
+                raise ValueError(f"BUILD_INTEGRITY: closure/{relative}")
 
     @staticmethod
     def verify_build(path: str | Path) -> bool:
@@ -1538,6 +2498,7 @@ class StudyCompiler:
                     raise ValueError(f"BUILD_INTEGRITY: {name}")
             if expected["manifest_hash"] != expected["build_manifest.json"]:
                 raise ValueError("BUILD_INTEGRITY: manifest authentication failed")
+            StudyCompiler._verify_closure(root, "package_closure.json" in expected)
             return True
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("BUILD_INTEGRITY: malformed or incomplete build") from exc

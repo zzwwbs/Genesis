@@ -161,6 +161,38 @@ class WorkflowDefinition(BaseModel):
         return tuple(result)
 
 
+def sanitised_candidate(
+    current: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Keep each patched section's fields its canonical model declares.
+
+    The filter once kept only keys the *current* document already had, so a
+    patch adding a legitimate field was silently undone -- a fresh study has no
+    ``extensions``, and the default workflow's two required foundation decisions
+    are written under ``/study/extensions``: approved as covered, stored nowhere.
+    """
+    from genesis.compiler import CANONICAL
+
+    result = dict(candidate)
+    for section, original in current.items():
+        if section == "schemas" or not isinstance(original, dict):
+            continue
+        if not isinstance(candidate.get(section), dict):
+            continue
+        model = CANONICAL.get(section)
+        known = set(original) | {"schema_version", "study_id"}
+        if model is not None:
+            known |= set(model.model_fields)
+        sanitised = {key: value for key, value in candidate[section].items() if key in known}
+        if "schema_version" in original and "schema_version" not in sanitised:
+            sanitised["schema_version"] = original["schema_version"]
+        if "study_id" in original:
+            # Identity is derived from the specification, never the patch.
+            sanitised["study_id"] = original["study_id"]
+        result[section] = sanitised
+    return result
+
+
 def apply_operations(
     current: dict[str, Any], operations: tuple[Any, ...] | list[Any]
 ) -> dict[str, Any]:
@@ -260,19 +292,7 @@ class PatchPreviewService:
         current_canonical["schemas"] = current_form.get("schemas", {})
         candidate: dict[str, Any] = apply_operations(current_canonical, patch.operations)
         self.service._validate_schema_files(candidate.get("schemas", {}))
-        for section, original in current_canonical.items():
-            if not isinstance(original, dict) or not isinstance(candidate.get(section), dict):
-                continue
-            if section == "schemas":
-                continue
-            known = set(original) | {"schema_version", "study_id"}
-            sanitised = {key: value for key, value in candidate[section].items() if key in known}
-            if "schema_version" in original and "schema_version" not in sanitised:
-                sanitised["schema_version"] = original["schema_version"]
-            if "study_id" in original:
-                # Identity is derived from the specification, never the patch.
-                sanitised["study_id"] = original["study_id"]
-            candidate[section] = sanitised
+        candidate = sanitised_candidate(current_canonical, candidate)
         yaml_files = {
             f"{name}.yaml": yaml.safe_dump(value, sort_keys=False)
             for name, value in candidate.items()
@@ -310,11 +330,15 @@ class PatchPreviewService:
                 for existing in prompt_dir.glob("*.txt"):
                     if existing.stem not in prompts:
                         existing.unlink()
-            if isinstance(prompts, dict) and prompts:
-                prompt_dir.mkdir(exist_ok=True)
-                for prompt_id, content in prompts.items():
-                    (prompt_dir / f"{prompt_id}.txt").write_text(str(content))
+            prompt_errors = (
+                write_candidate_prompts(prompt_dir, prompts)
+                if isinstance(prompts, dict) and prompts
+                else []
+            )
             validation = self._inspect(tmp_path, stage=stage, workflow=workflow)
+            if prompt_errors:
+                validation = dict(validation)
+                validation["errors"] = [*(validation.get("errors") or []), *prompt_errors]
             from genesis.compiler import StudyCompiler as _Compiler
             from genesis.compiler import ValidationIssue
 
@@ -339,6 +363,13 @@ class PatchPreviewService:
                     }
                     for issue in exc.issues
                 ]
+            # A defect introduced in one layer otherwise stays silent until the
+            # final stage gates on compilation -- three approvals later, where
+            # fixing it means reopening and invalidating everything downstream.
+            # Errors that belong to a layer already elicited are shown now.
+            validation["compile_warnings"] = _settled_compile_errors(
+                validation.get("compile_errors") or [], workflow, stage
+            )
             loaded = _Compiler(
                 tmp_path,
                 theory_templates=self.service._workflow_registry.theory_templates(),
@@ -425,6 +456,69 @@ class PatchPreviewService:
             "checklist": {key: value for key, value in checklist.items() if isinstance(value, str)},
             "summary": report.get("summary", "") if isinstance(report, dict) else "",
         }
+
+
+def write_candidate_prompts(prompt_dir: Path, prompts: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Write a draft's prompts, refusing any that is not text.
+
+    The drafting model may return a prompt as a structured specification --
+    objective, inputs, constraints -- rather than as the text a model is sent.
+    This wrote it with str(), so a dict repr became the prompt: no {context}
+    placeholder, no instruction the schema could be met from, and a model that
+    answered blind. The authoring API already refused non-text prompts; the
+    draft path now refuses them for the same stated reason, and the error
+    blocks approval rather than being discovered in a paid run.
+    """
+    prompt_dir.mkdir(exist_ok=True)
+    errors: list[dict[str, Any]] = []
+    for prompt_id, content in prompts.items():
+        if isinstance(content, str) and content.strip():
+            (prompt_dir / f"{prompt_id}.txt").write_text(content)
+            continue
+        errors.append(
+            {
+                "code": "PROMPT_CONTENT",
+                "severity": "error",
+                "source_file": f"prompts/{prompt_id}.txt",
+                "json_pointer": f"/prompts/{prompt_id}",
+                "message": (
+                    f"prompt '{prompt_id}' must be the non-empty text a model is sent, not "
+                    f"a {type(content).__name__}; write it as plain text that places context "
+                    "with {context} or {context.<path>}"
+                ),
+            }
+        )
+    return errors
+
+
+def _settled_compile_errors(
+    errors: list[dict[str, Any]],
+    workflow: WorkflowDefinition,
+    stage: WorkflowStage,
+) -> list[dict[str, Any]]:
+    """Compile errors belonging to a layer the researcher has already reached.
+
+    An intermediate package cannot compile: its later layers do not exist yet,
+    and the errors saying so are noise. An error in a layer already elicited is
+    not noise -- it is a defect that will block the final approval, and it is
+    cheapest to fix while that layer is the one in hand.
+    """
+    order = {item.id: index for index, item in enumerate(workflow.stages)}
+    owner_of: dict[str, str] = {}
+    for candidate in workflow.stages:
+        for owned in candidate.owned_paths:
+            section = owned.strip("/")
+            if section:
+                owner_of.setdefault(section, candidate.id)
+    current = order.get(stage.id, len(order))
+    settled: list[dict[str, Any]] = []
+    for error in errors:
+        section = _section_of(error)
+        owner = owner_of.get(section)
+        if owner is None or order.get(owner, len(order)) > current:
+            continue
+        settled.append({**error, "owned_by": owner})
+    return settled
 
 
 def _preview_issue(item: Mapping[str, Any]) -> dict[str, Any]:

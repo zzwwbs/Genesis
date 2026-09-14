@@ -6,10 +6,6 @@ time_model:
   end: 10
 termination: []
 conditions: []
-replications: 1
 matching: {}
 random_streams: []
 model_freezing: true
-budgets: {}
-checkpoints: {}
-replay_retention: {}

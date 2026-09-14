@@ -52,10 +52,9 @@ STAGE_DECISIONS = {
     "experiment-design": (
         "time-and-termination",
         "conditions-and-interventions",
-        "replication-and-randomness",
+        "randomness-and-matching",
         "model-and-schema-freezing",
         "outcome-plan",
-        "operational-controls",
     ),
 }
 

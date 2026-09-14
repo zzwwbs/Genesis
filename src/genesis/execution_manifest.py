@@ -212,11 +212,28 @@ class ExecutionManifest:
     # run. Empty when a build runs none, and then left out, so a configuration
     # without study code keeps the digest it had before this field existed.
     executor_code_digest: str = ""
+    # How much of the study this run realised. ``replication`` above is already
+    # one of these: which draw a run is belongs to the effective configuration,
+    # not to lineage. These two are the same kind of fact.
+    #
+    # An event cap can stop a run before its declared termination, so a capped
+    # run and an uncapped one are not realizations of the same configuration.
+    # The world a run was seeded from is the data it ran on, and two runs
+    # against different populations are not the same run repeated.
+    #
+    # Both follow ``executor_code_digest``: left out when absent, so a run that
+    # sets neither keeps the digest it had before these fields existed.
+    max_events: int | None = None
+    initialization_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = self._core_dict()
         if self.executor_code_digest:
             payload["executor_code_digest"] = self.executor_code_digest
+        if self.max_events is not None:
+            payload["max_events"] = int(self.max_events)
+        if self.initialization_digest:
+            payload["initialization_digest"] = self.initialization_digest
         return payload
 
     def _core_dict(self) -> dict[str, Any]:
@@ -268,6 +285,8 @@ def resolve_execution_manifest(
     outcome_plan_digest: str,
     origin_experiment_id: str | None = None,
     executor_code_digest: str = "",
+    max_events: int | None = None,
+    initialization_digest: str = "",
 ) -> dict[str, Any]:
     """Resolve the effective configuration from build and protocol facts.
 
@@ -293,6 +312,8 @@ def resolve_execution_manifest(
         model_configuration_digest=model_configuration_digest,
         outcome_plan_digest=outcome_plan_digest,
         executor_code_digest=executor_code_digest,
+        max_events=max_events,
+        initialization_digest=initialization_digest,
     ).to_dict()
 
 

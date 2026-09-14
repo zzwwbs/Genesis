@@ -562,3 +562,54 @@ def test_generative_output_without_usable_schema_fails(tmp_path: Path) -> None:
         StudyCompiler(source).compile(tmp_path / "no-schema-build")
     codes = {issue.code for issue in excinfo.value.issues}
     assert "OUTPUT_SCHEMA_MISSING" in codes
+
+
+def test_a_cycle_formed_only_by_merging_theory_edges_fails_compilation(tmp_path: Path) -> None:
+    """Declared a->b plus zero-lag theory b->a compiled clean (2026-09-14 M10).
+
+    Each set of edges was checked alone; the scheduler refused the merged graph
+    only when a run was created from the finished build.
+    """
+    import pytest
+
+    from genesis.compiler import StudyCompiler, ValidationIssue
+
+    openness = {
+        "schema_version": "1.0",
+        "study_id": "platform-governance",
+        "processes": [
+            {
+                "id": "formulate-strategy",
+                "executor": {"mode": "deterministic"},
+                "context_policy": "public",
+                "dependencies": {"after": ["publish"]},
+            },
+            {"id": "publish", "executor": {"mode": "deterministic"}, "context_policy": "public"},
+        ],
+    }
+    theory = {
+        "schema_version": "1.0",
+        "study_id": "platform-governance",
+        "theory_family": "institutional",
+        "relations": [
+            {
+                "id": "strategy-before-publish",
+                "from": "strategy",
+                "to": "publication",
+                "relation": "strategy precedes publication",
+                "execution": {
+                    "kind": "precedence",
+                    "producer_process": "formulate-strategy",
+                    "consumer_process": "publish",
+                    "lag_rounds": 0,
+                },
+            }
+        ],
+    }
+    source = _write_package(tmp_path, openness=openness, theory=theory)
+    out = tmp_path / "out"
+    out.mkdir()
+    with pytest.raises(ValidationIssue, match="GRAPH_IMMEDIATE_CYCLE"):
+        StudyCompiler(source).compile(out / "cycle-build")
+    # Nor the temporary build it had begun writing (2026-09-14 L3).
+    assert list(out.iterdir()) == []

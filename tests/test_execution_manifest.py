@@ -224,7 +224,6 @@ def test_execution_manifest_carries_effective_configuration(tmp_path: Path) -> N
     }
     protocol = {
         "conditions": [{"id": "base"}, {"id": "strict", "factors": {"policy": "strict"}}],
-        "replications": 3,
         "random_streams": [{"id": "conventional", "seed": 7}],
     }
     manifest = resolve_execution_manifest(
@@ -260,7 +259,7 @@ def test_scientific_config_digest_is_run_id_independent(tmp_path: Path) -> None:
         factors={},
         replication=1,
         build_manifest={"build_hash": "b", "study_id": "digest-study"},
-        protocol={"conditions": [{"id": "base"}], "replications": 1},
+        protocol={"conditions": [{"id": "base"}]},
         package_closure_digest=closure.digest,
         protocol_digest="p",
         model_configuration_digest="m",

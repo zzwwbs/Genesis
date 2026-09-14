@@ -1,11 +1,16 @@
 id: experiment-design
 title: Experiment Design
-opening_question: What comparisons, conditions, replications, and measurements are
-  needed to answer the research question?
-instructions: Clarify the time model, termination, conditions, interventions, replications,
-  random streams, matching, initialization, model profiles, parameter freezing, prompts,
-  complete output schemas, budgets, checkpoints, outcomes, joins, grouping, temporal
-  windows, missingness, replay, and retention.
+opening_question: What comparisons does the study need, over what time, and what
+  must be measured to answer the research question?
+instructions: 'Clarify the time model, termination, conditions and how each treatment reaches an actor,
+  the random streams and matching constraints that make cells comparable, model
+  profiles and parameter freezing, prompts, complete output schemas, and the outcome
+  plan including joins, grouping, temporal windows and missingness. Do NOT elicit
+  operational settings: how many replications to draw, how many worlds to
+  initialise, and any cap on events are chosen when the study is run, not when it
+  is specified. They do not change what the study is, and a researcher states them
+  as numbers rather than describing them in prose. There is no checkpoint or
+  retention policy to elicit; the runtime does not read one.'
 owned_paths:
 - /protocol
 - /outcomes
@@ -20,14 +25,20 @@ critical_decisions:
   target_paths: [/protocol/time_model, /protocol/phases, /protocol/termination]
   required: true
 - id: conditions-and-interventions
-  question: Which conditions and interventions must be compared, and when do they apply?
-  rationale: It determines experiment cells and treatment realization.
-  target_paths: [/protocol/factors, /protocol/conditions, /protocol/interventions]
+  question: Which conditions must be compared, and by what does each treatment reach
+    an actor -- a gated process, a gated context item, or a changed parameter?
+  rationale: It determines experiment cells and how a treatment is realized. There
+    is no `interventions` section -- a treatment is a condition plus whatever its
+    level gates -- so asking for one sent the answer to a path the schema drops.
+  target_paths: [/protocol/factors, /protocol/conditions]
   required: true
-- id: replication-and-randomness
-  question: How many replications, random streams, and matching constraints are needed?
-  rationale: It determines causal comparability and reproducibility.
-  target_paths: [/protocol/replications, /protocol/random_streams, /protocol/matching]
+- id: randomness-and-matching
+  question: Which random streams does the study need, and which must be shared across
+    conditions so the cells are comparable?
+  rationale: It determines what varies between cells and what is held identical, which
+    is what makes a within-block contrast a contrast in the treatment. How many draws
+    to take is an execution setting and is not decided here.
+  target_paths: [/protocol/random_streams, /protocol/matching]
   required: true
 - id: model-and-schema-freezing
   question: Which model profiles and structured-output contracts must be frozen?
@@ -39,11 +50,6 @@ critical_decisions:
   rationale: It determines executable outcome evaluation.
   target_paths: [/outcomes/outcomes]
   required: true
-- id: operational-controls
-  question: Which budgets, checkpoints, replay data, and retention settings are required?
-  rationale: It determines run bounds and reproducibility evidence.
-  target_paths: [/protocol/budgets, /protocol/checkpoints, /protocol/replay_retention]
-  required: true
 depends_on:
 - study-foundation
 - openness
@@ -54,8 +60,6 @@ ambiguity_topics:
 - time-model
 - termination
 - conditions
-- interventions
-- replications
 - random-streams
 - matching
 - initialization
@@ -63,15 +67,11 @@ ambiguity_topics:
 - parameter-freezing
 - prompts
 - schemas
-- budgets
-- checkpoints
 - outcomes
 - joins
 - grouping
 - temporal-windows
 - missingness
-- replay
-- retention
 completion_rules:
 - rule: canonical_schema_valid
 - rule: no_consequential_ambiguity

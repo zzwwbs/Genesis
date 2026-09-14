@@ -34,6 +34,20 @@ def produced_refs(process: Mapping[str, Any]) -> set[str]:
     for output in process.get("outputs") or ():
         if isinstance(output, Mapping) and output.get("artifact_type"):
             refs.add(str(output["artifact_type"]))
+    # The runtime stores an artifact for any catalog-named output key, whatever
+    # produced it -- so a retry fallback or a recorded_artifact executor's
+    # declared outputs are production channels too. Reading only `outputs`
+    # let a measurement's artifact reach a consumer gated off it whenever it
+    # arrived through one of these, which is the leak isolation exists to stop.
+    executor = process.get("executor")
+    parameters = executor.get("parameters") if isinstance(executor, Mapping) else None
+    retry = process.get("retry_policy")
+    for channel in (
+        parameters.get("outputs") if isinstance(parameters, Mapping) else None,
+        retry.get("fallback_outputs") if isinstance(retry, Mapping) else None,
+    ):
+        if isinstance(channel, Mapping | list | tuple):
+            refs.update(str(name) for name in channel)
     return refs
 
 
@@ -175,45 +189,47 @@ def measurement_diagnostics(
     return errors, warnings
 
 
-def gated_input_refs(
+def withheld_sources(
     process: Mapping[str, Any],
-    processes: Mapping[str, Mapping[str, Any]],
     *,
     phase: Any,
     condition: Mapping[str, Any],
-) -> list[Any]:
-    """A process's declared inputs, less measurement sources whose use does not apply now."""
+) -> frozenset[str]:
+    """The measurement processes whose declared use does not apply now.
+
+    The gate used to answer a different question -- which record *types* to
+    hide -- and that choice failed both ways. It could not hide a type another
+    process also produced without starving that process, so it hid nothing and
+    the measurement leaked; and it hid a consumer's own records of the same
+    type. A use names a source process, and every stored record names the
+    process that produced it, so the gate is expressed in those terms instead.
+    """
     from genesis.runtime import _evaluate_condition
 
-    refs = process.get("inputs") or []
-    if not isinstance(refs, list | tuple):
-        return list(refs) if isinstance(refs, Iterable) else []
-    gated = [
+    uses = [
         use
         for use in process.get("measurement_use") or ()
         if isinstance(use, Mapping) and use.get("when") is not None
     ]
-    if not gated:
-        return list(refs)
+    if not uses:
+        return frozenset()
     namespace = {"condition": condition_namespace(condition), "protocol": {"phase": phase}}
-    consumer_id = str(process.get("id"))
-    withheld: set[str] = set()
-    for use in gated:
-        if _evaluate_condition(use["when"], namespace):
-            continue
-        source_id = str(use.get("source"))
-        source = processes.get(source_id, {"id": source_id})
-        # Only what this measurement alone produces: another process may declare
-        # the same artifact type, and withholding that would starve the consumer
-        # of a producer the declaration says nothing about. The consumer's own
-        # outputs are not such a producer -- counting them let a consumer that
-        # declares the same artifact type defeat its own gate.
-        others: set[str] = set()
-        for other_id, other in processes.items():
-            if str(other_id) not in {source_id, consumer_id} and isinstance(other, Mapping):
-                others |= produced_refs(other)
-        withheld |= produced_refs(source) - others
-    return [ref for ref in refs if str(ref) not in withheld]
+    return frozenset(
+        str(use.get("source")) for use in uses if not _evaluate_condition(use["when"], namespace)
+    )
+
+
+def withhold_instances(
+    resolved: Mapping[str, Mapping[str, Any]], sources: frozenset[str]
+) -> dict[str, Mapping[str, Any]]:
+    """Resolved records less those a withheld measurement produced."""
+    if not sources:
+        return dict(resolved)
+    return {
+        instance_id: record
+        for instance_id, record in resolved.items()
+        if str(record.get("producer_process")) not in sources
+    }
 
 
 def condition_namespace(condition: Mapping[str, Any]) -> dict[str, Any]:

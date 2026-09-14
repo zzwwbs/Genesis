@@ -44,7 +44,6 @@ PACKAGE = {
     "protocol": {
         "time_model": {"type": "rounds", "end": 5},
         "conditions": [],
-        "replications": 1,
     },
     "outcomes": [],
     "models": [],

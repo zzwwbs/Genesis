@@ -95,10 +95,9 @@ STAGE_DECISIONS = {
     "experiment-design": (
         "time-and-termination",
         "conditions-and-interventions",
-        "replication-and-randomness",
+        "randomness-and-matching",
         "model-and-schema-freezing",
         "outcome-plan",
-        "operational-controls",
     ),
 }
 
@@ -935,3 +934,81 @@ def test_theory_draft_with_complete_vsr_mappings_approves(
     assert compile_errors == [], compile_errors
     result = service.approve_elicitation_stage(session["session_id"], approved_by="researcher")
     assert result["status"] != "failed"
+
+
+def test_re_approving_a_reopened_stage_still_gates_on_compilation(
+    service: GenesisService,
+) -> None:
+    """Both approval branches must gate the final stage on a real compile.
+
+    The fresh-patch branch did; the needs_review branch gated only on
+    inspection, which runs _load, _validate and _validate_theory but not the
+    theory execution plan, the feedback policy check or the schema catalog -- so
+    a defect only compilation sees would have been approved into a completed
+    session.
+
+    Caveat on the evidence: every compile-only defect I tried was caught earlier
+    by inspection, so this asserts the branch now consults a compile rather than
+    exhibiting a package that slips through. The asymmetry between the branches
+    was real and is closed; its exploitability is unconfirmed.
+    """
+    import yaml
+
+    session = service.start_elicitation(
+        {
+            "specification_id": "stage-study",
+            "workflow_id": "three-layer-study",
+            "model_profile_id": "assistant",
+            "researcher_id": "researcher",
+        }
+    )
+    for _stage in ("study-foundation", "openness", "theory", "domain", "experiment-design"):
+        _answer(service, session["session_id"])
+        session = _draft_and_approve(service, session["session_id"])
+    assert service.get_elicitation(session["session_id"])["status"] == "completed"
+
+    # Reopen upstream, so the stages after it re-approve without a fresh patch.
+    service.reopen_elicitation_stage(session["session_id"], "theory")
+    _answer(service, session["session_id"])
+    session = _draft_and_approve(service, session["session_id"])
+    assert service.get_elicitation(session["session_id"])["current_stage"] == "domain"
+
+    # 'domain' re-approves without a patch, then the last stage is reached.
+    service.approve_elicitation_stage(session["session_id"], approved_by="researcher")
+
+    # A real compile of a package with a relation bound to no declared
+    # mechanism does refuse it, so the helper reports what compilation would.
+    theory_path = service._specification_dir("stage-study") / "theory.yaml"
+    document = yaml.safe_load(theory_path.read_text())
+    document.setdefault("relations", []).append(
+        {"from": "variation", "to": "selection", "kind": "annotation", "mechanism_binding": "ghost"}
+    )
+    defective = yaml.safe_dump(document, sort_keys=False)
+    theory_path.write_text(defective)
+    assert service._compile_errors_for(service._specification_dir("stage-study"))
+    theory_path.write_text(
+        yaml.safe_dump({**document, "relations": document["relations"][:-1]}, sort_keys=False)
+    )
+
+    # And the last needs_review approval consults it.
+    consulted: list[Path] = []
+    original = service._compile_errors_for
+
+    def refusing(directory: Path) -> list[dict[str, object]]:
+        consulted.append(directory)
+        return [
+            {
+                "code": "THEORY_MECHANISM_UNKNOWN",
+                "path": "",
+                "source_file": "theory.yaml",
+                "message": "relation binds a mechanism the package does not declare",
+            }
+        ]
+
+    service._compile_errors_for = refusing  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ValueError, match="does not compile"):
+            service.approve_elicitation_stage(session["session_id"], approved_by="researcher")
+    finally:
+        service._compile_errors_for = original  # type: ignore[method-assign]
+    assert consulted, "the needs_review branch never asked whether the package compiles"

@@ -345,8 +345,16 @@ def _ready_ids(scheduler: Any, phase: int, state: dict[str, Any]) -> list[str]:
     return [item.process_id for item in scheduler.ready(phase, state=state)]
 
 
-def _scheduler_state(phase: int, **condition: Any) -> dict[str, Any]:
-    return {"condition": dict(condition), "protocol": {"phase": phase}}
+def _scheduler_state(phase: int, **factors: Any) -> dict[str, Any]:
+    """The condition shape the runtime hands the scheduler.
+
+    expand_protocol_conditions nests a factor's level under ``factors``, so a
+    helper that spread them at the top level tested a shape no run produces.
+    """
+    return {
+        "condition": {"id": "c", "factors": dict(factors)} if factors else {"id": "base"},
+        "protocol": {"phase": phase},
+    }
 
 
 def test_a_consumer_runs_in_phases_its_conditional_producer_skips() -> None:
@@ -393,7 +401,7 @@ def test_condition_triggers_accept_compound_predicates() -> None:
                     "repeat": True,
                     "predicate": {
                         "all": [
-                            {"path": "condition.governance", "op": "eq", "value": "hidden"},
+                            {"path": "condition.factors.governance", "op": "eq", "value": "hidden"},
                             {"path": "protocol.phase", "op": "gte", "value": 20},
                         ]
                     },
@@ -594,7 +602,7 @@ def test_a_conditional_use_may_not_gate_a_state_read() -> None:
     use = {
         "source": "detect",
         "rationale": "r",
-        "when": {"path": "condition.governance", "op": "eq", "value": "hidden"},
+        "when": {"path": "condition.factors.governance", "op": "eq", "value": "hidden"},
     }
     errors, _ = _diagnose(
         [DETECT, _settle(measurement_use=[use])],
@@ -617,7 +625,7 @@ def test_a_declared_use_that_reads_nothing_is_reported() -> None:
 
 
 def test_a_conditional_use_withholds_the_measurement_outside_its_condition() -> None:
-    from genesis.measurement import gated_input_refs
+    from genesis.measurement import withheld_sources
 
     process = _settle(
         measurement_use=[
@@ -626,18 +634,19 @@ def test_a_conditional_use_withholds_the_measurement_outside_its_condition() -> 
                 "rationale": "the penalty applies only under governance, from round 20",
                 "when": {
                     "all": [
-                        {"path": "condition.governance", "op": "eq", "value": "hidden"},
+                        {"path": "condition.factors.governance", "op": "eq", "value": "hidden"},
                         {"path": "protocol.phase", "op": "gte", "value": 20},
                     ]
                 },
             }
         ]
     )
-    processes = {"detect": DETECT, "settle": process}
-    governed = {"governance": "hidden"}
-    assert gated_input_refs(process, processes, phase=20, condition=governed) == ["detection"]
-    assert gated_input_refs(process, processes, phase=19, condition=governed) == []
-    assert gated_input_refs(process, processes, phase=20, condition={"governance": "none"}) == []
+    governed = {"id": "c", "factors": {"governance": "hidden"}}
+    assert withheld_sources(process, phase=20, condition=governed) == frozenset()
+    assert withheld_sources(process, phase=19, condition=governed) == {"detect"}
+    assert withheld_sources(
+        process, phase=20, condition={"id": "c", "factors": {"governance": "none"}}
+    ) == {"detect"}
 
 
 # --- G3: prompt roles and named context slots --------------------------------------
@@ -946,6 +955,7 @@ def _controller_with_log(processes: dict[str, Any] | None = None) -> Any:
     controller = RunController.__new__(RunController)
     controller._exchange_log = {}
     controller._exchange_processes = frozenset({"publish", "diary", "board"})
+    controller._exchange_retention = {}  # no declared cap: keep everything
     controller.scheduler = type("S", (), {"processes": processes or {}})()
     return controller
 
@@ -1591,9 +1601,10 @@ def test_a_measurement_without_declared_outputs_is_reported() -> None:
 
 
 def test_a_consumer_cannot_defeat_its_own_gate_by_declaring_the_same_type() -> None:
-    from genesis.measurement import gated_input_refs
+    """Hidden by producer: declaring the same type no longer changes what is
+    hidden, so the detector's record goes and the consumer's own stays."""
+    from genesis.measurement import withheld_sources, withhold_instances
 
-    detect = {**DETECT, "outputs": [{"artifact_type": "score", "schema_ref": "s"}]}
     consumer = _settle(
         inputs=["score"],
         outputs=[{"artifact_type": "score", "schema_ref": "s"}],
@@ -1601,31 +1612,29 @@ def test_a_consumer_cannot_defeat_its_own_gate_by_declaring_the_same_type() -> N
             {
                 "source": "detect",
                 "rationale": "r",
-                "when": {"path": "condition.governance", "op": "eq", "value": "hidden"},
+                "when": {"path": "condition.factors.governance", "op": "eq", "value": "hidden"},
             }
         ],
     )
-    outside = gated_input_refs(
-        consumer,
-        {"detect": detect, "settle": consumer},
-        phase=0,
-        condition={"governance": "none"},
-    )
-    assert outside == []
+    resolved = {
+        "score-1": {"artifact_type": "score", "producer_process": "detect"},
+        "score-2": {"artifact_type": "score", "producer_process": "settle"},
+    }
+    sources = withheld_sources(consumer, phase=0, condition={"governance": "none"})
+    assert set(withhold_instances(resolved, sources)) == {"score-2"}
 
 
 def test_a_gate_opens_for_a_factor_condition() -> None:
-    from genesis.measurement import gated_input_refs
+    from genesis.measurement import withheld_sources
     from genesis.runtime import expand_protocol_conditions
 
-    detect = {**DETECT, "outputs": [{"artifact_type": "score", "schema_ref": "s"}]}
     consumer = _settle(
         inputs=["score"],
         measurement_use=[
             {
                 "source": "detect",
                 "rationale": "r",
-                "when": {"path": "condition.governance", "op": "eq", "value": "hidden"},
+                "when": {"path": "condition.factors.governance", "op": "eq", "value": "hidden"},
             }
         ],
     )
@@ -1635,11 +1644,11 @@ def test_a_gate_opens_for_a_factor_condition() -> None:
             {"factors": [{"id": "governance", "levels": ["none", "hidden"]}]}
         )
     }
-    governed = conditions["governance-hidden"]
-    ungoverned = conditions["governance-none"]
     # A factor condition nests its levels; the predicate names the factor.
-    assert gated_input_refs(consumer, {"detect": detect}, phase=0, condition=governed) == ["score"]
-    assert gated_input_refs(consumer, {"detect": detect}, phase=0, condition=ungoverned) == []
+    assert withheld_sources(consumer, phase=0, condition=conditions["governance-hidden"]) == set()
+    assert withheld_sources(consumer, phase=0, condition=conditions["governance-none"]) == {
+        "detect"
+    }
 
 
 # --- H2, H3, M1, M2: the pin describes code without running it ---------------------
@@ -1749,6 +1758,10 @@ def test_study_code_that_nothing_pins_is_refused(tmp_path: Path, study_module) -
         path.unlink()
         with pytest.raises(ValueError, match="RUN_CODE_UNPINNED"):
             service.execute_run("r")
+        # Refused in preflight, so the run is left as it was rather than
+        # persisted as failed: raised from inside the dispatch it fired after
+        # the transition to running, and the run could never be started again.
+        assert service.get_run("r")["status"] == "created"
         # Supplying the executor directly is the declared way through.
         service.create_run({"id": "r2", "study_id": "code-study", "build": build})
         run = service.execute_run("r2", executor_overrides={"tick": lambda _invocation: {}})
@@ -1867,25 +1880,29 @@ def test_a_projection_says_what_it_projects() -> None:
         _project_value(record, "board", {"keep": ["title"], "applies_to": "each"})
 
 
-def test_gating_withholds_only_what_the_measurement_alone_produces() -> None:
-    from genesis.measurement import gated_input_refs
+def test_gating_withholds_only_what_the_measurement_produced() -> None:
+    """This test used to assert the leak: with another process also producing
+    `score`, the whole type stayed visible -- detector's records included.
+    Hidden by producer, the other process's records arrive and the detector's
+    do not."""
+    from genesis.measurement import withheld_sources, withhold_instances
 
-    detect = {**DETECT, "outputs": [{"artifact_type": "score", "schema_ref": "s"}]}
-    tally = {"id": "tally", "outputs": [{"artifact_type": "score", "schema_ref": "s"}]}
     settle = _settle(
         inputs=["score", "detect"],
         measurement_use=[
             {
                 "source": "detect",
                 "rationale": "r",
-                "when": {"path": "condition.governance", "op": "eq", "value": "hidden"},
+                "when": {"path": "condition.factors.governance", "op": "eq", "value": "hidden"},
             }
         ],
     )
-    processes = {"detect": detect, "tally": tally, "settle": settle}
-    outside = gated_input_refs(settle, processes, phase=1, condition={"governance": "none"})
-    # 'score' also comes from a process the declaration says nothing about.
-    assert outside == ["score"]
+    resolved = {
+        "score-d": {"artifact_type": "score", "producer_process": "detect"},
+        "score-t": {"artifact_type": "score", "producer_process": "tally"},
+    }
+    sources = withheld_sources(settle, phase=1, condition={"governance": "none"})
+    assert set(withhold_instances(resolved, sources)) == {"score-t"}
 
 
 def test_a_keyed_write_composes_only_under_the_acting_actor() -> None:
@@ -2043,7 +2060,7 @@ def test_declaring_both_factors_and_conditions_is_refused_at_compile(tmp_path: P
                 "time_model": {"type": "rounds", "start": 0, "end": 1},
                 "factors": [{"id": "governance", "levels": ["none", "on"]}],
                 "conditions": [{"id": "none", "factors": {"governance": "none"}}],
-            }
+            },
         },
         "both-study",
     )
@@ -2112,8 +2129,11 @@ def test_a_gate_on_an_undeclared_condition_factor_is_refused(tmp_path: Path) -> 
                         "allow": ["leaderboard"],
                         "available_when": {
                             # The factor is 'peer-visibility'; this names 'visibility'.
-                            "leaderboard": {"path": "condition.visibility", "op": "eq",
-                                            "value": "high"}
+                            "leaderboard": {
+                                "path": "condition.factors.visibility",
+                                "op": "eq",
+                                "value": "high",
+                            }
                         },
                     }
                 ],
@@ -2146,8 +2166,11 @@ def test_a_gate_on_a_declared_condition_factor_is_accepted(tmp_path: Path) -> No
                         "id": "creator-context",
                         "allow": ["leaderboard"],
                         "available_when": {
-                            "leaderboard": {"path": "condition.peer-visibility", "op": "eq",
-                                            "value": "high"}
+                            "leaderboard": {
+                                "path": "condition.factors.peer-visibility",
+                                "op": "eq",
+                                "value": "high",
+                            }
                         },
                     }
                 ],
@@ -2156,3 +2179,564 @@ def test_a_gate_on_a_declared_condition_factor_is_accepted(tmp_path: Path) -> No
         "gate-ok-study",
     )
     StudyCompiler(source).compile(tmp_path / "build")
+
+
+def _warnings_for(source: Path, build: Path) -> list[dict[str, Any]]:
+    from genesis.compiler import StudyCompiler
+
+    StudyCompiler(source).compile(build)
+    report = json.loads((build / "validation_report.json").read_text())
+    issues = report.get("warnings") or report.get("issues") or []
+    return [i for i in issues if isinstance(i, dict)]
+
+
+def test_a_context_policy_no_process_binds_is_reported(tmp_path: Path) -> None:
+    """The dead half of a real defect: the process it was written for reads another."""
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "measure",
+                        "executor": {"mode": "deterministic"},
+                        # Written a narrow policy, bound to the broad one.
+                        "context_policy": "broad-context",
+                        "trigger": {"phase": 0, "repeat": True},
+                    }
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [
+                    {"id": "broad-context", "allow": ["items"]},
+                    {"id": "narrow-context", "allow": ["items"]},
+                ],
+            },
+        },
+        "dead-policy-study",
+    )
+    warnings = _warnings_for(source, tmp_path / "build")
+    dead = [w for w in warnings if w.get("code") == "CONTEXT_POLICY_UNBOUND"]
+    assert len(dead) == 1
+    assert "narrow-context" in dead[0]["message"]
+
+
+def test_a_bound_context_policy_is_not_reported(tmp_path: Path) -> None:
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "measure",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "only-context",
+                        "trigger": {"phase": 0, "repeat": True},
+                    }
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [{"id": "only-context", "allow": ["items"]}],
+            },
+        },
+        "live-policy-study",
+    )
+    warnings = _warnings_for(source, tmp_path / "build")
+    assert [w for w in warnings if w.get("code") == "CONTEXT_POLICY_UNBOUND"] == []
+
+
+def test_a_feedback_slot_no_binding_fills_is_reported(tmp_path: Path) -> None:
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "act",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "actor-context",
+                        "trigger": {"phase": 0, "repeat": True},
+                    }
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                # The slot is allowed, scoped and capped -- and nothing writes it.
+                "visibility": [{"id": "actor-context", "allow": ["items", "feedback.leftover"]}],
+            },
+        },
+        "unfed-slot-study",
+    )
+    warnings = _warnings_for(source, tmp_path / "build")
+    unfed = [w for w in warnings if w.get("code") == "FEEDBACK_SLOT_UNFED"]
+    assert len(unfed) == 1
+    assert "leftover" in unfed[0]["message"]
+
+
+def _with_schema(source: Path, name: str = "s") -> Path:
+    """Give a fixture package the output schema its processes reference."""
+    schemas = source / "schemas"
+    schemas.mkdir(exist_ok=True)
+    (schemas / f"{name}.json").write_text(
+        json.dumps({"type": "object", "properties": {"v": {"type": "string"}}, "required": ["v"]})
+    )
+    return source
+
+
+def _artifact_flow_package(tmp_path: Path, *, produce_history: bool) -> Path:
+    outputs = [{"artifact_type": "article", "schema_ref": "s"}]
+    processes = [
+        {
+            "id": "publish",
+            "executor": {"mode": "deterministic"},
+            "context_policy": "ctx",
+            "trigger": {"phase": 0, "repeat": True},
+            "inputs": ["history"],
+            "outputs": outputs,
+        }
+    ]
+    if produce_history:
+        processes.append(
+            {
+                "id": "record",
+                "executor": {"mode": "deterministic"},
+                "context_policy": "ctx",
+                "trigger": {"phase": 0, "repeat": True},
+                "outputs": [{"artifact_type": "history", "schema_ref": "s"}],
+            }
+        )
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {"processes": processes},
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [{"id": "ctx", "allow": ["items"]}],
+                "artifacts": [
+                    {"id": "article", "artifact_type": "article", "schema_ref": "s"},
+                    {"id": "history", "artifact_type": "history", "schema_ref": "s"},
+                ],
+            },
+        },
+        "flow-study",
+    )
+    return _with_schema(source)
+
+
+def test_an_input_artifact_no_process_produces_is_refused(tmp_path: Path) -> None:
+    """It reads empty every round, so the actor never sees what the design says."""
+    from genesis.compiler import StudyCompiler, ValidationIssue
+
+    source = _artifact_flow_package(tmp_path, produce_history=False)
+    with pytest.raises(ValidationIssue) as raised:
+        StudyCompiler(source).compile(tmp_path / "build")
+    orphans = [i for i in raised.value.issues if i.code == "INPUT_ARTIFACT_UNPRODUCED"]
+    assert len(orphans) == 1
+    assert "history" in orphans[0].message
+
+
+def test_an_input_artifact_with_a_producer_is_accepted(tmp_path: Path) -> None:
+    from genesis.compiler import StudyCompiler
+
+    source = _artifact_flow_package(tmp_path, produce_history=True)
+    StudyCompiler(source).compile(tmp_path / "build")
+
+
+def test_an_input_naming_an_artifact_type_rather_than_its_id_is_accepted(tmp_path: Path) -> None:
+    """Inputs name ids, outputs declare types; the two need not be the same string."""
+    from genesis.compiler import StudyCompiler
+
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "formulate",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 0, "repeat": True},
+                        "inputs": ["creator-strategy"],
+                        "outputs": [{"artifact_type": "strategy", "schema_ref": "s"}],
+                    }
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [{"id": "ctx", "allow": ["items"]}],
+                "artifacts": [{"id": "creator-strategy", "artifact_type": "strategy"}],
+            },
+        },
+        "type-id-study",
+    )
+    StudyCompiler(_with_schema(source)).compile(tmp_path / "build")
+
+
+def test_a_state_nothing_writes_is_reported(tmp_path: Path) -> None:
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "act",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 0, "repeat": True},
+                        "state_effects": [{"field": "written", "op": "append"}],
+                    }
+                ]
+            },
+            "domain": {
+                "states": [
+                    {"id": "written", "value_type": "array", "initial": []},
+                    {"id": "orphaned", "value_type": "array", "initial": []},
+                ],
+                "visibility": [{"id": "ctx", "allow": ["written"]}],
+            },
+        },
+        "unwritten-study",
+    )
+    warnings = _warnings_for(source, tmp_path / "build")
+    unwritten = [w for w in warnings if w.get("code") == "STATE_NEVER_WRITTEN"]
+    assert [w["path"] for w in unwritten] == ["domain.states.orphaned"]
+
+
+def test_a_deterministic_executor_declaring_a_function_is_refused(tmp_path: Path) -> None:
+    """The mode ignores it, so the declaration reads as implementation and is not."""
+    from genesis.compiler import StudyCompiler, ValidationIssue
+
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "settle",
+                        "executor": {
+                            "mode": "deterministic",
+                            "parameters": {"function": "settle"},
+                        },
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 0, "repeat": True},
+                    }
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [{"id": "ctx", "allow": ["items"]}],
+            },
+        },
+        "inert-study",
+    )
+    with pytest.raises(ValidationIssue) as raised:
+        StudyCompiler(source).compile(tmp_path / "build")
+    issue = next(i for i in raised.value.issues if i.code == "EXECUTOR_FUNCTION_IGNORED")
+    assert "computational" in issue.message
+
+
+def test_a_deterministic_process_that_declares_work_is_reported(tmp_path: Path) -> None:
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "settle",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 0, "repeat": True},
+                        "state_effects": [{"field": "items", "op": "set"}],
+                    },
+                    {
+                        "id": "watch",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 0, "repeat": True},
+                    },
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [{"id": "ctx", "allow": ["items"]}],
+            },
+        },
+        "inert-effects-study",
+    )
+    warnings = _warnings_for(source, tmp_path / "build")
+    inert = [w for w in warnings if w.get("code") == "EXECUTOR_INERT"]
+    # Only the one that declares work it cannot do.
+    assert [w["path"] for w in inert] == ["openness.processes.settle.executor"]
+
+
+def _actor_source_package(tmp_path: Path, source: str) -> Path:
+    return _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "act",
+                        "actors": {"source": source, "id_field": "id", "fan_out": True},
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 0, "repeat": True},
+                    }
+                ]
+            },
+            "domain": {
+                "states": [{"id": "population", "value_type": "object", "initial": {}}],
+                "visibility": [{"id": "ctx", "allow": ["population"]}],
+            },
+        },
+        "actor-source-study",
+    )
+
+
+def test_an_actor_source_naming_no_declared_state_is_refused(tmp_path: Path) -> None:
+    """It resolves to nothing and raises once the run has started."""
+    from genesis.compiler import StudyCompiler, ValidationIssue
+
+    with pytest.raises(ValidationIssue) as raised:
+        StudyCompiler(_actor_source_package(tmp_path, "creators")).compile(tmp_path / "build")
+    issue = next(i for i in raised.value.issues if i.code == "ACTOR_SOURCE_UNKNOWN")
+    assert "population" in issue.message
+
+
+def test_an_actor_source_nested_under_a_declared_state_is_accepted(tmp_path: Path) -> None:
+    from genesis.compiler import StudyCompiler
+
+    source = _actor_source_package(tmp_path, "population.creators")
+    StudyCompiler(source).compile(tmp_path / "build")
+
+
+def _keyed_effect_process(mode: str, key: Any) -> dict[str, Any]:
+    effect: dict[str, Any] = {"field": "feeds", "op": "put"}
+    if key is not None:
+        effect["key"] = key
+    return {
+        "id": "distribute",
+        "actors": {"source": "population.users", "id_field": "id", "fan_out": True},
+        "executor": (
+            {"mode": mode, "parameters": {"entry_point": "pkg:fn"}}
+            if mode == "computational"
+            else {"mode": mode, "model_profile": "mp"}
+        ),
+        "context_policy": "ctx",
+        "information_timing": {"mode": "simultaneous", "order": "listed"},
+        "state_effects": [effect],
+    }
+
+
+def test_a_computational_process_may_write_under_the_acting_actor() -> None:
+    """Refusing the key left a fanned-out computational write with no legal form."""
+    from genesis.information_timing import model_effect_problems, whole_field_writes
+
+    process = _keyed_effect_process("computational", "actor")
+    assert model_effect_problems(process, {"feeds": "object"}) == []
+    # And it must count as composable, or simultaneous timing refuses it.
+    assert whole_field_writes(process) == []
+
+
+def test_a_keyed_write_without_the_actor_key_still_does_not_compose() -> None:
+    from genesis.information_timing import whole_field_writes
+
+    assert whole_field_writes(_keyed_effect_process("computational", None)) != []
+
+
+@pytest.mark.parametrize(
+    ("key", "fragment"),
+    [("owner", "only 'actor' is supported"), ("actor", "must be an object")],
+)
+def test_a_computational_keyed_write_is_still_checked(key: str, fragment: str) -> None:
+    from genesis.information_timing import model_effect_problems
+
+    process = _keyed_effect_process("computational", key)
+    problems = model_effect_problems(process, {"feeds": "array"})
+    assert any(fragment in problem for problem in problems), problems
+
+
+def test_from_remains_a_model_call_only_declaration() -> None:
+    from genesis.information_timing import model_effect_problems
+
+    process = _keyed_effect_process("computational", "actor")
+    process["state_effects"][0]["from"] = "feed"
+    problems = model_effect_problems(process, {"feeds": "object"})
+    assert any("declares from" in problem for problem in problems)
+
+
+def _trigger_package(tmp_path: Path, trigger: dict[str, Any], study: str) -> Path:
+    return _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "act",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": trigger,
+                    }
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [{"id": "ctx", "allow": ["items"]}],
+            },
+        },
+        study,
+    )
+
+
+def test_a_trigger_phase_that_is_not_an_integer_is_refused(tmp_path: Path) -> None:
+    """The scheduler compares it to the round number and dies on its first pass."""
+    from genesis.compiler import StudyCompiler, ValidationIssue
+
+    source = _trigger_package(tmp_path, {"phase": "round", "repeat": True}, "phase-study")
+    with pytest.raises(ValidationIssue) as raised:
+        StudyCompiler(source).compile(tmp_path / "build")
+    issue = next(i for i in raised.value.issues if i.code == "TRIGGER_PHASE_INVALID")
+    assert "protocol.phase" in issue.message
+
+
+def test_a_trigger_key_the_scheduler_never_reads_is_refused(tmp_path: Path) -> None:
+    """'rounds' reads like a schedule and is silently the default one."""
+    from genesis.compiler import StudyCompiler, ValidationIssue
+
+    source = _trigger_package(
+        tmp_path, {"phase": 1, "repeat": True, "rounds": [4, 7]}, "rounds-study"
+    )
+    with pytest.raises(ValidationIssue) as raised:
+        StudyCompiler(source).compile(tmp_path / "build")
+    issue = next(i for i in raised.value.issues if i.code == "TRIGGER_KEY_UNKNOWN")
+    assert "rounds" in issue.message
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        {"phase": 1, "repeat": True},
+        {"type": "condition", "predicate": {"path": "protocol.phase", "op": "gte", "value": 2}},
+        {"type": "event", "event": "published"},
+    ],
+)
+def test_the_scheduler_s_own_trigger_forms_are_accepted(
+    tmp_path: Path, trigger: dict[str, Any]
+) -> None:
+    from genesis.compiler import StudyCompiler
+
+    source = _trigger_package(tmp_path, trigger, "ok-trigger-study")
+    StudyCompiler(source).compile(tmp_path / "build")
+
+
+def test_a_dependency_key_the_scheduler_never_reads_is_refused(tmp_path: Path) -> None:
+    """'requires' states the round's chain to a reader and nothing to the scheduler."""
+    from genesis.compiler import StudyCompiler, ValidationIssue
+
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "publish",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 1, "repeat": True},
+                    },
+                    {
+                        "id": "distribute",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 1, "repeat": True},
+                        "dependencies": {
+                            "requires": ["publish"],
+                            "same_round_results_visible": True,
+                        },
+                    },
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [{"id": "ctx", "allow": ["items"]}],
+            },
+        },
+        "requires-study",
+    )
+    with pytest.raises(ValidationIssue) as raised:
+        StudyCompiler(source).compile(tmp_path / "build")
+    issue = next(i for i in raised.value.issues if i.code == "DEPENDENCY_KEY_UNKNOWN")
+    assert "requires" in issue.message
+    assert "after" in issue.message
+
+
+def test_the_scheduler_s_own_dependency_keys_are_accepted(tmp_path: Path) -> None:
+    from genesis.compiler import StudyCompiler
+
+    source = _write_package(
+        tmp_path,
+        {
+            "openness": {
+                "processes": [
+                    {
+                        "id": "publish",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 1, "repeat": True},
+                    },
+                    {
+                        "id": "distribute",
+                        "executor": {"mode": "deterministic"},
+                        "context_policy": "ctx",
+                        "trigger": {"phase": 1, "repeat": True},
+                        "dependencies": {"after": ["publish"]},
+                    },
+                ]
+            },
+            "domain": {
+                "states": [{"id": "items", "value_type": "array", "initial": []}],
+                "visibility": [{"id": "ctx", "allow": ["items"]}],
+            },
+        },
+        "after-study",
+    )
+    StudyCompiler(source).compile(tmp_path / "build")
+
+
+def test_a_resume_keeps_the_exchange_log_to_its_declared_bound() -> None:
+    """The live path trims to the cap; the rebuild kept every exchange (2026-09-14 M4).
+
+    A resumed run's models were then shown more history than the uninterrupted
+    run's, and all of it stayed in memory.
+    """
+    controller = _controller_with_log({"publish": {}})
+    controller._exchange_retention = {"publish": 2}
+
+    class _Persistence:
+        @staticmethod
+        def list_artifacts(_run_id: str) -> list[dict[str, Any]]:
+            return [
+                {
+                    "artifact_id": f"run-publish-w1-{phase}-attempt-1",
+                    "payload": json.dumps({"outputs": {"title": f"t{phase}"}}),
+                }
+                for phase in range(5)
+            ]
+
+    controller.persistence = _Persistence()
+    events = [
+        {
+            "event_id": f"run-publish-w1-{phase}-attempt-1",
+            "kind": "process_completed",
+            "process_id": "publish",
+            "actors": ["w1"],
+            "phase": phase,
+            "attempt": 1,
+            "commit_order": phase,
+        }
+        for phase in range(5)
+    ]
+    controller._restore_exchange_log("run", events)
+    assert [entry["phase"] for entry in controller._exchange_log[("publish", ("w1",))]] == [3, 4]

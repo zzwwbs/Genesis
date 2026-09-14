@@ -90,15 +90,11 @@ FULL_PAYLOAD = {
     },
     "protocol": {
         "time_model": {"type": "rounds", "start": 0, "end": 10, "step": 1},
-        "termination": [{"condition": "max_rounds"}],
+        "termination": [{"type": "end_time", "at": 10}],
         "conditions": [{"id": "base"}, {"id": "alternative"}],
-        "replications": 3,
         "matching": {"mode": "none"},
         "random_streams": [{"id": "stream-a", "seed": 42}],
         "model_freezing": True,
-        "budgets": {"max_calls": 100},
-        "checkpoints": {"interval": 5},
-        "replay_retention": {"mode": "full"},
     },
     "outcomes": [
         {

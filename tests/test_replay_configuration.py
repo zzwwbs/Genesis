@@ -42,7 +42,6 @@ PAYLOAD = {
             {"id": "policy", "levels": ["strict", "lenient"], "branchable": True},
             {"id": "peer", "levels": ["low", "high"], "branchable": False},
         ],
-        "replications": 3,
     },
     "outcomes": [],
     "prompts": {"compose": "Compose from {context}"},

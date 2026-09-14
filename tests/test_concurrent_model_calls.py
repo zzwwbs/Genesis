@@ -2005,3 +2005,48 @@ def test_a_non_finite_retry_after_falls_back_to_backoff(header: str) -> None:
 
 def test_an_unset_retry_bound_means_the_default() -> None:
     assert _bare_provider(max_retries=None).max_retries == 3
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_a_cap_reached_just_before_a_concurrent_batch_is_a_truncation(
+    tmp_path: Path, limit: int
+) -> None:
+    """Only the serial path asked about the cap before a turn (2026-09-14 R2-1).
+
+    Reached just as a concurrent batch began, the batch submitted nothing and the
+    run was recorded as finished rather than cut short.
+    """
+    from genesis.runtime import (
+        ContextEngine,
+        ExecutorRegistry,
+        ProcessResult,
+        RunController,
+        Scheduler,
+        StateStore,
+    )
+
+    class _Seed:
+        def execute(self, invocation: Any) -> Any:
+            return ProcessResult()
+
+    processes = [
+        {"id": "seed", "context_policy": "writer"},
+        {
+            "id": "write",
+            "actors": WRITERS,
+            "executor": {"mode": "generative"},
+            "context_policy": "writer",
+            "after": ["seed"],
+            "information_timing": {"mode": "simultaneous"},
+            "state_effects": [{"field": "drafts", "op": "append"}],
+        },
+    ]
+    controller = RunController(
+        Scheduler(processes),
+        ExecutorRegistry({"seed": _Seed(), "write": _PooledCall()}),
+        ContextEngine({"writer": {"allow": ["notes"]}}),
+        state_store=StateStore({"notes": list, "drafts": list}, {"notes": [], "drafts": []}),
+        max_concurrency={"write": limit},
+    )
+    assert controller.run("r", phase_limit=1, max_events=1) == ["seed"]
+    assert controller.budget_exhausted is True

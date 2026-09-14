@@ -252,7 +252,10 @@ def test_ui_exposes_the_approval_gated_workflow(tmp_path: Path) -> None:
     # Run tab raises the approval gate before compile/execute.
     assert "Compile approved draft" in response.text
     assert "Execute experiment" in response.text
-    assert "Study ID" in response.text
+    # The study every tab acts on is named in the header, not inside the Run
+    # tab, and the gate says why compilation is or is not available.
+    assert 'id="study-id"' in response.text.split("</header>")[0]
+    assert "must be approved before it compiles" in response.text
     # Model configuration stays in the Models tab.
     assert "Model configuration" in response.text
     assert "Save model profile" in response.text
@@ -277,8 +280,10 @@ def test_validation_errors_are_json_even_when_request_body_is_not_decoded(
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
-def test_web_ui_exposes_workspace_and_patch_review_controls(tmp_path: Path) -> None:
-    """AW-12/AW-02: the browser surface ships dashboard, explorer, replay and patch controls."""
+def test_web_ui_exposes_workspace_and_inspection_controls(tmp_path: Path) -> None:
+    """AW-12/AW-02: the browser surface ships dashboard, explorer, replay and
+    package-inspection controls. The patch control it used to name called a
+    route the app has never served."""
     client = TestClient(create_app(tmp_path / "workspace"))
     response = client.get("/ui")
     assert response.status_code == 200
@@ -288,7 +293,7 @@ def test_web_ui_exposes_workspace_and_patch_review_controls(tmp_path: Path) -> N
         "traceExplorer()",
         "replayWorkspace()",
         "processMap()",
-        "reviewPatch()",
+        "inspectPackage()",
         "listExperiments()",
         "listBuilds()",
     ):

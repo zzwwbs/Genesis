@@ -174,6 +174,18 @@ def _replay(service: Any, run_id: str, args: Any) -> dict[str, Any]:
     )
 
 
+def _remove_build(target: Path) -> None:
+    """Remove a build directory; a build's integrity files are written read-only."""
+    import shutil
+    import stat
+
+    def _writable(function: Any, path: str, _exc: Any) -> None:
+        os.chmod(path, stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+        function(path)
+
+    shutil.rmtree(target, onexc=_writable)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Invoke the GENESIS CLI."""
     args = build_parser().parse_args(argv)
@@ -195,10 +207,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         finally:
             service.close()
     elif args.command == "validate":
+        import shutil
+        import tempfile
+
         from genesis.compiler import StudyCompiler
 
-        # Validation is compilation without retaining a build artifact.
-        target = Path(args.output or (Path(args.path) / ".genesis-build-check"))
+        # Validation is compilation without retaining a build artifact. Only a
+        # directory this command created is removed: deleting whatever --output
+        # named wiped a user's existing directory even when compile refused to
+        # write into it.
+        scratch = None if args.output else Path(tempfile.mkdtemp(prefix="genesis-validate-"))
+        target = Path(args.output) if args.output else cast(Path, scratch) / "build"
+        created = not target.exists()
         try:
             build = StudyCompiler(args.path).compile(target)
             print(
@@ -207,10 +227,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             )
         finally:
-            if target.exists():
-                import shutil
-
-                shutil.rmtree(target)
+            if scratch is not None:
+                shutil.rmtree(scratch, ignore_errors=True)
+            elif created and target.exists():
+                _remove_build(target)
     elif args.command == "compile":
         if not args.output:
             raise SystemExit("compile requires --output")
