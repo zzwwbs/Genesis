@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--apply", action="store_true", help="Remove the unreferenced object files"
             )
-        if name == "run":
+        if name in {"run", "resume"}:
             command.add_argument(
                 "--max-concurrency",
                 action="append",
@@ -345,13 +345,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 result = service.execute_run(run_id, max_concurrency=max_concurrency)
             elif args.command == "status":
                 result = service.get_run(run_id)
-            elif args.command in {"pause", "resume", "cancel"}:
+            elif args.command == "resume":
+                # Executes the run from where it stopped; it used to set the status
+                # to running and execute nothing.
+                result = service.resume_run(
+                    run_id, max_concurrency=_max_concurrency(getattr(args, "max_concurrency", None))
+                )
+            elif args.command in {"pause", "cancel"}:
                 current = service.get_run(run_id)
-                target_status = {
-                    "pause": "paused",
-                    "resume": "running",
-                    "cancel": "cancelled",
-                }[args.command]
+                target_status = {"pause": "paused", "cancel": "cancelled"}[args.command]
                 result = service.transition_run(run_id, target_status, current["version"])
             elif args.command == "trace":
                 result = {"run_id": run_id, "events": service.trace_run(run_id)}

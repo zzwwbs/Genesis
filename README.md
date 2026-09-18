@@ -112,7 +112,14 @@ svc.export_run("exp-1-<condition-id>-1", "exports/run")      # one run's evidenc
 svc.export_experiment("exp-1", "exports/exp-1-tables")        # every cell, stacked tables
 ```
 
-For a single run without a protocol, `svc.execute_run("<run-id>")` executes it (deterministic-only studies can pass `executor_overrides`). A run can be paused, resumed or cancelled (`POST /runs/{id}/pause|resume|cancel`); a paused run resumes where it stopped with `execute_run`. `max_events` is a spend guard: a run stopped by it is recorded as `stopped_by: max_events`, never as a finished run.
+For a single run without a protocol, `svc.execute_run("<run-id>")` executes it (deterministic-only studies can pass `executor_overrides`). `max_events` is a spend guard: a run stopped by it is recorded as `stopped_by: max_events`, never as a finished run.
+
+**Interruptions.** Every completed call is committed before the next starts, so a run continues from its last committed event:
+
+- **Pause** (`POST /runs/{id}/pause`, `genesis pause`) stops a run once the calls in flight finish; **resume** (`svc.resume_run`, `POST /runs/{id}/resume`, `genesis resume --run-id <id>`) continues it — also after GENESIS was restarted, or when the process running it stopped.
+- **Provider problems pause instead of failing.** Rate limits, timeouts and server errors are retried with back-off first. If the provider still cannot serve a call — out of credit (HTTP 402), a rejected key (401/403), rate limiting or an outage that outlasts the retries — the run pauses, the call is not counted as a failure, and the run's latest execution records why (`paused_by`). Fix the cause, then resume. A protocol reports such cells under `paused_runs`. Errors in the study itself (an invalid request, invalid output, a bug in study code) still fail the run.
+- **One process per run.** Executing a run takes a lease in the workspace database, renewed while it runs. Another process asking to execute the same run is refused; a lease whose holder crashed expires after two minutes and can then be taken over.
+- `retry_policy` is `{max_attempts, failure_policy: fail_run|use_declared_fallback|skip_with_event, fallback_outputs}`; any other key is refused at compile.
 
 ## 5. Implementing processes
 
@@ -147,7 +154,7 @@ Analysis is data-first: GENESIS supplies the tables, the researcher computes the
 | Model profiles | `GET/POST /llm/profiles` · `POST /llm/profiles/{id}/test` |
 | Import a package | `POST /imports` (`source`, optional `specification_id`) |
 | Plan or realise a protocol | `POST /runs/{id}/protocol` (`replications`, `only_conditions`, `initializations`, `max_events`, `plan`, `parallel`) |
-| Execute, pause, resume, cancel a run | `POST /runs/{id}/execute` · `POST /runs/{id}/pause` · `/resume` · `/cancel` |
+| Execute, pause, resume, cancel a run | `POST /runs/{id}/execute` · `POST /runs/{id}/pause` · `POST /runs/{id}/resume` (executes) · `POST /runs/{id}/cancel` |
 | Trace events | `GET /runs/{id}/events` |
 | Declared / per-actor trace | `GET /runs/{id}/natural-trace[?trace=&actor=&phase=]` |
 | Outcomes | `GET /runs/{id}/outcomes` |
@@ -196,6 +203,7 @@ Open `/ui` → **Run**:
 2. **Read this build back** (optional): a model restates the compiled study in plain language, blind to your stated intent, so you can check it says what you meant.
 3. **Plan — costs nothing** shows how many runs and events a choice of replications, conditions, worlds and event cap implies. **Execute protocol** then runs exactly the planned settings.
 4. Every run freezes a manifest: build and compiler hashes, model and prompt versions, condition, random streams and seeds, data provenance, and the event cap.
+5. **Run control** — pick a running, paused or waiting run to **Pause**, **Resume** or **Cancel** it. A run that paused itself because its model provider could not serve it (out of credit, a rejected key, an outage) shows the reason here; fix it, then resume.
 
 ## 4. Outputs
 

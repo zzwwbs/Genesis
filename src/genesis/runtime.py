@@ -27,6 +27,7 @@ from genesis.information_timing import (
 
 # measurement imports runtime lazily, inside its functions, so this does not cycle.
 from genesis.measurement import withheld_sources, withhold_instances
+from genesis.provider_errors import is_provider_cancellation, provider_pause_reason
 from genesis.state_encoding import identical
 
 _ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
@@ -143,6 +144,14 @@ class _ReportedProcessFailure(RuntimeError):
     """Internal marker preventing a declared failed result being recorded twice."""
 
 
+class _ProviderPause(RuntimeError):
+    """A call the provider could not serve; the run pauses rather than fails."""
+
+    def __init__(self, reason: Mapping[str, Any]) -> None:
+        super().__init__(str(reason.get("error", "provider unavailable")))
+        self.reason = dict(reason)
+
+
 def _resolve_path(source: Mapping[str, Any], path: str) -> Any:
     if not isinstance(path, str) or not path or ".." in path or path.startswith("/"):
         raise ValueError("condition path must be a safe dotted path")
@@ -160,6 +169,73 @@ def _resolve_path(source: Mapping[str, Any], path: str) -> Any:
         else:
             return None
     return value
+
+
+def _resolve_per(per: Mapping[str, Any], actor_id: str) -> dict[str, Any]:
+    """The per selector with ``${actor}`` bound to this turn's outer actor."""
+    resolved = dict(per)
+    source = resolved.get("source")
+    if isinstance(source, str):
+        resolved["source"] = source.replace("${actor}", actor_id)
+    return resolved
+
+
+def _selector_ids(
+    selector: Mapping[str, Any],
+    state: Mapping[str, Any],
+    *,
+    what: str,
+    allow_missing: bool = False,
+) -> list[str]:
+    """The actor ids one selector draws, in a deterministic order.
+
+    Shared by the outer selector and by ``per``, so a nested selector resolves
+    its source exactly the way a top-level one does.
+    """
+    if selector.get("ids") is not None:
+        raw_ids = selector.get("ids")
+        if not isinstance(raw_ids, list | tuple):
+            raise ValueError(f"{what} ids must be a list")
+        return [_check_id(str(actor), "actor_id") for actor in raw_ids]
+    source = selector.get("source")
+    if not isinstance(source, str):
+        raise ValueError(f"{what} requires ids or source")
+    records = _resolve_path(state, source)
+    if records is None:
+        # A per source names a path under one actor's own record. That the actor
+        # has no such record yet is an ordinary state of the world -- they have
+        # not acted this round -- not a broken declaration.
+        if allow_missing:
+            return []
+        raise ValueError(f"{what} source is unavailable: {source}")
+    if isinstance(records, Mapping):
+        records = list(records.values())
+    if not isinstance(records, list | tuple):
+        raise ValueError(f"{what} source must resolve to a list or mapping")
+    id_field = str(selector.get("id_field", "id"))
+    ids = [
+        _check_id(str(record.get(id_field) if isinstance(record, Mapping) else record), "actor_id")
+        for record in records
+    ]
+    ids.sort()
+    return ids
+
+
+def actor_roles(process: Mapping[str, Any]) -> tuple[str, ...]:
+    """The role name of each position in this process's actor groups.
+
+    A process without a ``per`` selector has one role, so an output's actor
+    field can name it or stay an unqualified list. A paired process has two, and
+    an actor field has to say which one it means.
+    """
+    actors = process.get("actors")
+    if not isinstance(actors, Mapping):
+        return ("actor",)
+    roles = [str(actors.get("role") or "actor")]
+    per = actors.get("per")
+    if isinstance(per, Mapping):
+        roles.append(str(per.get("role") or "per"))
+    return tuple(roles)
 
 
 def expand_actor_instances(
@@ -181,30 +257,31 @@ def expand_actor_instances(
     if not isinstance(actors, Mapping):
         raise ValueError("actors must be a list or actor selector")
     fan_out = bool(actors.get("fan_out", True))
-    if actors.get("ids") is not None:
-        raw_ids = actors.get("ids")
-        if not isinstance(raw_ids, list | tuple):
-            raise ValueError("actor selector ids must be a list")
-        ids = [_check_id(str(actor), "actor_id") for actor in raw_ids]
-    else:
-        source = actors.get("source")
-        if not isinstance(source, str):
-            raise ValueError("actor selector requires ids or source")
-        records = _resolve_path(state, source)
-        if records is None:
-            raise ValueError(f"actor selector source is unavailable: {source}")
-        if isinstance(records, Mapping):
-            records = list(records.values())
-        if not isinstance(records, list | tuple):
-            raise ValueError("actor selector source must resolve to a list or mapping")
-        id_field = str(actors.get("id_field", "id"))
-        ids = []
-        for record in records:
-            actor = record.get(id_field) if isinstance(record, Mapping) else record
-            ids.append(_check_id(str(actor), "actor_id"))
-        ids.sort()
+    ids = _selector_ids(actors, state, what="actor selector")
     if len(ids) != len(set(ids)):
         raise ValueError("actor selector produced duplicate actor ids")
+    per = actors.get("per")
+    if per is not None:
+        if not isinstance(per, Mapping):
+            raise ValueError("actor selector per must be a mapping")
+        if not fan_out:
+            # A per selector exists to make one invocation per inner record; with
+            # fan_out off there is a single invocation and nothing to pair it to.
+            raise ValueError("actor selector per requires fan_out")
+        groups: list[tuple[str, ...]] = []
+        for actor_id in ids:
+            resolved = _resolve_per(per, actor_id)
+            inner = _selector_ids(resolved, state, what="actor selector per", allow_missing=True)
+            if len(inner) != len(set(inner)):
+                raise ValueError(
+                    f"actor selector per produced duplicate ids for actor '{actor_id}'"
+                )
+            # An actor whose inner source is empty takes no turn at all: a reader
+            # who opened nothing is not asked what they thought of it.
+            groups.extend((actor_id, inner_id) for inner_id in inner)
+        if len(groups) != len(set(groups)):
+            raise ValueError("actor selector produced duplicate actor groups")
+        return groups
     if not ids:
         return []
     return [(actor_id,) for actor_id in ids] if fan_out else [tuple(ids)]
@@ -751,10 +828,21 @@ def _project_nested(item: Any, paths: frozenset[str], project: Any) -> Any | Non
     """
     if isinstance(item, Mapping):
         return project(item, paths)
-    if isinstance(item, list | tuple) and any(isinstance(entry, Mapping) for entry in item):
-        return [
-            project(entry, paths) if isinstance(entry, Mapping) else _plain(entry) for entry in item
-        ]
+    if isinstance(item, list | tuple) and any(
+        isinstance(entry, Mapping | list | tuple) for entry in item
+    ):
+        # A list of lists of records is still the collection the projection
+        # names. Recursing only one level made the rule a silent no-op there:
+        # declared, compiled, and handing over the field it promised to
+        # withhold, which is the failure this whole function exists to prevent.
+        projected = []
+        for entry in item:
+            if isinstance(entry, Mapping):
+                projected.append(project(entry, paths))
+                continue
+            nested = _project_nested(entry, paths, project)
+            projected.append(_plain(entry) if nested is None else nested)
+        return projected
     return None
 
 
@@ -1586,23 +1674,52 @@ def _stamp_engine_fields(
         value = outputs.get(artifact_type)
         if not isinstance(value, Mapping):
             continue
-        if decl.get("actor_fields") and len(actor_ids) != 1:
-            return replace(
-                result,
-                status="failed",
-                metadata={
-                    **_plain(result.metadata),
-                    "code": "OUTPUT_ACTOR_FIELD_AMBIGUOUS",
-                    "error": (
-                        f"output '{artifact_type}' declares actor fields, but the invocation "
-                        f"has {len(actor_ids)} actors; an actor field needs exactly one"
-                    ),
-                },
-            )
+        actor_fields = decl.get("actor_fields")
+        roles = actor_roles(process)
+        if isinstance(actor_fields, Mapping):
+            # A paired invocation names which role each field takes, so the
+            # reader's id and the article's id land in their own fields.
+            named = [str(role) for role in actor_fields.values()]
+            unknown = [role for role in named if role not in roles]
+            # Two fields naming one role both receive that actor, so the other
+            # id is silently lost -- an article reaction attributed to the
+            # reader in both of its id fields. The declaration cannot mean what
+            # it says, so it is refused rather than half-applied.
+            repeated = len(named) != len(set(named))
+            if unknown or repeated or len(actor_ids) != len(roles):
+                return replace(
+                    result,
+                    status="failed",
+                    metadata={
+                        **_plain(result.metadata),
+                        "code": "OUTPUT_ACTOR_FIELD_AMBIGUOUS",
+                        "error": (
+                            f"output '{artifact_type}' maps actor fields to roles "
+                            f"{named}, but this process declares roles {list(roles)} and "
+                            f"the invocation has {len(actor_ids)} actors"
+                            + ("; a role may be named only once" if repeated else "")
+                        ),
+                    },
+                )
+            written: list[tuple[Any, Any]] = [
+                (name, actor_ids[roles.index(str(role))]) for name, role in actor_fields.items()
+            ]
+        else:
+            if actor_fields and len(actor_ids) != 1:
+                return replace(
+                    result,
+                    status="failed",
+                    metadata={
+                        **_plain(result.metadata),
+                        "code": "OUTPUT_ACTOR_FIELD_AMBIGUOUS",
+                        "error": (
+                            f"output '{artifact_type}' declares actor fields, but the invocation "
+                            f"has {len(actor_ids)} actors; name the role each field takes"
+                        ),
+                    },
+                )
+            written = [(name, actor_ids[0] if actor_ids else None) for name in actor_fields or ()]
         stamped = dict(_plain(value))
-        written: list[tuple[Any, Any]] = [
-            (name, actor_ids[0] if actor_ids else None) for name in decl.get("actor_fields") or ()
-        ]
         written += [(name, phase) for name in decl.get("phase_fields") or ()]
         for name, engine_value in written:
             if stamped.get(name) != engine_value:
@@ -2130,6 +2247,13 @@ def _declared_order(process: Mapping[str, Any]) -> tuple[tuple[str, ...], ...] |
     actors = process.get("actors")
     if isinstance(actors, Mapping) and actors.get("ids") is None:
         return None
+    if isinstance(actors, Mapping) and actors.get("per") is not None:
+        # A paired selector draws its inner half from state, so listed outer ids
+        # do not reproduce the order either: against an empty state the
+        # expansion is empty, and an empty tuple is not None, so the callers
+        # that test `is None` silently stopped recording batch_actors and
+        # refused to reopen an interrupted batch (CON-008/CON-010).
+        return None
     try:
         return tuple(expand_actor_instances(process, {}))
     except ValueError:
@@ -2178,6 +2302,16 @@ class RunController:
         # indistinguishable from reaching the declared termination. A run that
         # was cut short is not the study the researcher declared, so say so.
         self.budget_exhausted = False
+        # Why the run paused itself, when a provider could not serve a call.
+        self.pause_reason: dict[str, Any] | None = None
+        # Set when another process took the run over mid-execution.
+        self.lease_lost = False
+        # The last declared phase of this run, for stopped_with_work_remaining.
+        self._terminal_phase: int | None = None
+        self._executed: list[str] = []
+        # Invocation id -> the highest attempt already committed, so a resumed
+        # run continues after it instead of re-emitting a committed attempt id.
+        self._committed_attempts: dict[str, int] = {}
         self.state_store, self.persistence = state_store, persistence
         self.artifact_store = artifact_store
         self.output_schema_validator = output_schema_validator
@@ -2563,8 +2697,20 @@ class RunController:
 
     @staticmethod
     def _state_delta(before: Mapping[str, Any] | None, after: Mapping[str, Any]) -> dict[str, Any]:
+        """What this turn changed, by identity rather than by equality.
+
+        ``!=`` calls 1 and 1.0, True and 1, -0.0 and 0.0 unchanged, so those
+        transitions were left out of the recorded delta -- which is the
+        authoritative source a partial replay applies. The state history kept
+        the new bytes and the ledger kept none, so a replay of the frozen prefix
+        diverged from its source in exactly the bytes the commit identity is
+        digested from. ``StateStore.apply`` and ``encode_patch`` already compare
+        this way; this was the remaining ``!=``.
+        """
         before = before or {}
-        delta = {key: value for key, value in after.items() if before.get(key) != value}
+        delta = {
+            key: value for key, value in after.items() if not identical(before.get(key), value)
+        }
         delta.update({key: None for key in before if key not in after})
         return delta
 
@@ -2625,6 +2771,19 @@ class RunController:
                 self._recorded_batch_orders.setdefault(
                     (str(event.get("process_id")), event.get("phase", 0)),
                     tuple(tuple(str(actor) for actor in group) for group in order),
+                )
+        # How far each invocation's retries already got. A resume restarted the
+        # retry loop at attempt 1 and re-emitted an attempt id that was already
+        # committed -- with a different dispatch order and state version, which
+        # persistence rejects as a differing commit, leaving the run
+        # permanently unresumable. The cursor is derived from the ledger rather
+        # than persisted separately, so it survives any restart.
+        for event in events:
+            invocation = str(event.get("invocation_id") or "")
+            attempt = event.get("attempt")
+            if invocation and isinstance(attempt, int):
+                self._committed_attempts[invocation] = max(
+                    self._committed_attempts.get(invocation, 0), attempt
                 )
         if events:
             self._last_event_id = str(events[-1].get("event_id")) or None
@@ -2858,11 +3017,43 @@ class RunController:
                 )
         return expanded
 
+    @property
+    def stopped_with_work_remaining(self) -> bool:
+        """Whether stopping left declared work undone.
+
+        A lease lost after the last declared phase had committed is not a run
+        that stopped early: reporting it as one left the run 'running' with a
+        complete record, and a later resume was refused for a process that was
+        not running. Computed rather than set at the break, because the run has
+        several exit points and only one of them is that break.
+        """
+        if self._terminal_phase is None:
+            return True
+        return int(self._next_phase or 0) <= int(self._terminal_phase)
+
+    def _next_attempt(self, invocation_id: str) -> int:
+        """The attempt number to dispatch next for one invocation.
+
+        One past whatever the ledger already holds, so a run resumed after a
+        failed attempt continues its retries instead of re-emitting a committed
+        attempt id under a different dispatch order.
+        """
+        return self._committed_attempts.get(str(invocation_id), 0) + 1
+
+    def _record_committed_attempt(self, invocation_id: str, attempt: int) -> None:
+        self._committed_attempts[str(invocation_id)] = max(
+            self._committed_attempts.get(str(invocation_id), 0), int(attempt)
+        )
+
     def _poll_external_status(self) -> bool:
         """Sync run control from persisted status (service/API cancellation)."""
         if self.status_provider is None or self.status in {"cancelled", "paused"}:
             return self.status in {"cancelled", "paused"}
         external = self.status_provider()
+        if external == "lease_lost":
+            # Another process holds the run now; stop without claiming an outcome.
+            self.status, self.lease_lost = "paused", True
+            return True
         if external in {"cancelled", "paused"}:
             self.status = external
             return True
@@ -3055,6 +3246,11 @@ class RunController:
                         outputs=dict(retry_policy.get("fallback_outputs", {})),
                         metadata={**_plain(result.metadata), "skipped_fallback": True},
                     )
+            # Only a succeeded result commits outputs. A skip_with_event policy
+            # keeps its fallback_outputs on the result for the trace, but the
+            # skipped branch below commits no artifacts and an empty state
+            # delta, so there is nothing to stamp or validate; running the guard
+            # there would only turn a clean skip into a failure.
             if result.status == "succeeded":
                 result = _stamp_engine_fields(result, turn.process, call.actor_ids, call.phase)
             # F3/SCH-002: every declared artifact output — including a
@@ -3144,6 +3340,7 @@ class RunController:
                         [],
                     )
                     self._persisted_count += 1
+                    self._record_committed_attempt(call.invocation_id, attempt)
                     self._sync_persisted_state_version()
                     self._last_event_id = failed_event_id
                     self.commit_log.append(
@@ -3193,6 +3390,7 @@ class RunController:
                     )
                     persistence_committed = True
                     self._persisted_count += 1
+                    self._record_committed_attempt(call.invocation_id, attempt)
                     self._sync_persisted_state_version()
                     self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
                     self.commit_log.append(
@@ -3384,6 +3582,7 @@ class RunController:
                 )
                 persistence_committed = True
                 self._persisted_count += 1
+                self._record_committed_attempt(call.invocation_id, attempt)
                 self._sync_persisted_state_version()
                 self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
             commit_order = len(self.commit_log) + 1
@@ -3442,6 +3641,30 @@ class RunController:
                 and self.artifact_store is not None
             ):
                 self.artifact_store.restore(artifact_before)
+            # Checked before anything is recorded: the provider could not serve
+            # the call, so there is no attempt to count against the process and
+            # nothing to commit. Recording it as failed made the run terminal.
+            pause = provider_pause_reason(exc) if not executor_returned else None
+            if (
+                pause is None
+                and not executor_returned
+                and not persistence_committed
+                and is_provider_cancellation(exc)
+                and self._poll_external_status()
+            ):
+                # The researcher paused or cancelled this run, or the lease moved
+                # on: the call was aborted on purpose, so it is not an attempt
+                # that failed. Recording it as one made the run terminal, and a
+                # resume then re-emitted this attempt's event id.
+                pause = {
+                    "kind": "cancelled" if self.status == "cancelled" else "researcher_paused",
+                    "status": None,
+                    "error": "the call was stopped by the researcher",
+                }
+            if pause is not None and not persistence_committed:
+                raise _ProviderPause(
+                    {**pause, "process_id": turn.process_id, "phase": turn.phase}
+                ) from exc
             if not failure_recorded:
                 failure = {
                     "invocation_id": call.invocation_id,
@@ -3489,6 +3712,7 @@ class RunController:
                     self.status = "failed"
                     raise
                 self._persisted_count += 1
+                self._record_committed_attempt(call.invocation_id, attempt)
                 self._sync_persisted_state_version()
                 self._last_event_id = f"{call.invocation_id}-attempt-{attempt}"
                 failure_persisted = True
@@ -3732,7 +3956,7 @@ class RunController:
         outcome: ProcessResult | _ExecutorRaised,
     ) -> None:
         """Commit one actor's executed attempt, then any retries, in serial order."""
-        attempt = 1
+        attempt = self._next_attempt(call.invocation_id)
         while True:
             dispatch_order = self._log_dispatch(turn, call, attempt)
             if self._commit_attempt(turn, call, dispatch_order, attempt, outcome):
@@ -3950,7 +4174,27 @@ class RunController:
             f"'{scope.run_id}' cannot be read to rebuild a simultaneous batch's view"
         )
 
-    def run(
+    def run(self, run_id: str, *args: Any, **kwargs: Any) -> list[str]:
+        """Execute the run until it ends, pauses, is cancelled or reaches its cap.
+
+        A call the provider cannot serve -- no credit, a rejected key, an outage
+        that outlasted the retries -- pauses the run instead of failing it. The
+        call is not recorded as a failure: nothing it would have produced was
+        committed, and resuming runs it again. ``pause_reason`` says why.
+        """
+        try:
+            return self._run_body(run_id, *args, **kwargs)
+        except _ProviderPause as pause:
+            # A cancel that aborted an in-flight call already set the status;
+            # cancelled is final and must not be downgraded to paused.
+            if pause.reason.get("kind") != "cancelled":
+                self.status = "paused"
+                self.pause_reason = pause.reason
+            else:
+                self.status = "cancelled"
+            return list(self._executed)
+
+    def _run_body(
         self,
         run_id: str,
         phase_limit: int = 100,
@@ -3973,6 +4217,7 @@ class RunController:
         if self._run_id is not None and self._run_id != run_id:
             raise ValueError("controller cannot be reused for a different run")
         self.status, self._run_id = "running", run_id
+        self._terminal_phase = terminal_phase
         self._phase_start = int(phase_start)
         if self.state_store is None and state is not None:
             # A caller may provide a lightweight initial snapshot without a
@@ -3986,6 +4231,7 @@ class RunController:
             self.status = "completed"
             return []
         executed: list[str] = []
+        self._executed = executed
         condition = dict(condition or {})
         matching = dict(matching or {})
         scope = _RunScope(
@@ -4188,7 +4434,8 @@ class RunController:
                     feedback_slots=feedback_slots,
                     view=self._batch_views.get(actor_key),
                 )
-                for attempt in range(1, max_attempts + 1):
+                first_attempt = self._next_attempt(self._prepare_call(scope, turn, 1).invocation_id)
+                for attempt in range(first_attempt, max_attempts + 1):
                     call = self._prepare_call(scope, turn, attempt)
                     dispatch_order = self._log_dispatch(turn, call, attempt)
                     outcome = self._execute_call(turn, call)

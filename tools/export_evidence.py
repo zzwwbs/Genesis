@@ -11,7 +11,9 @@ Produces:
                                              user response event -> recorded downstream effects
 - evidence/README.md                        - evidence map (item -> file -> what to show)
 
-No model calls are made; only versioned/derived files are written.
+No model calls are made. Only the files listed above are written, and only those
+are removed on a re-export: curated evidence such as `evidence/traces/` is left
+alone.
 """
 
 from __future__ import annotations
@@ -43,12 +45,34 @@ def objs(digest: str):
     return None
 
 
+def _clear_owned_outputs() -> None:
+    """Remove the files this tool writes, and nothing else.
+
+    It used to rmtree the whole evidence directory, which also holds `traces/`
+    -- excerpts written by tools/export_traces.py, which this tool does not
+    regenerate. docs/ is gitignored, so a routine export silently destroyed
+    curated evidence with no copy anywhere.
+    """
+    if not OUT.is_dir():
+        return
+    for path in OUT.iterdir():
+        owned = (
+            path.name == "README.md"
+            or (path.name.startswith("theory-") and path.suffix == ".yaml")
+            or (path.name.startswith("run-manifest-") and path.suffix == ".json")
+            or (path.name.startswith("trace-chain-") and path.suffix == ".json")
+            or (path.is_dir() and path.name.startswith("compiled-build-"))
+        )
+        if not owned:
+            continue
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+
+
 def main() -> int:
     import sqlite3
 
-    if OUT.is_dir():
-        shutil.rmtree(OUT)
-    OUT.mkdir(parents=True)
+    _clear_owned_outputs()
+    OUT.mkdir(parents=True, exist_ok=True)
 
     # 1) theory spec (5.2)
     shutil.copy(PACKAGE / "theory.yaml", OUT / "theory-pilot-large.yaml")

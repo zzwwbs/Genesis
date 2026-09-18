@@ -9,11 +9,13 @@ import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import stat
 import statistics
 import tempfile
 import threading
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -329,6 +331,43 @@ def _table_order(row: Mapping[str, Any]) -> tuple[str, float]:
     return (str(row.get("run_id", "")), numeric)
 
 
+class _RunLease:
+    """A run's execution lease, renewed on a background thread while it runs."""
+
+    def __init__(
+        self, persistence: PersistenceCoordinator, run_id: str, owner: str, ttl: float
+    ) -> None:
+        self.persistence, self.run_id, self.owner, self.ttl = persistence, run_id, owner, ttl
+        self.lost = threading.Event()
+        self._stopped = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.persistence.acquire_run_lease(self.run_id, self.owner, self.ttl)
+        self._thread = threading.Thread(
+            target=self._renew, name=f"genesis-lease-{self.run_id}", daemon=True
+        )
+        self._thread.start()
+
+    def _renew(self) -> None:
+        while not self._stopped.wait(self.ttl / 4):
+            try:
+                if not self.persistence.renew_run_lease(self.run_id, self.owner, self.ttl):
+                    self.lost.set()
+                    return
+            except Exception:  # noqa: BLE001 - a missed renewal is retried next tick
+                continue
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        try:
+            self.persistence.release_run_lease(self.run_id, self.owner)
+        except Exception:  # noqa: BLE001 - an unreleased lease expires on its own
+            pass
+
+
 def _cell_columns(run_id: str, run: Mapping[str, Any]) -> dict[str, Any]:
     """Which run and cell a dataset row came from, as flat columns.
 
@@ -632,7 +671,9 @@ def _workflow_schema(name: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _run_trial_worker(workspace: str, trial_id: str) -> tuple[bool, str]:
+def _run_trial_worker(
+    workspace: str, trial_id: str, max_concurrency: int | Mapping[str, int] | None = None
+) -> tuple[bool, str]:
     """Process-pool worker: opens its own coordinator and executes one trial.
 
     A fresh GenesisService per worker keeps SQLite connections process-local;
@@ -642,7 +683,7 @@ def _run_trial_worker(workspace: str, trial_id: str) -> tuple[bool, str]:
     """
     service = GenesisService(workspace)
     try:
-        service.execute_run(trial_id)
+        service.execute_run(trial_id, max_concurrency=max_concurrency)
         status = str(service.get_run(trial_id)["status"])
         return (status == "completed", "" if status == "completed" else f"status={status}")
     except Exception as exc:
@@ -765,6 +806,32 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("PROPOSAL_INVALID: response JSON must be an object")
     return value
+
+
+def _joined_relation_name(left: str, right: str, on: str) -> str:
+    """The name a joined relation is held under while outcomes are evaluated.
+
+    It carries `on`: two outcomes joining the same pair on different keys shared
+    one relation, and because every plan is built before any is evaluated, the
+    last declaration won for both. An outcome's result then changed because of a
+    different outcome declared beside it.
+    """
+    return f"{left}+{right}+{on}"
+
+
+def _safe_path_name(value: str, what: str) -> str:
+    """One path segment, refused if it could reach outside its directory.
+
+    An imported run's id is caller-supplied and was interpolated straight into a
+    build path, so "../../pwned" escaped the workspace entirely.
+    """
+    text = str(value)
+    if not text or text in {".", ".."} or any(sep in text for sep in ("/", "\\", "\x00")):
+        raise ValueError(
+            f"IMPORT_RUN: {what} '{text}' is not a single path-safe name; it must not "
+            "contain a path separator or climb out of the workspace"
+        )
+    return text
 
 
 def _validated_max_events(value: Any, code: str) -> int | None:
@@ -1214,6 +1281,9 @@ class GenesisService:
         # run's work and provider spend.
         self._executing_runs: set[str] = set()
         self._executing_lock = threading.Lock()
+        # Who holds a run's execution lease: unique to this service instance.
+        self._lease_owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        self._leases: dict[str, _RunLease] = {}
         # The profile store is read, modified and rewritten as a whole; concurrent
         # API requests would otherwise lose or corrupt each other's writes (M4).
         self._profiles_lock = threading.RLock()
@@ -3011,13 +3081,39 @@ class GenesisService:
                     f"RUN_ALREADY_EXECUTING: run '{run_id}' is already executing in this process"
                 )
             self._executing_runs.add(run_id)
+        lease: _RunLease | None = None
         try:
+            # The in-process set cannot see another process. The lease can: a
+            # script resuming a run that a server is still executing is refused
+            # instead of writing a second execution into the same record.
+            lease = _RunLease(self.persistence, run_id, self._lease_owner, self.LEASE_TTL_SECONDS)
+            lease.start()
+            self._leases[run_id] = lease
             return self._execute_claimed_run(
                 run_id, executor_overrides=executor_overrides, max_concurrency=override
             )
         finally:
+            if lease is not None:
+                lease.stop()
+                self._leases.pop(run_id, None)
             with self._executing_lock:
                 self._executing_runs.discard(run_id)
+
+    def resume_run(
+        self, run_id: str, *, max_concurrency: int | Mapping[str, int] | None = None
+    ) -> dict[str, Any]:
+        """Continue a run that paused, or whose executing process stopped.
+
+        Resuming used to be a status change only: 'resume' set the run running and
+        nothing executed it. It now executes the run from its last committed event.
+        """
+        run = self.get_run(run_id)
+        if run["status"] not in {"paused", "running"}:
+            raise ValueError(
+                f"RUN_TRANSITION: only a paused or interrupted run can be resumed; "
+                f"run '{run_id}' is {run['status']}"
+            )
+        return self.execute_run(run_id, max_concurrency=max_concurrency)
 
     def _execute_claimed_run(
         self,
@@ -3081,9 +3177,11 @@ class GenesisService:
                 max_concurrency=max_concurrency,
                 resumed_from=resumed_from if resumed_from != "created" else None,
             )
-        except Exception:
+        except Exception as exc:
             latest = self.get_run(run_id)
-            if latest["status"] == "running":
+            # A lost lease means another process holds the run: its status is that
+            # process's to set, and marking it failed would end a run still going.
+            if latest["status"] == "running" and not str(exc).startswith("RUN_LEASE_LOST"):
                 self.persistence.transition_run(run_id, "failed", latest["version"])
             raise
 
@@ -3277,6 +3375,12 @@ class GenesisService:
         cancel_event = threading.Event()
 
         def _status_provider() -> str:
+            lease = self._leases.get(run_id)
+            if lease is not None and lease.lost.is_set():
+                # Another process took the run over after this one stopped
+                # renewing its lease: stop, and leave the run's status to it.
+                cancel_event.set()
+                return "lease_lost"
             status = str(self.get_run(run_id).get("status", "running"))
             if status in {"cancelled", "paused"}:
                 cancel_event.set()
@@ -3489,9 +3593,30 @@ class GenesisService:
             raise
         # A run cut short by its event cap must say so even when nothing else
         # about the execution was worth recording.
-        if execution_recorded or controller.budget_exhausted:
+        if execution_recorded or controller.budget_exhausted or controller.pause_reason:
             self._record_execution_outcome(run_id, controller)
         self._record_process_instances(run_id, controller)
+        if getattr(controller, "lease_lost", False) and getattr(
+            controller, "stopped_with_work_remaining", True
+        ):
+            # A lease lost in the final phase, after the controller committed
+            # every declared turn, left the run 'running' with a complete
+            # record: execute_protocol reported a finished cell as failed, and a
+            # later resume was refused with RUN_ALREADY_EXECUTING naming a
+            # process that was not running. The raise is for a run that still
+            # had work to do -- the case its own message describes.
+            raise ValueError(
+                f"RUN_LEASE_LOST: run '{run_id}' was taken over by another process after "
+                "this one stopped renewing its lease; this execution stopped without "
+                "changing the run"
+            )
+        if getattr(controller, "lease_lost", False):
+            # The work is done and the record is complete, so the run is settled
+            # here rather than left running for an owner that has nothing to do.
+            latest = self.get_run(run_id)
+            if latest["status"] == "running":
+                return self.persistence.transition_run(run_id, "completed", latest["version"])
+            return latest
         latest = self.get_run(run_id)
         if controller.status == "cancelled":
             # The cancel that stopped the controller was usually persisted by the
@@ -3518,10 +3643,17 @@ class GenesisService:
             # truncated cell and a full one are indistinguishable in the record
             # and would be compared as though they were the same study.
             outcome["stopped_by"] = "max_events"
+        reason = getattr(controller, "pause_reason", None)
+        if reason:
+            # Why the run paused itself -- out of credit, a rejected key, an
+            # outage -- so the researcher knows what to fix before resuming.
+            outcome["paused_by"] = {**reason, "at": datetime.now(UTC).isoformat()}
         if not outcome:
             return
         try:
-            if outcome.get("stopped_by") and not self.get_run(run_id).get("executions"):
+            if (outcome.get("stopped_by") or outcome.get("paused_by")) and not self.get_run(
+                run_id
+            ).get("executions"):
                 # A study with no model profiles records no execution segment,
                 # and the merge below silently drops updates when there is none
                 # to merge into -- losing exactly the fact that matters most.
@@ -3572,6 +3704,7 @@ class GenesisService:
         parallel: bool = False,
         max_workers: int = 4,
         worker_kind: str | None = None,
+        max_concurrency: int | Mapping[str, int] | None = None,
     ) -> dict[str, Any]:
         """Expand worlds x conditions x replications into runs (REP-004, AW-13).
 
@@ -3740,8 +3873,19 @@ class GenesisService:
 
         def dispatch_one(trial_id: str) -> tuple[bool, str]:
             try:
-                self.execute_run(trial_id, executor_overrides=executor_overrides)
-                status = str(self.get_run(trial_id)["status"])
+                # Concurrent model calls within each run; how many runs execute at
+                # once is max_workers. Operational, so it never enters the manifest.
+                self.execute_run(
+                    trial_id,
+                    executor_overrides=executor_overrides,
+                    max_concurrency=max_concurrency,
+                )
+                run = self.get_run(trial_id)
+                status = str(run["status"])
+                if status == "paused":
+                    paused_by = (run.get("executions") or [{}])[-1].get("paused_by") or {}
+                    detail = f": {paused_by['error']}" if paused_by.get("error") else ""
+                    return False, f"status=paused{detail}"
                 return (status == "completed", "" if status == "completed" else f"status={status}")
             except Exception as exc:
                 return False, f"{type(exc).__name__}: {exc}"
@@ -3758,7 +3902,9 @@ class GenesisService:
                     )
                 from functools import partial
 
-                worker = partial(_run_trial_worker, str(self.workspace))
+                worker = partial(
+                    _run_trial_worker, str(self.workspace), max_concurrency=max_concurrency
+                )
                 with ProcessPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
                     outcomes = _dispatch_bounded(pool, worker, trial_ids, max_workers)
             else:
@@ -3772,6 +3918,14 @@ class GenesisService:
             for trial_id, (ok, diagnostic) in zip(trial_ids, outcomes, strict=True)
             if not ok
         }
+        # A cell paused because its provider could not serve it has not failed:
+        # it resumes where it stopped, so it is reported apart from failures.
+        paused = {
+            trial_id: diagnostic
+            for trial_id, diagnostic in failures.items()
+            if diagnostic.startswith("status=paused")
+        }
+        failures = {key: value for key, value in failures.items() if key not in paused}
         failed_ids = list(failures)
         aggregates = self._cross_run_aggregates(run_ids)
         summary = {
@@ -3779,10 +3933,11 @@ class GenesisService:
             "runs": run_ids,
             "failed_runs": failed_ids,
             "failures": failures,
+            "paused_runs": paused,
             "aggregates": aggregates,
         }
         self.append_run_collection(run_id, "outcomes", summary)
-        return {**summary, "status": "completed" if not failed_ids else "partial"}
+        return {**summary, "status": "completed" if not failed_ids and not paused else "partial"}
 
     def _outcome_groupings(self, run_id: str) -> dict[str, tuple[str, ...]]:
         """Declared grouping keys per outcome id, from the run's pinned plan."""
@@ -4554,7 +4709,14 @@ class GenesisService:
             raise ValueError(
                 "IMPORT_BUILD: reproducibility bundle has no build_hash in build_manifest.json"
             )
-        build_dir = self.workspace / "builds" / f"{target_id}-imported-{build_hash[:8]}"
+        # The id comes from the caller or from the bundle's own manifest, and it
+        # was interpolated into a path unchecked: "../../pwned" wrote a complete
+        # executable build directory outside the workspace, reachable through
+        # POST /runs/import. resolve_path refuses what escapes; the separator
+        # check refuses a name that would nest the build somewhere unexpected
+        # inside it.
+        safe_id = _safe_path_name(target_id, "run id")
+        build_dir = self.resolve_path(f"builds/{safe_id}-imported-{build_hash[:8]}")
         build_dir.mkdir(parents=True, exist_ok=True)
         for name in executable_files:
             target = build_dir / name
@@ -5169,6 +5331,9 @@ class GenesisService:
             self.last_outcome_engine = "python"
             return None
 
+    # How long a run's execution lease lasts without renewal; renewed every quarter.
+    LEASE_TTL_SECONDS = 120.0
+
     # The build files that determine what a run did. An analysis build may
     # differ from a run's build only outside these.
     _EXECUTION_DEFINING_FILES = (
@@ -5401,7 +5566,7 @@ class GenesisService:
                 left = str(join.get("left", "events"))
                 right = str(join.get("right", "artifacts"))
                 on = str(join.get("on", "invocation_id"))
-                joined_name = f"{left}+{right}"
+                joined_name = _joined_relation_name(left, right, on)
                 sources[joined_name] = _hash_join(
                     _source_rows(sources, left), _source_rows(sources, right), on
                 )
@@ -5575,7 +5740,17 @@ class GenesisService:
             if str(source.get("kind", "")) == "artifacts":
                 # An artifact's value is already spread into the row's columns;
                 # its nested copy would repeat every field as one JSON cell.
-                raw_rows = [{k: v for k, v in row.items() if k != "value"} for row in raw_rows]
+                # A `value` column the dataset's own fields step created is a
+                # different thing: it was stripped too, so the column evaluated
+                # fine for outcomes but was missing from the exported table and
+                # the dictionary.
+                declared_fields = {
+                    str(step.get("name"))
+                    for step in (declared.get(name) or {}).get("fields") or []
+                    if isinstance(step, Mapping) and step.get("name")
+                }
+                if "value" not in declared_fields:
+                    raw_rows = [{k: v for k, v in row.items() if k != "value"} for row in raw_rows]
             # In run and round order: rows came out in storage order, so round 10
             # sorted before round 2 and a table read out of sequence.
             raw_rows.sort(key=_table_order)
@@ -6727,7 +6902,17 @@ class GenesisService:
                 )
         return invalidations
 
-    def _predicted_invalidations(self, workflow: Any, patch: Any) -> list[dict[str, Any]]:
+    def _predicted_invalidations(
+        self, workflow: Any, patch: Any, current_stage: str | None = None
+    ) -> list[dict[str, Any]]:
+        """What approving this patch would actually make stale.
+
+        The preview returned every rule target unconditionally while approval
+        skips any target that is not strictly downstream, so the researcher was
+        told an already-approved upstream layer had gone stale -- reachable
+        through the default workflow's `domain.states: [openness.inputs, ...]`
+        rule.
+        """
         touched: list[str] = []
         for operation in patch.operations:
             parts = [part for part in str(operation.path).split("/") if part]
@@ -6736,6 +6921,12 @@ class GenesisService:
             elif parts:
                 touched.append(parts[0])
         result: list[dict[str, Any]] = []
+        stage_ids = [stage.id for stage in workflow.stages]
+        current_index = (
+            stage_ids.index(current_stage)
+            if current_stage is not None and current_stage in stage_ids
+            else None
+        )
         for rule_key, targets in workflow.invalidation.items():
             if not any(
                 section == rule_key or section.startswith(rule_key + ".") for section in touched
@@ -6743,6 +6934,10 @@ class GenesisService:
                 continue
             for target in targets:
                 mapped = self._stage_for_section(workflow, target)
+                if mapped and current_index is not None:
+                    # The same filter _invalidate_downstream_stages applies.
+                    if mapped not in stage_ids or stage_ids.index(mapped) <= current_index:
+                        continue
                 if mapped:
                     result.append(
                         {
@@ -6955,7 +7150,9 @@ class GenesisService:
             ),
             live_directory=self._specification_dir(session.specification_id),
         )
-        preview["invalidations"] = self._predicted_invalidations(workflow, patch)
+        preview["invalidations"] = self._predicted_invalidations(
+            workflow, patch, session.current_stage
+        )
         # Carry forward acknowledgements already made against identical findings,
         # so regenerating a preview does not silently re-arm the gate.
         preview["intent_check"] = self._intent_check(

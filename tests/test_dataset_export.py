@@ -188,3 +188,64 @@ def test_table_rows_run_in_run_and_round_order() -> None:
         ("a", None),
         ("b", 1),
     ]
+
+
+def test_a_protocol_passes_its_concurrency_to_every_run(tmp_path: Path) -> None:
+    """max_concurrency was accepted by execute_run but not by execute_protocol,
+    so a protocol always ran each cell's model calls one at a time."""
+    service = GenesisService(tmp_path)
+    try:
+        draft = service.create_specification(STUDY)
+        service.approve_specification("tables", draft["version"], "researcher")
+        build = service.compile_study(None, "builds/tables", specification_id="tables")["path"]
+        service.create_run({"id": "exp", "study_id": "tables", "build": build})
+        seen: list[object] = []
+        original = service.execute_run
+
+        def execute_run(run_id: str, **kwargs: object) -> dict:
+            seen.append(kwargs.get("max_concurrency"))
+            return original(run_id, **kwargs)  # type: ignore[arg-type]
+
+        service.execute_run = execute_run  # type: ignore[method-assign]
+        service.execute_protocol(
+            "exp", executor_overrides={"tick": lambda _inv: {}}, max_concurrency=16
+        )
+        assert seen == [16, 16]
+    finally:
+        service.close()
+
+
+def test_a_dataset_may_declare_a_column_named_value(tmp_path: Path) -> None:
+    """Artifact rows drop their nested `value`, but not a column of that name.
+
+    The strip was unconditional, so a dataset whose own fields step created a
+    `value` column evaluated fine for outcomes while the exported table and the
+    data dictionary lost it (2026-09-14 M6).
+    """
+    import json
+
+    from genesis.service import GenesisService
+
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "outcome_plan.json").write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "id": "d",
+                        "source": {"kind": "artifacts", "artifact_type": "detection-result"},
+                        "fields": [
+                            {"name": "value", "op": "copy", "field": "detected"},
+                        ],
+                    }
+                ],
+                "outcomes": [],
+            }
+        )
+    )
+    rows = {"d": [{"artifact_id": "a1", "value": 1, "score": 3}]}
+    tables, dictionary = GenesisService._dataset_tables(rows, build)
+    assert "value" in tables["d"][0], "the declared column survives the artifact strip"
+    assert tables["d"][0]["value"] == 1
+    assert "value" in dictionary["d"]["columns"]

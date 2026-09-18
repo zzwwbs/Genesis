@@ -66,3 +66,22 @@ def test_order_and_shape_are_preserved_so_the_context_digest_is_stable() -> None
     assert [entry["id"] for entry in projected] == ["a1"]
     assert list(projected[0]) == ["id", "title", "authors"]
     assert isinstance(projected[0]["authors"], list)
+
+
+def test_a_projection_reaches_records_nested_inside_a_list_of_lists() -> None:
+    """One level of recursion left the rule a silent no-op for this shape.
+
+    A list whose entries are lists of records failed the guard, so the value was
+    handed over whole -- declared, compiled, and delivering the field the
+    projection promised to withhold.
+    """
+    from genesis.runtime import _dropped_paths, _kept_paths
+
+    paths = frozenset({"authors.private"})
+    nested = {"authors": [[{"name": "n1", "private": "SECRET"}]]}
+    assert _dropped_paths(nested, paths) == {"authors": [[{"name": "n1"}]]}
+    assert _kept_paths(nested, frozenset({"authors.name"})) == {"authors": [[{"name": "n1"}]]}
+    # The flat shape, which already worked, still does.
+    assert _dropped_paths({"authors": [{"name": "n1", "private": "S"}]}, paths) == {
+        "authors": [{"name": "n1"}]
+    }

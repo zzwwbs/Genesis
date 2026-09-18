@@ -823,6 +823,54 @@ def _validate_run_length(protocol: Any, warnings: list[dict[str, Any]]) -> list[
     return errors
 
 
+RETRY_POLICY_KEYS = frozenset({"max_attempts", "failure_policy", "fallback_outputs"})
+FAILURE_POLICIES = frozenset({"fail_run", "use_declared_fallback", "skip_with_event"})
+
+
+def _validate_retry_policies(openness: OpennessSpec) -> list[dict[str, str]]:
+    """Refuse a retry policy the runtime would read differently than it says.
+
+    The runtime reads max_attempts, failure_policy and fallback_outputs. The
+    clickbait detector declared on_exhausted: record-missing, which nothing
+    reads: a failed detection failed the whole run instead of being recorded as
+    missing.
+    """
+    errors: list[dict[str, str]] = []
+    for process in openness.processes:
+        policy = process.retry_policy or {}
+        where = f"openness.processes.{process.id}.retry_policy"
+
+        def refuse(message: str, where: str = where) -> None:
+            errors.append(
+                {
+                    "code": "RETRY_POLICY_INVALID",
+                    "severity": "error",
+                    "path": where,
+                    "message": message,
+                }
+            )
+
+        unread = sorted(set(policy) - RETRY_POLICY_KEYS)
+        if unread:
+            refuse(
+                f"retry_policy keys {unread} are never read; a retry policy is "
+                f"{{{', '.join(sorted(RETRY_POLICY_KEYS))}}}"
+            )
+        attempts = policy.get("max_attempts", 1)
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+            refuse(f"max_attempts is {attempts!r}; it must be a whole number of at least 1")
+        failure = policy.get("failure_policy", "fail_run")
+        if failure not in FAILURE_POLICIES:
+            refuse(
+                f"failure_policy '{failure}' is not applied; use one of "
+                f"{', '.join(sorted(FAILURE_POLICIES))}"
+            )
+        fallback = policy.get("fallback_outputs")
+        if failure == "use_declared_fallback" and not isinstance(fallback, dict):
+            refuse("failure_policy use_declared_fallback needs fallback_outputs to substitute")
+    return errors
+
+
 def _validate_retention(openness: OpennessSpec) -> list[dict[str, str]]:
     """Refuse a retention value the engine does not read as keep or purge.
 
@@ -897,6 +945,54 @@ def _advise_rounds_without_repeat(openness: OpennessSpec) -> list[dict[str, Any]
     return warnings
 
 
+def _process_actor_roles(process: Any) -> tuple[str, ...]:
+    """The role name of each position in a process's actor groups."""
+    actors = getattr(process, "actors", None)
+    if actors is None:
+        return ()
+    roles = [str(getattr(actors, "role", "actor") or "actor")]
+    per = getattr(actors, "per", None)
+    if per is not None:
+        roles.append(str(getattr(per, "role", "per") or "per"))
+    return tuple(roles)
+
+
+def _actor_role_problems(process: Any, names: Any) -> list[str]:
+    """Refuse actor fields whose form does not match the process's actor roles.
+
+    A paired process has two actors, so a bare list of field names has no way to
+    say which id it means; an unpaired one has a single role, so a mapping may
+    only name that role.
+    """
+    roles = _process_actor_roles(process)
+    if not roles:
+        return []
+    if isinstance(names, Mapping):
+        problems = []
+        unknown = sorted({str(role) for role in names.values() if str(role) not in roles})
+        if unknown:
+            problems.append(
+                f"actor fields name role(s) {', '.join(unknown)}, but process "
+                f"'{process.id}' declares {', '.join(roles)}"
+            )
+        named = [str(role) for role in names.values()]
+        repeated = sorted({role for role in named if named.count(role) > 1})
+        if repeated:
+            # Both fields would receive the same actor and the other id would be
+            # lost, so the declaration cannot mean what it says.
+            problems.append(
+                f"actor fields name role(s) {', '.join(repeated)} more than once; each "
+                "field must take a different role, or the other actor's id is lost"
+            )
+        return problems
+    if len(roles) > 1:
+        return [
+            f"process '{process.id}' pairs actors ({', '.join(roles)}), so each actor "
+            "field must name the role it takes rather than being a bare list"
+        ]
+    return []
+
+
 def _validate_engine_fields(openness: OpennessSpec, source: Path) -> list[dict[str, str]]:
     """Refuse an actor or phase field the engine could not write as declared."""
     catalog = _schema_catalog(source)
@@ -921,6 +1017,8 @@ def _validate_engine_fields(openness: OpennessSpec, source: Path) -> list[dict[s
                         f"process '{process.id}' declares actor fields but no actors, "
                         "so there is no actor id to write"
                     )
+                if kind == "actor_fields":
+                    problems.extend(_actor_role_problems(process, names))
                 fields: dict[str, Any] = properties if isinstance(properties, dict) else {}
                 # A closed schema with no properties block admits no field at all,
                 # so it is checked too; skipping it let the run fail mid-way.
@@ -984,6 +1082,27 @@ def _validate_actor_sources(
     errors: list[dict[str, str]] = []
     for process in openness.processes:
         actors = process.actors
+        per = getattr(actors, "per", None) if actors is not None else None
+        per_source = getattr(per, "source", None) if per is not None else None
+        if isinstance(per_source, str) and per_source:
+            # The segment after the root is the outer actor's own id, bound at
+            # expansion; only the root has to be a state declared up front.
+            per_root = per_source.partition(".")[0]
+            if per_root not in states:
+                known = ", ".join(sorted(states)) or "none"
+                errors.append(
+                    {
+                        "code": "ACTOR_SOURCE_UNKNOWN",
+                        "severity": "error",
+                        "dependency_section": "domain",
+                        "path": f"openness.processes.{process.id}.actors.per.source",
+                        "message": (
+                            f"per source '{per_source}' starts from '{per_root}', which is not "
+                            f"a declared state (declared: {known}); name the state that holds "
+                            "each actor's own records"
+                        ),
+                    }
+                )
         source = getattr(actors, "source", None) if actors is not None else None
         if not isinstance(source, str) or not source:
             continue
@@ -2063,6 +2182,7 @@ class StudyCompiler:
         errors.extend(_validate_actor_sources(domain, openness, warnings))
         errors.extend(_validate_triggers(openness))
         errors.extend(_validate_retention(openness))
+        errors.extend(_validate_retry_policies(openness))
         errors.extend(_validate_outcomes(loaded["outcomes"], domain))
         errors.extend(_validate_run_length(loaded["protocol"], warnings))
         errors.extend(_validate_engine_fields(openness, self.source))

@@ -26,6 +26,11 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
+from genesis.provider_errors import (  # noqa: F401 - re-exported
+    PAUSING_HTTP_STATUSES,
+    TRANSIENT_HTTP_STATUSES,
+    provider_pause_reason,
+)
 from genesis.runtime import ProcessInvocation, ProcessResult, _plain
 from genesis.schema_validation import SchemaDiagnostic
 from genesis.schema_validation import validate_schema as _authoritative_validate_schema
@@ -35,10 +40,9 @@ from genesis.schema_validation import validate_schema as _authoritative_validate
 # it only repeats the error (CON-001).
 # 425 asks for a replay (RFC 8470); 520-524 are gateway failures in front of an
 # origin (e.g. Cloudflare); 529 is a provider reporting itself overloaded.
-TRANSIENT_HTTP_STATUSES = frozenset(
-    {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
-)
+
 DEFAULT_MAX_RETRIES = 3
+
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_CAP_SECONDS = 60.0
 

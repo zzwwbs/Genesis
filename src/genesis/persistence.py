@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Collection, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Any, cast
@@ -27,7 +27,7 @@ from genesis.state_encoding import (
     should_write_base,
 )
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 _RUN_STATUSES = {"created", "running", "paused", "completed", "failed", "cancelled"}
 # A SHA-256 object digest as it appears inside stored JSON records.
 _DIGEST_PATTERN = re.compile(r"\b[0-9a-f]{64}\b")
@@ -282,6 +282,8 @@ class PersistenceCoordinator:
                     self._migration_9()
                 elif target == 10:
                     self._migration_10()
+                elif target == 11:
+                    self._migration_11()
                 self._validate_schema_version(target)
                 self.connection.execute(f"PRAGMA user_version = {target}")
                 self.connection.execute("COMMIT")
@@ -586,6 +588,22 @@ class PersistenceCoordinator:
         self.connection.execute("CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS artifacts_by_run ON artifacts(run_id)")
 
+    def _migration_11(self) -> None:
+        """Run execution leases, so two processes never execute one run at once.
+
+        The guard against concurrent execution lived in each process's memory,
+        so a script resuming a run that a server was still executing ran it
+        twice into the same record. Additive and idempotent.
+        """
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS run_leases (
+                run_id TEXT PRIMARY KEY NOT NULL,
+                owner TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )"""
+        )
+
     def _validate_schema(self) -> None:
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
         if version != _SCHEMA_VERSION:
@@ -642,6 +660,13 @@ class PersistenceCoordinator:
                 "idempotency_key": ("TEXT", primary_key_not_null, 1),
                 "response_json": ("TEXT", 1, 0),
                 "created_at": ("TEXT", 1, 0),
+            }
+        if version >= 11:
+            specs["run_leases"] = {
+                "run_id": ("TEXT", primary_key_not_null, 1),
+                "owner": ("TEXT", 1, 0),
+                "acquired_at": ("TEXT", 1, 0),
+                "expires_at": ("TEXT", 1, 0),
             }
         if version >= 3:
             specs["package_versions"] = {
@@ -2039,6 +2064,57 @@ class PersistenceCoordinator:
     # How many idempotency records are kept; the oldest beyond it are evicted.
     IDEMPOTENCY_LIMIT = 10_000
     _IDEMPOTENCY_ENVELOPE = "genesis.idempotency/1"
+
+    def acquire_run_lease(self, run_id: str, owner: str, ttl_seconds: float) -> None:
+        """Claim the right to execute a run, across processes, for ``ttl_seconds``.
+
+        Refused while another owner holds an unexpired lease. An expired lease --
+        its holder stopped renewing, having crashed or been suspended -- is taken
+        over. Taken in one immediate transaction so two claimants cannot both win.
+        """
+        now = datetime.now(UTC)
+        expires = (now + timedelta(seconds=ttl_seconds)).isoformat()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute(
+                    "SELECT owner, expires_at FROM run_leases WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row is not None and row[0] != owner and datetime.fromisoformat(row[1]) > now:
+                    raise ValueError(
+                        f"RUN_ALREADY_EXECUTING: run '{run_id}' is being executed by another "
+                        f"process ({row[0]}); its lease expires at {row[1]}. If that process has "
+                        "stopped, resume the run after then."
+                    )
+                self.connection.execute(
+                    """INSERT INTO run_leases(run_id, owner, acquired_at, expires_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(run_id) DO UPDATE SET
+                           owner = excluded.owner,
+                           acquired_at = excluded.acquired_at,
+                           expires_at = excluded.expires_at""",
+                    (run_id, owner, now.isoformat(), expires),
+                )
+                self.connection.execute("COMMIT")
+            except Exception:
+                self._rollback()
+                raise
+
+    def renew_run_lease(self, run_id: str, owner: str, ttl_seconds: float) -> bool:
+        """Extend a lease this owner still holds; False once another owner has it."""
+        expires = (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat()
+        with self._lock:
+            updated = self.connection.execute(
+                "UPDATE run_leases SET expires_at = ? WHERE run_id = ? AND owner = ?",
+                (expires, run_id, owner),
+            ).rowcount
+        return bool(updated)
+
+    def release_run_lease(self, run_id: str, owner: str) -> None:
+        with self._lock:
+            self.connection.execute(
+                "DELETE FROM run_leases WHERE run_id = ? AND owner = ?", (run_id, owner)
+            )
 
     def record_idempotency(
         self, key: str, response: dict[str, Any], payload_hash: str | None = None

@@ -177,10 +177,12 @@ def test_no_control_calls_a_route_the_app_does_not_serve(page: str) -> None:
     """'Review patch' GET /specifications/{id}/draft, which has never existed,
     so it threw before reaching its own fallback and printed 'Not Found'."""
     import re as _re
-    from pathlib import Path as _Path
 
-    app = (_Path(__file__).resolve().parents[1] / "src" / "genesis" / "app.py").read_text()
-    served = set(_re.findall(r'@app\.(?:get|post|put|delete)\("([^"]+)"', app))
+    from genesis.app import create_app
+
+    # Read from the app itself: routes registered in a loop (pause, cancel)
+    # carry no decorator for a source scan to find.
+    served = {getattr(route, "path", "") for route in create_app().routes}
 
     # A served route may take parameters, so match calls against patterns
     # rather than comparing strings: '/elicitation/workflows/three-layer-study'

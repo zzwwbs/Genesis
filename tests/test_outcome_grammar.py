@@ -125,3 +125,19 @@ def test_a_process_filtered_dataset_reads_declared_artifacts() -> None:
     ]
     rows = materialize_datasets(plan, {"artifacts": artifacts, "events": [], "state": []})["d"]
     assert [row["score"] for row in rows] == [3]
+
+
+def test_two_outcomes_joining_one_pair_on_different_keys_keep_their_own() -> None:
+    """The relation name carries `on`, so one declaration cannot win for both.
+
+    Every plan is built before any is evaluated, so a second outcome joining
+    events+artifacts on process_id used to overwrite the first's relation and
+    both then read the last-declared key (2026-09-14 M5).
+    """
+    from genesis.service import _joined_relation_name
+
+    by_invocation = _joined_relation_name("events", "artifacts", "invocation_id")
+    by_process = _joined_relation_name("events", "artifacts", "process_id")
+    assert by_invocation != by_process
+    sources = {by_invocation: ["a"], by_process: ["b"]}
+    assert len(sources) == 2

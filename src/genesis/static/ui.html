@@ -472,6 +472,19 @@
         <pre id="protocol-output">Plan first: it reports how many runs these settings would dispatch, and writes nothing.</pre>
       </div>
       <div class="panel">
+        <h3>Run control</h3>
+        <p class="muted">Pause stops a run once the calls in flight finish. Resume continues it from its last committed event, also after GENESIS was restarted. A run whose model provider cannot serve it (out of credit, a rejected key, an outage) pauses itself and says why here; fix the cause, then resume.</p>
+        <div>
+          <label for="control-run">Run:</label>
+          <select id="control-run" onchange="showRunControl()"></select>
+          <button onclick="refreshControlRuns()">Refresh</button>
+          <button id="control-pause" onclick="pauseControlledRun()" disabled>Pause</button>
+          <button id="control-resume" onclick="resumeControlledRun()" disabled>Resume</button>
+          <button id="control-cancel" onclick="cancelControlledRun()" disabled>Cancel</button>
+        </div>
+        <pre id="control-output">Refresh to list runs that are running, paused or waiting to start.</pre>
+      </div>
+      <div class="panel">
         <h3>Run inventory</h3>
         <button onclick="listRuns()">List runs</button>
         <button onclick="listExperiments()">List experiments</button>
@@ -706,7 +719,8 @@
       preview: 'Run deterministic validation and inspect the proposed package changes.',
       approve: 'Review the changes and evidence, then click "Approve this stage" (or "Request revision").',
       revise: 'Return to clarification without changing the accepted package.',
-      reopen_stage: 'Reopen an approved stage and review any dependent stages that become stale.'
+      reopen_stage: 'Reopen an approved stage and review any dependent stages that become stale.',
+      edit_draft: 'Edit the generated draft directly, then review the changes again.'
     };
     function resetSuggestionSelection() {
       selectedSuggestionIndex = null;
@@ -928,7 +942,12 @@
         const id = actionIds[action];
         if (id) document.getElementById(id).classList.add('action-visible');
       });
-      const primaryAction = allowed.find(action => !['revise', 'reopen_stage', 'cancel'].includes(action));
+      // edit_draft has no button of its own: the service advertises it while
+      // the collapsed draft editor is the control, so the editor is opened
+      // rather than the action being silently skipped.
+      const draftEditor = document.getElementById('draft-editor');
+      if (draftEditor && allowed.includes('edit_draft') && !draftEditor.hidden) draftEditor.open = true;
+      const primaryAction = allowed.find(action => !['revise', 'reopen_stage', 'cancel', 'edit_draft'].includes(action));
       if (primaryAction && actionIds[primaryAction]) document.getElementById(actionIds[primaryAction]).classList.add('primary');
       document.getElementById('elicitation-status-hint').textContent = actionHints[primaryAction || allowed[0]] || 'The session is ready.';
       document.getElementById('elicitation-composer').disabled = !allowed.includes('submit_message');
@@ -1685,6 +1704,80 @@
     }
     async function exportBundle() {
       try { const result = await request('/exports', {method:'POST', body:JSON.stringify({run_id:selectedRun(), output:`exports/${id()}`})}); show('analysis-output', result); } catch (e) { show('analysis-output', e.message); }
+    }
+    const controlledRun = () => document.getElementById('control-run').value;
+    function setRunControls(status) {
+      document.getElementById('control-pause').disabled = status !== 'running';
+      document.getElementById('control-resume').disabled = !(status === 'paused' || status === 'running');
+      document.getElementById('control-cancel').disabled = !['created', 'running', 'paused'].includes(status);
+    }
+    async function refreshControlRuns() {
+      try {
+        const result = await request('/runs');
+        const runs = (result.items || result || []).filter(run => ['running', 'paused', 'created'].includes(run.status));
+        const select = document.getElementById('control-run');
+        const previous = select.value;
+        select.innerHTML = '';
+        for (const run of runs) {
+          const option = document.createElement('option');
+          option.value = run.id;
+          option.textContent = `${run.id} (${run.status})`;
+          select.appendChild(option);
+        }
+        if (previous && [...select.options].some(o => o.value === previous)) select.value = previous;
+        if (select.options.length) {
+          await showRunControl();
+        } else {
+          setRunControls('none');
+          show('control-output', 'No run is running, paused or waiting to start.');
+        }
+      } catch (e) { show('control-output', e.message); }
+    }
+    async function showRunControl() {
+      const runId = controlledRun();
+      if (!runId) return;
+      try {
+        const run = await request(`/runs/${encodeURIComponent(runId)}`);
+        setRunControls(run.status);
+        const last = (run.executions || []).slice(-1)[0] || {};
+        const paused = last.paused_by;
+        show('control-output', {
+          run_id: run.id,
+          status: run.status,
+          paused_because: paused ? `${paused.kind}${paused.status ? ' (HTTP ' + paused.status + ')' : ''}: ${paused.error}` : undefined,
+          stopped_by: last.stopped_by,
+          resumed_from: last.resumed_from_status,
+          note: run.status === 'running'
+            ? 'If no GENESIS process is still executing this run (it was interrupted), Resume continues it; a run another process is executing is refused.'
+            : undefined,
+        });
+      } catch (e) { show('control-output', e.message); }
+    }
+    async function pauseControlledRun() {
+      const runId = controlledRun();
+      try {
+        const run = await request(`/runs/${encodeURIComponent(runId)}`);
+        await request(`/runs/${encodeURIComponent(runId)}/pause`, {method:'POST', headers:{'If-Match': `"${run.version}"`}});
+        await showRunControl();
+      } catch (e) { show('control-output', e.message); }
+    }
+    async function cancelControlledRun() {
+      const runId = controlledRun();
+      if (!confirm(`Cancel ${runId}? A cancelled run cannot be resumed.`)) return;
+      try {
+        const run = await request(`/runs/${encodeURIComponent(runId)}`);
+        await request(`/runs/${encodeURIComponent(runId)}/cancel`, {method:'POST', headers:{'If-Match': `"${run.version}"`}});
+        await showRunControl();
+      } catch (e) { show('control-output', e.message); }
+    }
+    async function resumeControlledRun() {
+      const runId = controlledRun();
+      document.getElementById('control-resume').disabled = true;
+      show('control-output', `Resuming ${runId}. This continues until the run completes, pauses or is cancelled; Pause stays available from another tab or window.`);
+      try {
+        await request(`/runs/${encodeURIComponent(runId)}/resume`, {method:'POST', body:JSON.stringify({}), timeoutMs: 24 * 60 * 60 * 1000});
+      } catch (e) { show('control-output', e.message); return; }
+      await showRunControl();
     }
     async function listRuns() {
       try { const result = await request('/runs'); show('run-output', result); } catch (e) { show('run-output', e.message); }

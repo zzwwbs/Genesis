@@ -33,7 +33,7 @@ from studies.clickbait_2x2 import (  # noqa: E402
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMAS = ROOT / "genesis-workspace/.genesis/specifications/clickbait-2x2-v4/schemas"
+SCHEMAS = ROOT / "genesis-workspace/.genesis/specifications/clickbait-2x2-v6/schemas"
 
 
 class _Context:
@@ -180,7 +180,20 @@ def _settle_data(score: int, clicks: int = 4) -> dict[str, Any]:
 
 
 def _performance(result: Any) -> dict[str, Any]:
+    """The row the creator reads."""
     rows = _effects(result)["article-performance"]["value"]
+    return list(rows.values())[-1] if isinstance(rows, dict) else rows[-1]
+
+
+def _settlement(result: Any) -> dict[str, Any]:
+    """The row the platform keeps, which the creator never sees.
+
+    The two were one object until the v5-full-a run showed `penalised` and
+    `gross_revenue` in 68 of 69 creator contexts. Every assertion about the
+    sanction belongs here; every assertion about what a creator knows belongs
+    in ``_performance``.
+    """
+    rows = _effects(result)["settlements"]["value"]
     return list(rows.values())[-1] if isinstance(rows, dict) else rows[-1]
 
 
@@ -200,14 +213,19 @@ def test_the_sanction_applies_only_under_governance_and_from_the_onset(
     for response in data["reader-response"]:
         response["article_id"] = f"a-{phase}-w1"
     data["detection-result"][0]["article_id"] = f"a-{phase}-w1"
-    row = _performance(settle(_Invocation(data, phase=phase, factors={"governance": governance})))
-    assert row["penalised"] is penalised
+    settled = settle(_Invocation(data, phase=phase, factors={"governance": governance}))
+    assert _settlement(settled)["penalised"] is penalised
+    # Whatever the platform decides, the creator's own ledger never says so.
+    assert "penalised" not in _performance(settled)
+    row = _settlement(settled)
     expected = row["gross_revenue"] * (SANCTION_RETENTION if penalised else 1.0)
     assert row["actual_revenue"] == expected
+    # The lowered figure is the one thing the sanction does let a creator see.
+    assert _performance(settled)["actual_revenue"] == expected
 
 
 def test_an_article_below_the_threshold_is_never_penalised() -> None:
-    row = _performance(
+    row = _settlement(
         settle(
             _Invocation(
                 _settle_data(score=DETECTION_THRESHOLD - 1),
@@ -224,17 +242,14 @@ def test_a_missing_detection_leaves_the_article_unsanctioned() -> None:
     """A failed detection is recorded as missing, never as a positive."""
     data = _settle_data(score=DETECTION_THRESHOLD)
     data["detection-result"] = []
-    row = _performance(
-        settle(_Invocation(data, phase=1, factors={"governance": "hidden-sanction"}))
-    )
+    row = _settlement(settle(_Invocation(data, phase=1, factors={"governance": "hidden-sanction"})))
     assert row["penalised"] is False
 
 
 def test_revenue_is_one_per_click_and_accumulates_onto_the_prior_total() -> None:
     result = settle(_Invocation(_settle_data(score=0, clicks=4), factors={"governance": "none"}))
-    row = _performance(result)
-    assert row["clicks"] == 4
-    assert row["gross_revenue"] == 4.0
+    assert _performance(result)["clicks"] == 4
+    assert _settlement(result)["gross_revenue"] == 4.0
     revenue = _effects(result)["revenue"]["value"]
     assert revenue["w1"] == 14.0  # 10.0 carried in, plus this round's 4
 
@@ -249,7 +264,7 @@ def test_settlement_emits_no_artifact_and_the_creator_reads_state_instead() -> N
         )
     )
     assert _outputs(result) == {}
-    assert sorted(_effects(result)) == ["article-performance", "revenue"]
+    assert sorted(_effects(result)) == ["article-performance", "revenue", "settlements"]
 
 
 def test_the_creator_facing_revenue_carries_no_score_and_no_gross_figure() -> None:
@@ -430,13 +445,12 @@ def test_an_artifact_input_is_read_as_readily_as_a_state_field() -> None:
         },
         "feeds": {"u1": [{"article_id": article_id}]},
     }
-    row = _performance(
-        settle(_Invocation(data, phase=phase, factors={"governance": "hidden-sanction"}))
-    )
+    settled = settle(_Invocation(data, phase=phase, factors={"governance": "hidden-sanction"}))
+    row = _performance(settled)
     assert row["clicks"] == 1
     assert row["exposures"] == 1
     # The detection came through the same way, so the sanction could apply.
-    assert row["penalised"] is True
+    assert _settlement(settled)["penalised"] is True
 
 
 def test_a_detection_joins_on_the_article_it_was_invoked_for_not_the_id_it_wrote() -> None:
@@ -457,7 +471,41 @@ def test_a_detection_joins_on_the_article_it_was_invoked_for_not_the_id_it_wrote
             },
         },
     }
-    row = _performance(
+    row = _settlement(
         settle(_Invocation(data, phase=phase, factors={"governance": "hidden-sanction"}))
     )
     assert row["penalised"] is True
+
+
+def test_a_feed_item_shows_no_summary_of_the_body() -> None:
+    """The topic was a précis of the body, readable before the click."""
+    data = {
+        "articles": [_article("w1", topic="A summary of everything the body says")],
+        "follower-network": {"w1": ["u1"]},
+        "population": {"users": [{"id": "u1"}]},
+    }
+    item = _outputs(distribute(_Invocation(data, actor="u1")))["user-feed"]["items"][0]
+    assert "topic" not in item and "track" not in item
+    assert item["title"] == "A title"
+
+
+def test_a_feed_item_carries_only_this_users_own_impressions_of_the_author() -> None:
+    """The impressions state is keyed by author; a user sees their own notes only."""
+    data = {
+        "articles": [_article("w1", phase=3)],
+        "follower-network": {"w1": ["u1"]},
+        "population": {"users": [{"id": "u1"}, {"id": "u2"}]},
+        "impressions": {
+            "w1": [
+                {"user_id": "u1", "phase": 1, "impression": "mine, first"},
+                {"user_id": "u2", "phase": 1, "impression": "someone else's"},
+                {"user_id": "u1", "phase": 2, "impression": "mine, second"},
+            ]
+        },
+    }
+    feed = _outputs(distribute(_Invocation(data, phase=3, actor="u1")))["user-feed"]
+    _validate("feed-schema", feed)
+    assert feed["items"][0]["your_earlier_impressions"] == [
+        {"round": 1, "impression": "mine, first"},
+        {"round": 2, "impression": "mine, second"},
+    ]

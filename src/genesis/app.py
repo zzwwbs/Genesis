@@ -600,8 +600,36 @@ def create_app(
 
         return endpoint
 
-    for action, target in (("pause", "paused"), ("resume", "running"), ("cancel", "cancelled")):
+    for action, target in (("pause", "paused"), ("cancel", "cancelled")):
         app.post(f"/runs/{{run_id}}/{action}")(transition_route(target))
+
+    @app.post("/runs/{run_id}/resume")
+    def resume_run(run_id: str, request: Request, payload: dict[str, Any] | None = None) -> Any:
+        """Continue a paused or interrupted run from its last committed event.
+
+        Resume used to set the run's status to running and execute nothing, so a
+        run 'resumed' from the API sat at running until someone called execute.
+        It runs until the run completes, pauses or is cancelled.
+        """
+        try:
+            options = dict(payload or {})
+            unknown = sorted(set(options) - {"max_concurrency"})
+            if unknown:
+                raise ValueError(f"INVALID_FIELD: unsupported resume options: {', '.join(unknown)}")
+            if_match = request.headers.get("If-Match")
+            if if_match is not None:
+                try:
+                    expected = int(if_match.strip('"'))
+                except ValueError:
+                    return _error(
+                        "VALIDATION_ERROR", "If-Match must contain an integer version", 422
+                    )
+                current = service.get_run(run_id)["version"]
+                if expected != current:
+                    raise ValueError(f"EXPECTED_VERSION: expected {expected}, found {current}")
+            return service.resume_run(run_id, max_concurrency=options.get("max_concurrency"))
+        except Exception as exc:
+            return _service_error(exc)
 
     @app.get("/experiments")
     def list_experiments() -> Any:
@@ -657,6 +685,7 @@ def create_app(
             "plan",
             "parallel",
             "max_workers",
+            "max_concurrency",
         }
         try:
             unknown = sorted(set(options) - allowed)
@@ -677,6 +706,7 @@ def create_app(
                 max_workers=cast(
                     int, _integer_option("max_workers", options.get("max_workers"), 4)
                 ),
+                max_concurrency=_integer_option("max_concurrency", options.get("max_concurrency")),
             )
         except Exception as exc:
             return _service_error(exc)

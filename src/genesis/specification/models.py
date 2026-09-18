@@ -168,8 +168,10 @@ class OutputSpec(StrictModel):
     schema_ref: StableId
     # Output fields that name the acting actor. The engine writes them, over
     # whatever the executor returned: an identity the engine already holds must
-    # not depend on a model repeating it back.
-    actor_fields: list[str] | None = None
+    # not depend on a model repeating it back. A list names fields an unpaired
+    # process fills from its one actor; a mapping of field to role says which
+    # actor of a paired invocation each field takes.
+    actor_fields: list[str] | dict[str, str] | None = None
     # Output fields that name the round the output was produced in, written by
     # the engine for the same reason.
     phase_fields: list[str] | None = None
@@ -190,6 +192,35 @@ class TracePolicy(StrictModel):
     retention: str | None = None
 
 
+class PerSelector(StrictModel):
+    """The inner half of a paired actor selector.
+
+    Resolved once per outer actor, with ``${actor}`` bound to that actor's id, so
+    a process can take one turn per record the actor itself produced -- one
+    reaction per article this reader opened, rather than one per reader.
+    """
+
+    source: str
+    id_field: str = "id"
+    role: str = "per"
+
+    @model_validator(mode="after")
+    def safe_source(self) -> PerSelector:
+        import re
+
+        if not re.fullmatch(r"[A-Za-z0-9_${}-]+(?:\.[A-Za-z0-9_${}-]+)*", self.source):
+            raise ValueError("actor selector per source must be a safe dotted path")
+        if "${actor}" not in self.source:
+            # Without the binding every outer actor resolves the same records and
+            # the pairing is a cross product, which no design has yet wanted.
+            raise ValueError("actor selector per source must bind ${actor}")
+        if not self.id_field or "." in self.id_field:
+            raise ValueError("actor selector per id_field must be one field name")
+        if not self.role:
+            raise ValueError("actor selector per role must be a name")
+        return self
+
+
 class ActorSelector(StrictModel):
     """Data-driven selection of actor instances for one process occurrence."""
 
@@ -197,6 +228,8 @@ class ActorSelector(StrictModel):
     source: str | None = None
     id_field: str = "id"
     fan_out: bool = True
+    role: str = "actor"
+    per: PerSelector | None = None
 
     @model_validator(mode="after")
     def exactly_one_source(self) -> ActorSelector:
@@ -209,7 +242,25 @@ class ActorSelector(StrictModel):
                 raise ValueError("actor selector source must be a safe dotted path")
         if not self.id_field or "." in self.id_field:
             raise ValueError("actor selector id_field must be one field name")
+        if not self.role:
+            raise ValueError("actor selector role must be a name")
+        if self.per is not None:
+            if not self.fan_out:
+                raise ValueError("actor selector per requires fan_out")
+            if self.per.role == self.role:
+                raise ValueError("actor selector per role must differ from the outer role")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_unpaired_fields(self, handler: Any) -> Any:
+        # An unpaired selector serialises as it did before roles existed, so
+        # every package built earlier still compiles to the same build hash.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("per") is None:
+            data.pop("per", None)
+            if data.get("role") == "actor":
+                data.pop("role", None)
+        return data
 
 
 class InformationTiming(StrictModel):
