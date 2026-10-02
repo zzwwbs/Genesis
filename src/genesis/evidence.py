@@ -21,6 +21,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from genesis.execution_manifest import has_symlink
+
 BUNDLE_VERSION = 1
 
 # The capability vocabulary (spec §4.2). Each is individually evaluated.
@@ -247,7 +249,7 @@ def verify_bundle_manifest(destination: Path) -> dict[str, Any]:
             raise ValueError(f"IMPORT_BUNDLE: duplicate member path '{relative}'")
         seen.add(relative)
         asset = destination / relative
-        if not asset.is_file() or asset.is_symlink():
+        if not asset.is_file() or has_symlink(destination, Path(relative)):
             raise ValueError(f"IMPORT_BUNDLE: member '{relative}' is missing or a link")
         expected = str(member.get("digest", ""))
         actual = file_digest(asset)

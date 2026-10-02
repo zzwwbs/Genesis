@@ -16,6 +16,7 @@ import statistics
 import tempfile
 import threading
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -44,6 +45,7 @@ from genesis.elicitation import (
 from genesis.elicitation import (
     SpecificationPatch as ElicitationSpecificationPatch,
 )
+from genesis.errors import NotFoundError
 from genesis.evidence import (
     ExportMode,
     _is_contained_relative,
@@ -57,6 +59,7 @@ from genesis.execution_manifest import (
     canonical_json,
     executor_code_digest,
     executor_code_reference,
+    has_symlink,
     resolve_execution_manifest,
     scientific_config_digest,
 )
@@ -69,6 +72,9 @@ from genesis.intent_check import (
 )
 from genesis.outcome_plan import (
     _INCOMPLETE_ROUND,
+    _observation_key,
+    _value_repeats_row,
+    check_dataset_id,
     compile_outcome_plan,
     materialize_datasets,
     outcome_plan_digest,
@@ -89,6 +95,7 @@ from genesis.providers import (
 from genesis.readback import BUILD_PARTS, assemble_readback_request, readback_record
 from genesis.readback import SYSTEM as READBACK_SYSTEM
 from genesis.replay import ReplayMode
+from genesis.runtime import _ID as _RUN_ID_SEGMENT
 from genesis.runtime import (
     STATE_VALUE_TYPES,
     ArtifactStore,
@@ -310,11 +317,16 @@ def _artifact_row(
         {key: value for key, value in payload.get("outputs", {}).items() if key not in declared_ids}
     )
     if "value" in payload:
-        row["value"] = payload["value"]
-        if isinstance(payload["value"], dict):
-            row.update(payload["value"])
-        if isinstance(payload.get("declared_artifact_id"), str):
-            row[payload["declared_artifact_id"]] = payload["value"]
+        original = payload["value"]
+        declared = payload.get("declared_artifact_id")
+        # The artifacts relation is counted on `value`. A record is spread, and
+        # an inner field of that name wins; the whole record is not also written
+        # onto the declared artifact id.
+        row["value"] = original
+        if isinstance(original, dict):
+            row.update(original)
+        elif isinstance(declared, str) and declared and declared != "value" and declared not in row:
+            row[declared] = original
     return row
 
 
@@ -424,7 +436,7 @@ def _hash_join(
             # every keyless row to every other: 636 events became 767,016 rows.
             continue
         try:
-            index.setdefault(key, []).append(row)
+            index.setdefault(_observation_key(key), []).append(row)
         except TypeError:
             unindexed.append(row)
     merged: list[dict[str, Any]] = []
@@ -433,15 +445,18 @@ def _hash_join(
         if key is None:
             continue
         try:
-            matches: Iterable[Mapping[str, Any]] = index.get(key) or ()
+            matches: Iterable[Mapping[str, Any]] = index.get(_observation_key(key)) or ()
         except TypeError:
-            matches = [other for other in unindexed if other.get(on) == key]
+            identity = _observation_key(key)
+            matches = [other for other in unindexed if _observation_key(other.get(on)) == identity]
         for match in matches:
             merged.append({**row, **match})
     return merged
 
 
 _DEFAULT_WORLD = "__package__"
+# Runs whose dataset tables run_datasets keeps built, for paging.
+_DATASET_TABLE_CACHE_LIMIT = 4
 
 
 def _empirical_mode(build_path: Path) -> bool:
@@ -469,6 +484,12 @@ def _resolve_initializations(
     """
     if declared is None:
         return [{"id": _DEFAULT_WORLD}]
+    if isinstance(declared, str):
+        # One data source. Iterated as given, "data/world.json" became a world
+        # per character: "world 'd' names 'd'".
+        declared = [declared]
+    if not isinstance(declared, list):
+        raise ValueError("RUN_PROTOCOL: initializations must be a list of worlds")
     if not declared:
         raise ValueError("RUN_PROTOCOL: initializations is empty; omit it to use the package's own")
     worlds: list[dict[str, Any]] = []
@@ -485,6 +506,19 @@ def _resolve_initializations(
             raise ValueError("RUN_PROTOCOL: each initialization needs a data_source")
         if world["id"] in seen or world["id"] == _DEFAULT_WORLD:
             raise ValueError(f"RUN_PROTOCOL: duplicate or reserved world id '{world['id']}'")
+        # The world id goes into every run id the protocol creates, and the
+        # engine refuses a run id that is not lowercase kebab-case -- but only
+        # once the run exists, so `world_c.json` produced runs that failed on
+        # their first turn, and failed is final: re-running the protocol landed
+        # on the same failed runs. Underscored data file names are ordinary, so
+        # this is refused here, before anything is created.
+        if not _RUN_ID_SEGMENT.fullmatch(str(world["id"])):
+            raise ValueError(
+                f"RUN_PROTOCOL: world id '{world['id']}' (from "
+                f"'{world['data_source']}') is not lowercase kebab-case, and every run "
+                "id this protocol creates includes it; rename the file, or give the "
+                'world an explicit id: {"id": "world-c", "data_source": ...}'
+            )
         # ``build_path / x`` is just x when x is absolute, and follows ``..``
         # out of the build when it is not, so an existence check alone let any
         # readable JSON on the machine become the run's population -- and be
@@ -817,6 +851,87 @@ def _joined_relation_name(left: str, right: str, on: str) -> str:
     different outcome declared beside it.
     """
     return f"{left}+{right}+{on}"
+
+
+def _validate_canonical_sections(
+    candidate: Mapping[str, Any], canonical: Mapping[str, Any]
+) -> None:
+    """Validate every canonical section of a drafted specification.
+
+    A `remove /study` patch deleted a whole section, and the bare index raised
+    KeyError: not a ValueError, so it escaped the elicitation repair loop and the
+    route reported 404, as if the session did not exist. A missing section is an
+    invalid draft, and the assistant is asked to correct it like any other.
+    """
+    for section, model in canonical.items():
+        if not isinstance(candidate.get(section), Mapping):
+            raise ValueError(
+                f"the patch leaves no '{section}' section; every canonical section must "
+                "remain, so edit its fields instead of removing it"
+            )
+        model.model_validate(candidate[section])
+
+
+def _level_text(level: Any) -> str:
+    """How a factor level is spelled on a command line."""
+    if isinstance(level, bool):
+        return "true" if level else "false"
+    return str(level).lower()
+
+
+# Fields a run acquires from import or from execution. POST /runs stored
+# whatever the body contained, so these became a way to read arbitrary JSON
+# and to replace a run's outcomes.
+_RUN_CREATE_RESERVED = frozenset({"imported_datasets", "imported_outcomes", "outcomes"})
+_CONTENT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _proposal_validation_error(exc: ValidationError) -> ValueError:
+    """A proposal that fails validation, named as a client error.
+
+    Pydantic wraps a ``PATCH_PATH`` value error in its own message, which has
+    no domain-code prefix and was reported as an internal fault.
+    """
+    messages: list[str] = []
+    for error in exc.errors():
+        message = str(error.get("msg", ""))
+        prefix = "Value error, "
+        if message.startswith(prefix):
+            message = message[len(prefix) :]
+        if message:
+            messages.append(message)
+    text = "; ".join(messages) or "accepted proposal is not a valid patch"
+    code = text.split(":", 1)[0]
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", code):
+        text = f"PROPOSAL_INVALID: {text}"
+    return ValueError(text)
+
+
+def _bundle_records(path: Path, what: str) -> list[dict[str, Any]]:
+    """A bundle member that must be a list of records.
+
+    Invalid JSON, or a JSON value that is not that list, used to surface as an
+    internal fault.
+    """
+    try:
+        loaded = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"IMPORT_RUN: {what} is not valid JSON") from exc
+    if not isinstance(loaded, list) or any(not isinstance(row, dict) for row in loaded):
+        raise ValueError(f"IMPORT_RUN: {what} must be a list of records")
+    return loaded
+
+
+def _event_has_purge_marker(event: Mapping[str, Any], marker: str) -> bool:
+    if event.get("raw_response") == marker or event.get("parsed_response") == marker:
+        return True
+    for nested_name in ("metadata", "payload"):
+        nested = event.get(nested_name)
+        if isinstance(nested, Mapping) and (
+            nested.get("raw_response") == marker or nested.get("parsed_response") == marker
+        ):
+            return True
+    return False
 
 
 def _safe_path_name(value: str, what: str) -> str:
@@ -1276,11 +1391,19 @@ class GenesisService:
         )
         self._patch_preview = PatchPreviewService(self)
         self.last_outcome_engine = "python"
+        # A run's dataset tables, kept while its evidence is unchanged; see
+        # run_datasets. Small and least-recently-used: a page view needs one run.
+        self._dataset_table_cache: OrderedDict[
+            tuple[Any, ...], tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]
+        ] = OrderedDict()
         # Runs executing in this process. A run is executed by one caller at a
         # time; a second concurrent call is refused rather than duplicating the
         # run's work and provider spend.
         self._executing_runs: set[str] = set()
         self._executing_lock = threading.Lock()
+        # The build directory the import in progress created. Cleared when that
+        # import commits; deleted if it is refused, so GET /builds does not list it.
+        self._import_build_dir: Path | None = None
         # Who holds a run's execution lease: unique to this service instance.
         self._lease_owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self._leases: dict[str, _RunLease] = {}
@@ -1465,7 +1588,22 @@ class GenesisService:
         return self.persistence.list_studies()
 
     def create_package(self, payload: dict[str, Any]) -> dict[str, Any]:
-        package_id = payload["id"]
+        package_id = payload.get("id")
+        # The id names the package's file. Checked only for workspace
+        # containment, "../model-profiles" was accepted and written as
+        # .genesis/model-profiles.json -- outside packages/, invisible to the
+        # listing, and able to claim the profile store's path before any
+        # profile existed -- and "a/b" failed as a 500.
+        if not isinstance(package_id, str) or not _RUN_ID_SEGMENT.fullmatch(package_id):
+            raise ValueError(
+                f"PACKAGE_ID_INVALID: package id {package_id!r} must be a stable lowercase "
+                "kebab-case identifier"
+            )
+        # The id is the file name plus ``.json``. Past 250 characters that name
+        # exceeds the filesystem limit, and ``path.exists()`` raised
+        # ``File name too long``, reported as an internal fault.
+        if len(package_id) > 250:
+            raise ValueError("PACKAGE_ID_INVALID: package id must be at most 250 characters")
         path = self.resolve_path(Path(".genesis/packages") / f"{package_id}.json")
         if path.exists():
             raise ValueError(f"ALREADY_EXISTS: package '{package_id}' already exists")
@@ -1669,7 +1807,7 @@ class GenesisService:
         """Stored record including any pasted api_key (never exposed to reads)."""
         profile = self._load_model_profiles().get(profile_id)
         if profile is None:
-            raise KeyError(profile_id)
+            raise NotFoundError(profile_id)
         return dict(profile)
 
     @staticmethod
@@ -1684,7 +1822,7 @@ class GenesisService:
         self._validate_specification_id(profile_id)
         profile = self._load_model_profiles().get(profile_id)
         if profile is None:
-            raise KeyError(profile_id)
+            raise NotFoundError(profile_id)
         return self._public_model_profile(profile)
 
     def create_model_profile(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1706,7 +1844,7 @@ class GenesisService:
             profiles = self._load_model_profiles()
             current = profiles.get(profile_id)
             if current is None:
-                raise KeyError(profile_id)
+                raise NotFoundError(profile_id)
             if current.get("version") != expected_version:
                 raise ValueError(
                     f"EXPECTED_VERSION: expected {expected_version}, found {current.get('version')}"
@@ -1780,6 +1918,10 @@ class GenesisService:
     def _validate_specification_id(value: Any) -> str:
         if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", value):
             raise ValueError("INVALID_ID: specification id must be a stable lowercase identifier")
+        # Longer than this, the id is a directory name the filesystem rejects,
+        # and that OSError was reported as an internal fault.
+        if len(value) > 250:
+            raise ValueError("INVALID_ID: specification id must be at most 250 characters")
         return value
 
     def _specification_exists(self, specification_id: str) -> bool:
@@ -1831,7 +1973,7 @@ class GenesisService:
                 "snapshot_digest": digest,
                 "files": bundle.get("files", {}),
             }
-        raise KeyError(specification_id)
+        raise NotFoundError(f"{specification_id} version {version}")
 
     def _specification_dir(self, specification_id: str) -> Path:
         self._validate_specification_id(specification_id)
@@ -2032,7 +2174,7 @@ class GenesisService:
         directory = self._specification_dir(specification_id)
         metadata_path = directory / "metadata.json"
         if not metadata_path.is_file():
-            raise KeyError(specification_id)
+            raise NotFoundError(specification_id)
         metadata = json.loads(metadata_path.read_text())
         if not isinstance(metadata, dict):
             raise ValueError("SPECIFICATION_METADATA: metadata must be an object")
@@ -2122,7 +2264,7 @@ class GenesisService:
     ) -> dict[str, Any]:
         directory = self._specification_dir(specification_id)
         if not (directory / "metadata.json").is_file():
-            raise KeyError(specification_id)
+            raise NotFoundError(specification_id)
         items = checklist_record(directory)
         for item in items:
             if str(item.get("id")) != item_id:
@@ -2139,7 +2281,7 @@ class GenesisService:
                 item["researcher_confirmation"] = True
             persist_checklist(directory, items)
             return dict(item)
-        raise KeyError(item_id)
+        raise NotFoundError(item_id)
 
     def refresh_checklist(self, specification_id: str) -> list[dict[str, Any]]:
         directory = self._specification_dir(specification_id)
@@ -2199,7 +2341,7 @@ class GenesisService:
         profile_id = profile_id or live[0]
         configured = profiles.get(profile_id)
         if configured is None:
-            raise KeyError(profile_id)
+            raise NotFoundError(profile_id)
         if configured.get("provider") == "answer-pool":
             raise ValueError(
                 f"MODEL_PROFILE: answer-pool profile '{profile_id}' cannot act as the "
@@ -2279,7 +2421,10 @@ class GenesisService:
         whole form, preserving the established flow.
         """
         if patch is not None:
-            validated = SpecificationPatch.model_validate(patch)
+            try:
+                validated = SpecificationPatch.model_validate(patch)
+            except ValidationError as exc:
+                raise _proposal_validation_error(exc) from exc
             validated.validate_deterministic()
             patch = validated.model_dump(mode="json")
             specification_ops = [
@@ -2530,6 +2675,16 @@ class GenesisService:
                 **payload,
                 "max_events": _validated_max_events(payload["max_events"], "RUN_CREATE"),
             }
+        # Import and execution record these. A caller who supplied them was
+        # trusted: imported_datasets became a path read, and imported_outcomes
+        # (or outcomes) was served as the run's results.
+        reserved = sorted(_RUN_CREATE_RESERVED.intersection(payload))
+        if reserved:
+            raise ValueError(
+                "RUN_CREATE: "
+                + ", ".join(reserved)
+                + " are recorded by import and execution, not supplied when a run is created"
+            )
         return self.persistence.create_run(payload)
 
     def get_run(self, run_id: str) -> dict[str, Any]:
@@ -3029,6 +3184,21 @@ class GenesisService:
                 artifact_type = compiled_outputs[0].get("artifact_type")
                 if isinstance(artifact_type, str):
                     output_key = artifact_type
+                if (
+                    isinstance(schema_ref, str)
+                    and schema_catalog
+                    and schema_ref not in schema_catalog
+                ):
+                    # A model's output declares a schema the build does not carry.
+                    # Binding it only when present let the process run with no
+                    # schema at all, so its output was committed unvalidated. A
+                    # build compiled before the compiler refused this can still
+                    # carry it, so it is refused here too, by name.
+                    raise ValueError(
+                        f"OUTPUT_SCHEMA_MISSING: process '{process.get('id')}' declares output "
+                        f"schema '{schema_ref}', which this build does not carry; recompile "
+                        "the package"
+                    )
                 if isinstance(schema_ref, str) and schema_ref in schema_catalog:
                     output_schema = schema_catalog[schema_ref]
                     if schema_catalog_validator is not None:
@@ -3741,6 +3911,10 @@ class GenesisService:
         # Say so rather than silently ignoring what the package states.
         _refuse_retired_protocol_settings(protocol)
         conditions = expand_protocol_conditions(protocol)
+        if isinstance(only_conditions, str):
+            # One condition id. Iterated as given, a string was read letter by
+            # letter: "abcdef" reported unknown conditions a, b, c, d, e, f.
+            only_conditions = [only_conditions]
         if only_conditions is not None:
             if not only_conditions:
                 # Read as "run nothing", it dispatched nothing and reported
@@ -3766,6 +3940,14 @@ class GenesisService:
         if draws < 1:
             raise ValueError("RUN_PROTOCOL: replications must be at least 1")
         max_events = _validated_max_events(max_events, "RUN_PROTOCOL")
+        # Refused here, before any cell exists. Each cell's execute_run checks it
+        # too, but only after the protocol has created every run, so a bad
+        # per-profile override left a set of runs behind it; and the HTTP route
+        # accepted only the integer form, so the per-profile limit the execute
+        # and resume routes and the CLI all take could not be set at all.
+        max_concurrency = self.validate_execution_options(
+            {"build": build_ref}, max_concurrency=max_concurrency
+        )
         worlds = _resolve_initializations(initializations, build_path)
         plan = {
             "experiment_id": run_id,
@@ -4259,6 +4441,13 @@ class GenesisService:
                     f"REPLAY_CONFIGURATION_INVALID: factor '{key}' is not declared branchable"
                 )
             levels = factor.get("levels")
+            if isinstance(levels, list) and isinstance(value, str) and value not in levels:
+                # The CLI can only pass text, so a numeric or boolean level was
+                # never matched and was refused as undeclared. Text naming exactly
+                # one declared level is that level, recorded with its own type.
+                spelled = [level for level in levels if _level_text(level) == value.strip().lower()]
+                if len(spelled) == 1:
+                    value = spelled[0]
             if isinstance(levels, list) and value not in levels:
                 raise ValueError(
                     f"REPLAY_CONFIGURATION_INVALID: value '{value}' is not a declared level "
@@ -4412,23 +4601,36 @@ class GenesisService:
         justification: str | None,
         overrides: Mapping[str, Any] | None = None,
     ) -> None:
+        if overrides is not None and not isinstance(overrides, Mapping):
+            # A list reached overrides.items() and failed as a 500.
+            raise ValueError(
+                "REPLAY_CONFIGURATION_INVALID: overrides must map each factor to a level"
+            )
         if overrides and mode != ReplayMode.BRANCH:
             raise ValueError(
                 "REPLAY_CONFIGURATION_INVALID: overrides are only accepted for "
                 f"branch replay, not {mode.value}"
             )
+        if boundary is not None and not isinstance(boundary, str):
+            raise ValueError("REPLAY_BOUNDARY: boundary must be a string")
         if mode == ReplayMode.PARTIAL and not boundary:
-            raise ValueError("partial replay requires a boundary")
+            raise ValueError("REPLAY_CONFIGURATION_INVALID: partial replay requires a boundary")
         if mode == ReplayMode.BRANCH:
             if not boundary:
-                raise ValueError("branch replay requires a boundary")
+                raise ValueError("REPLAY_CONFIGURATION_INVALID: branch replay requires a boundary")
             if not justification:
-                raise ValueError("branch replay requires a justification")
+                raise ValueError(
+                    "REPLAY_CONFIGURATION_INVALID: branch replay requires a justification"
+                )
         if mode == ReplayMode.FULL and (artifact_ids or boundary):
-            raise ValueError("full replay does not accept artifact_ids or a boundary")
+            raise ValueError(
+                "REPLAY_CONFIGURATION_INVALID: full replay does not accept "
+                "artifact_ids or a boundary"
+            )
         if artifact_ids and mode != ReplayMode.ARTIFACT:
             raise ValueError(
-                f"artifact_ids are only accepted for artifact replay, not {mode.value}"
+                "REPLAY_CONFIGURATION_INVALID: artifact_ids are only accepted for artifact "
+                f"replay, not {mode.value}"
             )
 
     @staticmethod
@@ -4716,8 +4918,21 @@ class GenesisService:
         # check refuses a name that would nest the build somewhere unexpected
         # inside it.
         safe_id = _safe_path_name(target_id, "run id")
-        build_dir = self.resolve_path(f"builds/{safe_id}-imported-{build_hash[:8]}")
-        build_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"builds/{safe_id}-imported-{build_hash[:8]}"
+        build_dir = self.resolve_path(stem)
+        # The run does not exist yet, so a directory already at this name is not
+        # this import's: an earlier refused import, or a run since removed. It is
+        # neither written into nor deleted -- the bundle's files were copied over
+        # whatever was there before the later checks could refuse the bundle. The
+        # import takes the next free name instead.
+        attempt = 2
+        while build_dir.exists():
+            build_dir = self.resolve_path(f"{stem}-{attempt}")
+            attempt += 1
+        build_dir.mkdir(parents=True)
+        # Cleared when the import commits. A later refusal rolls the registry
+        # row back; without this the directory stayed and GET /builds listed it.
+        self._import_build_dir = build_dir
         for name in executable_files:
             target = build_dir / name
             target.write_bytes((source_path / name).read_bytes())
@@ -4754,7 +4969,9 @@ class GenesisService:
                 if not _is_contained_relative(relative):
                     raise ValueError(f"IMPORT_BUILD: unsafe closure asset path '{relative}'")
                 source_asset = source_path / "package" / relative
-                if not source_asset.is_file() or source_asset.is_symlink():
+                if not source_asset.is_file() or has_symlink(
+                    source_path / "package", Path(relative)
+                ):
                     raise ValueError(f"IMPORT_BUILD: closure asset missing in bundle: {relative}")
                 target = build_dir / "closure" / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -4852,6 +5069,15 @@ class GenesisService:
                     for artifact in self.artifacts_for_run(run_id)
                     if artifact.get("artifact_id") in artifact_ids
                 ]
+                # Retrieval of named artifacts: one that is not there is an
+                # error, not a smaller answer. Dropping it reported success for a
+                # request that retrieved nothing it asked for.
+                found = {str(artifact.get("artifact_id")) for artifact in retained}
+                missing = sorted(set(artifact_ids) - found)
+                if missing:
+                    raise NotFoundError(
+                        f"run '{run_id}' has no artifact {', '.join(map(repr, missing))}"
+                    )
             else:
                 recorded = self._recorded_process_outputs(run_id, ())
                 generative_ids = self._generative_process_ids(build_ref)
@@ -5749,8 +5975,20 @@ class GenesisService:
                     for step in (declared.get(name) or {}).get("fields") or []
                     if isinstance(step, Mapping) and step.get("name")
                 }
+                # The artifact's nested copy of its payload is a mapping whose
+                # fields are already spread into the row, so it repeats them as a
+                # single JSON cell. A record's own `value` is kept unless it is
+                # such a copy -- including a mapping-valued one, which the earlier
+                # rule dropped for every exploded dataset.
                 if "value" not in declared_fields:
-                    raw_rows = [{k: v for k, v in row.items() if k != "value"} for row in raw_rows]
+                    raw_rows = [
+                        {
+                            k: v
+                            for k, v in row.items()
+                            if k != "value" or not _value_repeats_row(v, row)
+                        }
+                        for row in raw_rows
+                    ]
             # In run and round order: rows came out in storage order, so round 10
             # sorted before round 2 and a table read out of sequence.
             raw_rows.sort(key=_table_order)
@@ -5796,6 +6034,9 @@ class GenesisService:
         tables, dictionary = GenesisService._dataset_tables(datasets, build_path)
         written: list[Path] = []
         for name, rows in tables.items():
+            # The last line of defence: whatever produced the name, a file lands
+            # in this directory or not at all.
+            check_dataset_id(name)
             written.append(AnalysisExporter().export_csv(rows, directory / f"{name}.csv"))
             if rows:
                 written.append(
@@ -5806,11 +6047,93 @@ class GenesisService:
         written.append(target)
         return written
 
+    def _import_dataset_tables(self, source_path: Path) -> dict[str, Any]:
+        """Keep the dataset tables an exported bundle carries, if it carries any."""
+        directory = source_path / "datasets"
+        dictionary_path = directory / "dictionary.json"
+        if not dictionary_path.is_file():
+            return {}
+        dictionary = json.loads(dictionary_path.read_text())
+        if not isinstance(dictionary, dict):
+            raise ValueError("IMPORT_RUN: datasets/dictionary.json must be an object")
+        tables: dict[str, str] = {}
+        for name in dictionary:
+            dataset_id = check_dataset_id(name)
+            parquet = directory / f"{dataset_id}.parquet"
+            csv_path = directory / f"{dataset_id}.csv"
+            if parquet.is_file():
+                import pyarrow.parquet as pq
+
+                try:
+                    rows = pq.read_table(parquet).to_pylist()
+                except Exception as exc:
+                    raise ValueError(
+                        f"IMPORT_RUN: dataset '{dataset_id}' could not be read"
+                    ) from exc
+            elif csv_path.is_file():
+                import csv
+
+                with csv_path.open(newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+            else:
+                # A dictionary entry with no table is a bundle claiming a dataset
+                # it does not carry: served as an empty table it reads as a
+                # dataset that happened to have no rows.
+                raise ValueError(
+                    f"IMPORT_RUN: dataset '{dataset_id}' is listed in the dictionary but "
+                    "carries no table"
+                )
+            ref = self.persistence.object_store.put(
+                json.dumps(rows, sort_keys=True, default=str).encode(), "application/json"
+            )
+            tables[dataset_id] = ref.digest
+        dictionary_ref = self.persistence.object_store.put(
+            json.dumps(dictionary, sort_keys=True).encode(), "application/json"
+        )
+        return {"imported_datasets": {"tables": tables, "dictionary": dictionary_ref.digest}}
+
+    def _load_imported_dataset_tables(
+        self, imported: Mapping[str, Any]
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+        root = self.persistence.object_store.root.resolve()
+
+        def load(digest: str) -> Any:
+            if not isinstance(digest, str) or not _CONTENT_DIGEST.fullmatch(digest):
+                raise ValueError(
+                    "DATASET_DIGEST: an imported dataset reference must be a content digest"
+                )
+            path = (root / digest[:2] / digest[2:]).resolve()
+            if path != root and root not in path.parents:
+                raise ValueError(
+                    "DATASET_DIGEST: an imported dataset reference escapes the object store"
+                )
+            return json.loads(path.read_bytes())
+
+        tables = {
+            str(name): list(load(str(digest)))
+            for name, digest in dict(imported.get("tables") or {}).items()
+        }
+        dictionary = load(str(imported["dictionary"])) if imported.get("dictionary") else {}
+        return tables, dict(dictionary)
+
     def run_datasets(
         self, run_id: str, *, analysis_build: str | Path | None = None
     ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
         """A run's datasets as the tables its export would write, and their dictionary."""
         run = self.get_run(run_id)
+        imported = run.get("imported_datasets")
+        if isinstance(imported, Mapping):
+            if analysis_build is not None:
+                # The bundle's tables are the run's evidence; an analysis build
+                # cannot rebuild them, and skipping this branch answered with an
+                # empty dataset set instead of saying so.
+                raise ValueError(
+                    f"DATASETS_UNAVAILABLE: run '{run_id}' was imported, so its tables come "
+                    "from its bundle; an analysis build does not apply to it"
+                )
+            # An imported run's tables are the ones its bundle carried; it may
+            # have no build to rebuild them from.
+            return self._load_imported_dataset_tables(imported)
         build_ref = run.get("build") or run.get("build_path")
         if not build_ref:
             raise ValueError(
@@ -5819,13 +6142,37 @@ class GenesisService:
         build_path = self.resolve_path(str(build_ref))
         if analysis_build is not None:
             build_path = self._analysis_build(build_path, analysis_build)
+        # Paging a dataset asked for every table again: each page re-evaluated
+        # every outcome and rebuilt every table, so an M-page dataset cost M
+        # full rebuilds. The result depends only on the run's evidence and the
+        # build read, so it is kept until either changes -- a commit landing
+        # changes the event marker even while the run's version does not.
+        manifest = build_path / "build_manifest.json"
+        key = (
+            run_id,
+            str(build_path),
+            # The build's content, not only its path: a build deleted and
+            # recompiled in place served the old build's tables.
+            hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest.is_file() else "",
+            str(run.get("status")),
+            int(run.get("version") or 0),
+            self.persistence.event_marker(run_id),
+        )
+        cached = self._dataset_table_cache.get(key)
+        if cached is not None:
+            self._dataset_table_cache.move_to_end(key)
+            return cached
         datasets: dict[str, list[dict[str, Any]]] = {}
         self.evaluate_outcomes(run_id, datasets_out=datasets, analysis_build=analysis_build)
         if self._retention_purges_raw(json.loads((build_path / "processes.json").read_text())):
             datasets = {
                 name: GenesisService._redact_raw_responses(rows) for name, rows in datasets.items()
             }
-        return self._dataset_tables(datasets, build_path)
+        result = self._dataset_tables(datasets, build_path)
+        self._dataset_table_cache[key] = result
+        while len(self._dataset_table_cache) > _DATASET_TABLE_CACHE_LIMIT:
+            self._dataset_table_cache.popitem(last=False)
+        return result
 
     @staticmethod
     def _with_derived_rows(
@@ -5863,6 +6210,41 @@ class GenesisService:
     @staticmethod
     def _retention_purges_raw(processes: list[Mapping[str, Any]]) -> bool:
         return bool(GenesisService._purging_processes(processes))
+
+    def _export_retention(self, run: Mapping[str, Any], processes: list[Mapping[str, Any]]) -> str:
+        """How this bundle treats raw provider bodies.
+
+        The label used to be read only from the build's processes, so a re-export
+        of a run whose source had already removed them claimed ``retain_raw_responses``.
+        """
+        if run.get("retention_policy") == "purge_raw_responses" or self._retention_purges_raw(
+            processes
+        ):
+            return "purge_raw_responses"
+        marker = "<purged-by-retention>"
+        for event in self.persistence.iter_events(str(run["id"])):
+            if _event_has_purge_marker(event, marker):
+                return "purge_raw_responses"
+        return "retain_raw_responses"
+
+    def _write_imported_datasets(self, directory: Path, imported: Mapping[str, Any]) -> list[Path]:
+        """Write the tables an imported run already carries."""
+        tables, dictionary = self._load_imported_dataset_tables(imported)
+        if not tables and not dictionary:
+            return []
+        directory.mkdir(parents=True, exist_ok=True)
+        written: list[Path] = []
+        for name, rows in tables.items():
+            dataset_id = check_dataset_id(name)
+            written.append(AnalysisExporter().export_csv(rows, directory / f"{dataset_id}.csv"))
+            if rows:
+                written.append(
+                    AnalysisExporter.rows_to_parquet(rows, directory / f"{dataset_id}.parquet")
+                )
+        target = directory / "dictionary.json"
+        target.write_text(json.dumps(dictionary, indent=2, sort_keys=True, default=str) + "\n")
+        written.append(target)
+        return written
 
     @staticmethod
     def _purging_processes(processes: list[Mapping[str, Any]]) -> set[str]:
@@ -6338,8 +6720,7 @@ class GenesisService:
             projection["schemas"] = current_form.get("schemas", {})
             candidate = apply_operations(projection, patch.operations)
             self._validate_schema_files(candidate.get("schemas", {}))
-            for section, model in CANONICAL.items():
-                model.model_validate(candidate[section])
+            _validate_canonical_sections(candidate, CANONICAL)
             return patch
 
         try:
@@ -7439,6 +7820,14 @@ class GenesisService:
         verify the manifest, then atomically published, refusing to overwrite
         an existing destination (spec §4.3).
         """
+        # An unknown spelling is refused rather than compared: the branches below
+        # test equality, so "Reproducibility" took the exploration path while the
+        # manifest recorded the caller's text as the bundle's export mode.
+        if mode not in (ExportMode.EXPLORATION, ExportMode.REPRODUCIBILITY):
+            raise ValueError(
+                f"EXPORT_MODE: unknown export mode {mode!r}; use "
+                f"'{ExportMode.EXPLORATION}' or '{ExportMode.REPRODUCIBILITY}'"
+            )
         destination = self.resolve_path(output).resolve()
         if destination.exists():
             raise ValueError(
@@ -7594,7 +7983,15 @@ class GenesisService:
             replay_lineage={"source_run_id": run_id},
         )
         output_paths = list(result_paths)
-        if datasets and (run.get("build") or run.get("build_path")):
+        imported_tables = run.get("imported_datasets")
+        if isinstance(imported_tables, Mapping):
+            # evaluate_outcomes returns the imported snapshot and does not rebuild
+            # tables, so a re-export used to omit them. The second bundle then
+            # verified, because it hashes whatever it wrote.
+            output_paths.extend(
+                self._write_imported_datasets(destination / "datasets", imported_tables)
+            )
+        elif datasets and (run.get("build") or run.get("build_path")):
             output_paths.extend(
                 self._write_datasets(
                     destination / "datasets",
@@ -7820,11 +8217,7 @@ class GenesisService:
                 "raw cumulative state snapshots",
                 "provider response bodies when retention purges them",
             ],
-            retention_policy=(
-                "purge_raw_responses"
-                if self._retention_purges_raw(processes)
-                else "retain_raw_responses"
-            ),
+            retention_policy=self._export_retention(run, processes),
         )
         output_paths.append(bundle_manifest_path)
         return output_paths
@@ -8135,10 +8528,15 @@ class GenesisService:
             try:
                 result = self._import_run(source, run_id, size_limit_bytes=size_limit_bytes)
                 connection.execute("RELEASE SAVEPOINT import_run")
+                self._import_build_dir = None
                 return result
             except Exception:
                 connection.execute("ROLLBACK TO SAVEPOINT import_run")
                 connection.execute("RELEASE SAVEPOINT import_run")
+                build_dir = getattr(self, "_import_build_dir", None)
+                self._import_build_dir = None
+                if isinstance(build_dir, Path) and build_dir.is_dir():
+                    shutil.rmtree(build_dir, ignore_errors=True)
                 raise
 
     def _import_run(
@@ -8191,7 +8589,7 @@ class GenesisService:
                     raise ValueError(f"IMPORT_INTEGRITY: duplicate member path '{relative}'")
                 seen.add(relative)
                 asset = source_path / relative
-                if not asset.is_file() or asset.is_symlink():
+                if not asset.is_file() or has_symlink(source_path, Path(str(relative))):
                     raise ValueError(f"IMPORT_INTEGRITY: bundle member '{relative}' is missing")
                 total += asset.stat().st_size
                 actual = hashlib.sha256(asset.read_bytes()).hexdigest()
@@ -8224,7 +8622,12 @@ class GenesisService:
                 "bundle (no member coverage, containment, digest or size checks "
                 "could run)"
             )
-        run_manifest = json.loads((source_path / "run_manifest.json").read_text())
+        try:
+            run_manifest = json.loads((source_path / "run_manifest.json").read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("IMPORT_RUN: run_manifest.json is not valid JSON") from exc
+        if not isinstance(run_manifest, dict):
+            raise ValueError("IMPORT_RUN: run_manifest.json must be an object")
         # Digests prove the bundle was not corrupted in transit; they cannot
         # show that the manifest is internally consistent. A manifest whose
         # seeds do not derive from the identity it states cannot reconstruct
@@ -8238,12 +8641,10 @@ class GenesisService:
             raise ValueError(f"ALREADY_EXISTS: run '{target_id}' already imported")
         except KeyError:
             pass
-        events = json.loads((source_path / "events.json").read_text())
-        artifacts = json.loads((source_path / "artifacts.json").read_text())
+        events = _bundle_records(source_path / "events.json", "events")
+        artifacts = _bundle_records(source_path / "artifacts.json", "artifacts")
         outcomes_path = source_path / "outcomes.json"
-        outcomes = json.loads(outcomes_path.read_text()) if outcomes_path.exists() else []
-        if not isinstance(outcomes, list) or any(not isinstance(row, dict) for row in outcomes):
-            raise ValueError("IMPORT_RUN: outcomes must be a list of records")
+        outcomes = _bundle_records(outcomes_path, "outcomes") if outcomes_path.exists() else []
         # EVD-003: preserve the original run identity separately from the local
         # import identity; imported outcomes are visibly labelled as snapshots.
         origin = {}
@@ -8254,6 +8655,14 @@ class GenesisService:
         imported_manifest = dict(run_manifest)
         imported_manifest.setdefault("origin", {}).update(origin)
         imported_manifest["imported_outcomes"] = "snapshot"
+        if isinstance(bundle_manifest, Mapping):
+            retention = bundle_manifest.get("retention_policy")
+            if retention in {"purge_raw_responses", "retain_raw_responses"}:
+                run_payload_retention = retention
+            else:
+                run_payload_retention = None
+        else:
+            run_payload_retention = None
         # F3: restore and register the verified executable build when the
         # bundle carries one, so replay/reexecution capabilities are real.
         restored_build, build_restored = self._reconstruct_imported_build(
@@ -8266,8 +8675,18 @@ class GenesisService:
             "manifest": imported_manifest,
             "build": restored_build,
             "imported_outcomes": outcomes,
+            # The bundle's analysis tables. evaluate_outcomes returns the
+            # imported snapshot and never rebuilds datasets, so without these an
+            # imported run answered every dataset with 404 -- data lost across
+            # the round trip whose members the bundle manifest digests.
+            **self._import_dataset_tables(source_path),
             "study_id": run_manifest.get("study_id", ""),
             "status": str(run_manifest.get("status", "completed")),
+            **(
+                {"retention_policy": run_payload_retention}
+                if run_payload_retention is not None
+                else {}
+            ),
             # F1: replay reads these from the run row, not the manifest. The
             # pinned experimental configuration (condition, factors,
             # replication) is lifted here so a replayed import inherits the
@@ -8518,6 +8937,11 @@ class GenesisService:
         inspected = 0
         for path in self.persistence.object_store.root.glob("??/*"):
             if not path.is_file():
+                continue
+            # A write in flight (.object-*) or an abandoned one (*.tmp) is not an
+            # object; the store's own collector skips the same names. Hashed as
+            # objects, a healthy store under load reported integrity failures.
+            if path.name.startswith(".") or path.suffix == ".tmp":
                 continue
             inspected += 1
             digest = path.parent.name + path.name

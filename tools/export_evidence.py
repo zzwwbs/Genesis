@@ -71,25 +71,26 @@ def _clear_owned_outputs() -> None:
 def main() -> int:
     import sqlite3
 
-    _clear_owned_outputs()
-    OUT.mkdir(parents=True, exist_ok=True)
-
-    # 1) theory spec (5.2)
-    shutil.copy(PACKAGE / "theory.yaml", OUT / "theory-pilot-large.yaml")
-
-    # 2) compiled Study Build (5.3)
-    manifest = json.loads((BUILD_DIR / "build_manifest.json").read_text())
-    build_hash = str(manifest.get("build_hash", "unknown"))[:8]
-    build_out = OUT / f"compiled-build-{build_hash}"
-    shutil.copytree(BUILD_DIR, build_out)
-
-    # 3) run manifest (5.4)
     con = sqlite3.connect(WORKSPACE / ".genesis" / "genesis.db")
     try:
         row = con.execute("SELECT payload_json FROM runs WHERE run_id=?", (RUN_ID,)).fetchone()
         if not row:
             print(f"run {RUN_ID} not found")
             return 1
+
+        _clear_owned_outputs()
+        OUT.mkdir(parents=True, exist_ok=True)
+
+        # 1) theory spec (5.2)
+        shutil.copy(PACKAGE / "theory.yaml", OUT / "theory-pilot-large.yaml")
+
+        # 2) compiled Study Build (5.3)
+        manifest = json.loads((BUILD_DIR / "build_manifest.json").read_text())
+        build_hash = str(manifest.get("build_hash", "unknown"))[:8]
+        build_out = OUT / f"compiled-build-{build_hash}"
+        shutil.copytree(BUILD_DIR, build_out)
+
+        # 3) run manifest (5.4). The run was confirmed to exist before anything was deleted.
         run_payload = json.loads(row[0])
         run_manifest = run_payload.get("manifest")
         (OUT / f"run-manifest-{RUN_ID}.json").write_text(
@@ -99,13 +100,22 @@ def main() -> int:
         # 4) trace chain: user-action artifact -> interpret event -> user-act event ->
         #    resulting analytics record
         target: dict | None = None
-        for _event_id, pref, _kind in con.execute(
-            "SELECT event_id, payload_ref, kind FROM events WHERE run_id=?", (RUN_ID,)
-        ).fetchall():
-            payload = objs(str(pref))
-            if payload and payload.get("process_id") == "user-act" and payload.get("phase") == 0:
-                target = payload
-                break
+        # Reconstructed, not decoded row by row: a patch-form event's payload
+        # alone is {'fields': ...}, so this scan missed the event it looks for.
+        from genesis.persistence import PersistenceCoordinator
+
+        store = PersistenceCoordinator(
+            WORKSPACE / ".genesis" / "genesis.db",
+            WORKSPACE / ".genesis" / "objects",
+            read_only=True,
+        )
+        try:
+            for payload in store.iter_events(RUN_ID):
+                if payload.get("process_id") == "user-act" and payload.get("phase") == 0:
+                    target = payload
+                    break
+        finally:
+            store.close()
         if target is None:
             print("no user-act@0 event")
             return 1

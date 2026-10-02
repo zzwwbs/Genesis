@@ -132,7 +132,7 @@ def test_a_successful_first_call_records_no_retries(monkeypatch) -> None:
 
 def test_request_errors_are_not_retried(monkeypatch) -> None:
     with scripted_server([(400, {})]) as (url, hits):
-        with pytest.raises(ValueError, match=r"PROVIDER_HTTP: provider returned HTTP 400: "):
+        with pytest.raises(ValueError, match=r"PROVIDER_HTTP: provider returned HTTP 400$"):
             _provider(url, monkeypatch).generate(_request())
     assert len(hits) == 1
 

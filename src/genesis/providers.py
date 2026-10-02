@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
+from genesis.errors import NotFoundError
 from genesis.provider_errors import (  # noqa: F401 - re-exported
     PAUSING_HTTP_STATUSES,
     TRANSIENT_HTTP_STATUSES,
@@ -42,6 +43,10 @@ from genesis.schema_validation import validate_schema as _authoritative_validate
 # origin (e.g. Cloudflare); 529 is a provider reporting itself overloaded.
 
 DEFAULT_MAX_RETRIES = 3
+# The most a provider response may carry. A chat completion is kilobytes; these
+# bound memory against an endpoint that streams without end.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_ERROR_BODY_BYTES = 64 * 1024
 
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_CAP_SECONDS = 60.0
@@ -675,6 +680,30 @@ def _after_retries(retries: Sequence[Mapping[str, Any]]) -> str:
     return f" after {len(retries)} retries" if retries else ""
 
 
+_PROVIDER_ERROR_TOKEN = re.compile(r"^[a-z_]{1,64}$")
+
+
+def _provider_error_token(detail: str) -> str:
+    """A short ``error.code`` or ``error.type``, or nothing.
+
+    The response body often echoes the prompt. A token of this shape cannot.
+    The body is not logged anywhere else, so without the token a 400 reaches
+    the ledger as a bare status code.
+    """
+    try:
+        body = json.loads(detail)
+    except json.JSONDecodeError:
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return ""
+    for key in ("code", "type"):
+        token = error.get(key)
+        if isinstance(token, str) and _PROVIDER_ERROR_TOKEN.fullmatch(token):
+            return token
+    return ""
+
+
 class OpenAICompatibleProvider:
     """Small adapter for providers implementing OpenAI Chat Completions."""
 
@@ -781,13 +810,26 @@ class OpenAICompatibleProvider:
         def _open() -> None:
             try:
                 with urllib.request.urlopen(http_request, timeout=self.timeout) as response:
-                    box.append((response.read(), getattr(response, "status", 200)))
+                    body = response.read(MAX_RESPONSE_BYTES + 1)
+                    if len(body) > MAX_RESPONSE_BYTES:
+                        # Read without a bound, a stalling or hostile endpoint
+                        # could stream until memory ran out, with several calls
+                        # in flight per run. timeout bounds each socket wait, not
+                        # the bytes. A completion this size is not a completion.
+                        raise ValueError(
+                            "PROVIDER_RESPONSE: provider response exceeded "
+                            f"{MAX_RESPONSE_BYTES} bytes"
+                        )
+                    box.append((body, getattr(response, "status", 200)))
             except urllib.error.HTTPError as exc:
                 # Read the error body here, inside the cancellable wait. Read on
                 # the caller's thread, a stalled body blocked past cancellation,
                 # and a failed read escaped retry handling as a bare error.
                 try:
-                    body = exc.read()
+                    # Only diagnostics and parameter repair read it, so it is
+                    # truncated rather than refused; the slice that follows came
+                    # after reading the whole body, which bounded nothing.
+                    body = exc.read(MAX_ERROR_BODY_BYTES)
                 except (OSError, http.client.HTTPException, ValueError):
                     body = b""
                 finally:
@@ -860,23 +902,32 @@ class OpenAICompatibleProvider:
                 if attempts == 0:
                     fixed = self._unsupported_parameter_fix(payload, detail)
                     if fixed is not None:
-                        payload = fixed
+                        # Only what this retry actually took away. Listing every
+                        # known parameter absent from the new payload named ones
+                        # that were never sent: a request with only max_tokens,
+                        # rejected, was recorded as having had temperature
+                        # stripped -- a false statement about how the run's model
+                        # was called.
                         degraded_parameters = [
                             key
-                            for key in ("temperature", "max_tokens", "max_completion_tokens")
-                            if key not in payload
+                            for key in (
+                                "temperature",
+                                "max_tokens",
+                                "max_completion_tokens",
+                                "response_format",
+                            )
+                            if key in payload and key not in fixed
                         ]
+                        payload = fixed
                         attempts += 1
                         continue
-                # The provider's body routinely echoes the offending request —
-                # i.e. the prompt, which carries the authorized context. Keep a
-                # short, bounded excerpt out of the message that reaches event
-                # records and API callers, where the trace policy does not
-                # govern it; the full body stays on the chained exception.
-                summary = " ".join(detail.split())[:200]
+                # The body often echoes the prompt, and nothing logs that body.
+                # Keep only a short structured code, which cannot be a prompt.
+                token = _provider_error_token(detail)
+                coded = f" {token}" if token else ""
                 raise ValueError(
-                    f"PROVIDER_HTTP: provider returned HTTP {exc.code}"
-                    f"{_after_retries(retries)}: {summary}"
+                    f"PROVIDER_HTTP: provider returned HTTP {exc.code}{coded}"
+                    f"{_after_retries(retries)}"
                 ) from exc
             # HTTPException covers responses broken mid-flight (IncompleteRead,
             # BadStatusLine), which are not OSErrors.
@@ -941,7 +992,7 @@ class RecordedArtifactProvider:
         if not request.artifact_id:
             raise ValueError("recorded provider requires artifact_id")
         if request.artifact_id not in self._artifacts:
-            raise KeyError(request.artifact_id)
+            raise NotFoundError(request.artifact_id)
         recorded = self._artifacts[request.artifact_id]
         if not isinstance(recorded, dict) or "payload" not in recorded or "hash" not in recorded:
             raise ValueError("recorded artifact requires payload and hash")
@@ -982,7 +1033,7 @@ class ProviderRegistry:
         try:
             return self._providers[name]
         except KeyError:
-            raise KeyError(f"provider unavailable: {name}") from None
+            raise NotFoundError(f"provider unavailable: {name}") from None
 
     def capabilities(self) -> dict[str, ProviderCapabilities]:
         return {name: provider.capabilities() for name, provider in self._providers.items()}

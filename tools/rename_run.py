@@ -32,18 +32,6 @@ WORKSPACE = ROOT / "genesis-workspace"
 DB = WORKSPACE / ".genesis" / "genesis.db"
 
 
-def objs(digest: str):
-    for cand in (
-        WORKSPACE / ".genesis" / "objects" / digest[:2] / digest[2:],
-        WORKSPACE / ".genesis" / "objects" / digest,
-    ):
-        try:
-            return json.loads(cand.read_text())
-        except Exception:
-            continue
-    return None
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", default="pilot-large-gate-3")
@@ -61,21 +49,30 @@ def main() -> int:
     finally:
         con.close()
 
-    events = []
-    con = sqlite3.connect(DB)
+    # Reconstructed. A patch-form event's payload_ref is the delta, not the
+    # event, so decoding it raw failed every run written since events were stored
+    # as patches.
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(DB, WORKSPACE / ".genesis" / "objects", read_only=True)
     try:
-        for pref in con.execute(
-            "SELECT payload_ref FROM events WHERE run_id=? ORDER BY rowid", (args.run,)
-        ).fetchall():
-            events.append(objs(str(pref[0])))
+        events = list(store.iter_events(args.run))
         artifacts = []
-        for aid, pref in con.execute(
-            "SELECT artifact_id, payload_ref FROM artifacts WHERE run_id=? ORDER BY artifact_id",
-            (args.run,),
-        ).fetchall():
-            artifacts.append({"artifact_id": aid, "payload": objs(str(pref[0]))})
+        for row in store.iter_artifacts(args.run):
+            payload = row["payload"]
+            try:
+                decoded = json.loads(payload)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                decoded = None
+            artifacts.append(
+                {
+                    "artifact_id": row["artifact_id"],
+                    "payload": decoded,
+                    "media_type": row.get("media_type"),
+                }
+            )
     finally:
-        con.close()
+        store.close()
 
     old, new = args.run, args.new_id
 

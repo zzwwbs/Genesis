@@ -68,3 +68,6 @@ demos/demo-workspace/
 # local agent instruction files (working conventions, not part of the library)
 /AGENTS.md
 /CLAUDE.md
+
+# Local review probes, not part of the project.
+.probe_verify/

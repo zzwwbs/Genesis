@@ -1462,6 +1462,7 @@ def test_provider_http_error_does_not_carry_the_whole_response_body() -> None:
 
     message = str(caught.value)
     assert message.startswith("PROVIDER_HTTP: provider returned HTTP 400")
+    assert "echoed prompt" not in message
     assert len(message) < 400
 
 
@@ -3054,6 +3055,7 @@ def test_hash_join_matches_the_nested_loop_and_scales_linearly() -> None:
     import random
     import time
 
+    from genesis.outcome_plan import _observation_key
     from genesis.service import _hash_join
 
     left = [{"k": index % 3, "l": index} for index in range(6)]
@@ -3064,8 +3066,12 @@ def test_hash_join_matches_the_nested_loop_and_scales_linearly() -> None:
         for left_row in left_rows:
             for right_row in right_rows:
                 # A missing key matches nothing (2026-09-14): None == None joined
-                # every keyless row to every other.
-                if left_row.get(on) is not None and left_row.get(on) == right_row.get(on):
+                # every keyless row to every other. True, 1 and 1.0 are not one
+                # key either: Python's == would join them.
+                left_key = left_row.get(on)
+                if left_key is not None and _observation_key(left_key) == _observation_key(
+                    right_row.get(on)
+                ):
                     merged.append({**left_row, **right_row})
         return merged
 

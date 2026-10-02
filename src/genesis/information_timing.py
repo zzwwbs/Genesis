@@ -83,6 +83,13 @@ def is_batched(process: Mapping[str, Any]) -> bool:
     if isinstance(actors, Mapping):
         if actors.get("fan_out", True) is False:
             return False
+        if actors.get("per") is not None:
+            # One turn per inner record, drawn from state: even a single listed
+            # id can expand into many groups. Classifying by the outer ids alone
+            # called such a batch unbatched, so it needed no timing declaration
+            # and the runtime silently chose simultaneous semantics -- the
+            # research decision this module exists to make explicit.
+            return True
         ids = actors.get("ids")
         if isinstance(ids, list | tuple):
             return len(ids) > 1
@@ -122,6 +129,23 @@ def _predicate_paths(condition: Any) -> Iterator[str]:
         yield from _predicate_paths(condition["not"])
     if "path" in condition:
         yield str(condition["path"])
+
+
+_PREDICATE_KEYS = frozenset({"path", "op", "value", "all", "any", "not"})
+
+
+def _availability_predicate(conditions: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The predicate an availability rule applies, inline or under ``predicate``.
+
+    The runtime accepts ``{path, op, value}`` written directly. Reading only
+    ``predicate`` missed that form, so a same-batch dependency was not reported
+    and the run took simultaneous timing without a declaration.
+    """
+    nested = conditions.get("predicate")
+    if isinstance(nested, Mapping):
+        return nested
+    inline = {key: value for key, value in conditions.items() if key in _PREDICATE_KEYS}
+    return inline or None
 
 
 def _availability_conditions(policy: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -187,7 +211,8 @@ def batch_dependencies(process: Mapping[str, Any], policy: Mapping[str, Any] | N
     for conditions in _availability_conditions(policy):
         uses_events = bool(conditions.get("event")) or bool(conditions.get("source_match_event"))
         uses_events = uses_events or any(
-            path.split(".")[0] == "events" for path in _predicate_paths(conditions.get("predicate"))
+            path.split(".")[0] == "events"
+            for path in _predicate_paths(_availability_predicate(conditions))
         )
         if uses_events and emits_events:
             reasons.append("its context availability depends on events its own actors emit")

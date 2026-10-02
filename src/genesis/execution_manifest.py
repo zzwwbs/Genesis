@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,26 @@ _CREDENTIAL_MARKERS = (
 )
 # Whole file or directory names that denote secrets, compared without suffix.
 _CREDENTIAL_STEMS = {"key", "keys", "token", "tokens", "password", "passwords", "env"}
+# Root files that are the study. Anything else at the root -- metadata.json
+# (which copies every prompt, plus the specification id and the approver),
+# notes.txt, service-account.json -- is not the study, and putting it in the
+# closure changes the scientific digest and can carry a secret the build
+# reports as excluded.
+_ROOT_SPECIFICATION_FILES = frozenset(
+    {
+        f"{name}.{suffix}"
+        for name in (
+            "study",
+            "openness",
+            "theory",
+            "domain",
+            "protocol",
+            "outcomes",
+            "models",
+        )
+        for suffix in ("yaml", "yml")
+    }
+)
 # The asset types each package directory may contribute (spec §2.1). An
 # allowlist, so a stray file -- an .env, a key, an editor cache -- cannot enter a
 # closure, and with it every build and export, merely by being in the tree.
@@ -98,6 +119,51 @@ def _is_excluded(relative: Path) -> bool:
     return _exclusion_reason(relative) is not None
 
 
+def has_symlink(root: Path, relative: Path) -> bool:
+    """Whether any component of ``root / relative`` is a symbolic link.
+
+    ``Path.is_symlink`` reports only the final component, so a link used as a
+    directory (``package -> elsewhere``) followed by a regular file was accepted.
+    """
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def symlink_refusal(root: Path, relative: Path) -> str | None:
+    """A message refusing a symlinked package asset, or ``None`` for regular files.
+
+    A closure is the original bytes of regular files, and every sibling path in
+    the system already refuses links (``_reconstruct_imported_build``,
+    ``import_package``, ``verify_bundle_manifest``); this was the one place that
+    followed them. That let a link carry a file the closure excludes under an
+    included name -- ``data/population.csv -> keys.env`` pinned a credential as
+    the study's data -- and let ``data/sub -> <dir>`` reach assets the walk does
+    not collect, so a package compiled into a build no run could use.
+
+    Judged component by component, so a link anywhere in the path is found, and
+    a symlinked *directory* is refused rather than silently contributing nothing.
+    """
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            try:
+                target = os.readlink(current)
+            except OSError:  # pragma: no cover - unreadable link
+                target = ""
+            points = f" -> {target}" if target else ""
+            return (
+                f"PACKAGE_SYMLINK: package asset '{relative.as_posix()}' is a symbolic link"
+                f"{points}; a package carries regular files only, so copy the file into "
+                "the package"
+            )
+    return None
+
+
 def _safe_relative(root: Path, path: Path) -> Path:
     """Return the package-relative path, rejecting traversal and symlink escape."""
     resolved_root = root.resolve()
@@ -125,6 +191,10 @@ class PackageClosure:
     # Package files left out, with the reason, so an omission is visible rather
     # than silent. Not part of the digest: the closure is what was included.
     excluded: tuple[tuple[str, str], ...] = ()
+    # The bytes the digest was computed from. The compiler writes these rather
+    # than reading the package again, so a file that changes mid-compile cannot
+    # land in the build under a digest of different bytes.
+    contents: Mapping[str, bytes] = field(default_factory=dict)
 
     @property
     def assets(self) -> dict[str, dict[str, Any]]:
@@ -151,24 +221,46 @@ def build_package_closure(source: str | Path) -> PackageClosure:
     excluded: list[tuple[str, str]] = []
     seen: set[str] = set()
     candidates: list[Path] = []
-    for pattern in ("*.yaml", "*.yml", "*.json", "*.txt"):
-        candidates.extend(sorted(root.glob(pattern)))
+    contents: dict[str, bytes] = {}
+    for name in sorted(_ROOT_SPECIFICATION_FILES):
+        path = root / name
+        if path.exists():
+            candidates.append(path)
     for subdir in ("prompts", "schemas", "data"):
         base = root / subdir
-        if base.is_dir():
-            candidates.extend(sorted(p for p in base.rglob("*") if p.is_file()))
+        # Checked before is_dir, so a link that is broken or points at a
+        # directory is refused rather than skipped: either way the package does
+        # not carry the assets it appears to.
+        refusal = symlink_refusal(root, Path(subdir))
+        if refusal is not None:
+            raise ValueError(refusal)
+        if not base.is_dir():
+            continue
+        entries = sorted(base.rglob("*"))
+        # Checked before the is_file filter, so a symlinked directory inside the
+        # tree is refused too: rglob does not descend into one, so it would
+        # otherwise contribute nothing and leave a package that compiled into a
+        # build no run could use.
+        for entry in entries:
+            refusal = symlink_refusal(root, entry.relative_to(root))
+            if refusal is not None:
+                raise ValueError(refusal)
+        candidates.extend(p for p in entries if p.is_file())
     for path in candidates:
         relative = _safe_relative(root, path)
         normalized = relative.as_posix()
         if normalized in seen:
             continue
+        seen.add(normalized)
+        refusal = symlink_refusal(root, relative)
+        if refusal is not None:
+            raise ValueError(refusal)
         reason = _exclusion_reason(relative)
         if reason is not None:
-            seen.add(normalized)
             excluded.append((normalized, reason))
             continue
-        seen.add(normalized)
         content = path.read_bytes()
+        contents[normalized] = content
         assets.append(
             {
                 "path": normalized,
@@ -188,6 +280,7 @@ def build_package_closure(source: str | Path) -> PackageClosure:
         digest=hashlib.sha256(canonical_json(manifest).encode()).hexdigest(),
         manifest=manifest,
         excluded=tuple(sorted(excluded)),
+        contents=contents,
     )
 
 

@@ -28,6 +28,7 @@ from typing import Any, Literal, cast
 import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from genesis.errors import NotFoundError
 from genesis.specification.models import StableId
 
 WORKFLOW_COMPLETION_RULES = frozenset(
@@ -134,7 +135,7 @@ class WorkflowDefinition(BaseModel):
         for stage in self.stages:
             if stage.id == stage_id:
                 return stage
-        raise KeyError(stage_id)
+        raise NotFoundError(stage_id)
 
     def next_stage(self, stage_id: str) -> WorkflowStage | None:
         for index, stage in enumerate(self.stages):
@@ -1053,7 +1054,7 @@ class WorkflowRegistry:
         try:
             definition = self._definitions[workflow_id]
         except KeyError as exc:
-            raise KeyError(f"WORKFLOW_INVALID: unknown workflow '{workflow_id}'") from exc
+            raise NotFoundError(f"WORKFLOW_INVALID: unknown workflow '{workflow_id}'") from exc
         return definition.model_copy(deep=True)
 
     def list(self) -> list[WorkflowDefinition]:
@@ -1366,6 +1367,10 @@ class SpecificationPatch(BaseModel):
         operation_paths = [operation.path for operation in self.operations]
 
         def _covers(target: str, operation_path: str) -> bool:
+            # An empty or root target matched every path: ``"".rstrip("/") + "/"``
+            # and ``"/".rstrip("/") + "/"`` are both ``"/"``.
+            if not target.strip("/"):
+                return False
             return (
                 target == operation_path
                 or target.startswith(operation_path.rstrip("/") + "/")
@@ -1614,7 +1619,7 @@ class ElicitationSessionStore:
             try:
                 return self._sessions[session_id].model_copy(deep=True)
             except KeyError as exc:
-                raise KeyError(
+                raise NotFoundError(
                     f"ELICITATION_SESSION_EXPIRED: no session '{session_id}' "
                     "(session not found in this workspace)"
                 ) from exc
@@ -1624,7 +1629,7 @@ class ElicitationSessionStore:
         with self._access():
             session = self._sessions.get(session_id)
             if session is None:
-                raise KeyError(
+                raise NotFoundError(
                     f"ELICITATION_SESSION_EXPIRED: no session '{session_id}' "
                     "(session not found in this workspace)"
                 )

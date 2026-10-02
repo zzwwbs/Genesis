@@ -94,14 +94,15 @@ def test_package_closure_pins_nested_assets() -> None:
             "protocol.yaml",
             "outcomes.yaml",
             "models.yaml",
-            "processes.yaml",
-            "metadata.json",
             "prompts/compose.txt",
             "schemas/output.yaml",
             "data/population.csv",
             "data/nested/matrix.json",
         ):
             assert expected in paths, f"missing {expected}"
+        assert "metadata.json" not in paths
+        assert "processes.yaml" not in paths
+        assert "notes.txt" not in paths
         by_path = {asset["path"]: asset for asset in closure.manifest["assets"]}
         assert by_path["prompts/compose.txt"]["size"] == len("Compose from {context}")
         assert by_path["data/population.csv"]["media_type"] == "text/csv"
@@ -131,15 +132,15 @@ def test_closure_digest_is_stable_across_relocation(tmp_path: Path) -> None:
 def test_closure_rejects_traversal_and_symlink_escape(tmp_path: Path) -> None:
     spec_dir = tmp_path / ".genesis" / "specifications" / "escape-study"
     spec_dir.mkdir(parents=True)
-    (spec_dir / "study.yaml").write_text("schema_version: '1.0'\nstudy_id: escape-study\n")
     outside = tmp_path / "outside-secret.txt"
     outside.write_text("do not inline")
-    # A symlink inside the package pointing outside the package.
+    # A canonical file that is a link is refused. A stray root file is not
+    # collected at all, so it is not a way to point the closure outside.
     try:
-        (spec_dir / "leak.txt").symlink_to(outside)
+        (spec_dir / "study.yaml").symlink_to(outside)
     except OSError:
         pytest.skip("symlinks unavailable on this filesystem")
-    with pytest.raises(ValueError, match="escape|outside|symlink"):
+    with pytest.raises(ValueError, match="symbolic link|PACKAGE_SYMLINK|escapes"):
         build_package_closure(spec_dir)
 
 
@@ -155,6 +156,7 @@ def test_closure_excludes_credential_files(tmp_path: Path) -> None:
     assert ".credentials.yaml" not in paths
     assert "creds.json" not in paths
     assert "study.yaml" in paths
+    assert "metadata.json" not in paths
 
 
 def test_run_identity_pins_nested_package_assets(tmp_path: Path) -> None:

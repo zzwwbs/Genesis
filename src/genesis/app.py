@@ -8,7 +8,7 @@ import logging
 import re
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, cast
@@ -20,6 +20,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from genesis import __version__
 from genesis.compiler import ValidationIssue
+from genesis.errors import NotFoundError
+from genesis.evidence import ExportMode
 from genesis.replay import ReplayMode
 from genesis.service import GenesisService
 
@@ -69,7 +71,18 @@ _DOMAIN_CODE = re.compile(r"[A-Z][A-Z0-9_]*")
 
 def _service_error(exc: Exception) -> JSONResponse:
     _LOGGER.warning("service error: %s", exc)
-    if isinstance(exc, KeyError):
+    if isinstance(exc, KeyError) and not isinstance(exc, NotFoundError):
+        # A missing key inside a route is an internal fault, not an absent
+        # resource. Reported as 404 it read as "resource not found", with advice
+        # to list a collection that was fine, while the real fault was hidden.
+        _LOGGER.exception("unhandled service error", exc_info=exc)
+        return _error(
+            "INTERNAL_ERROR",
+            "the request failed inside the service; see the server log",
+            500,
+            remediation="Retry; if it persists, inspect the server log for the correlation id.",
+        )
+    if isinstance(exc, NotFoundError):
         message = str(exc).strip(chr(34)).strip(chr(39))
         if message.startswith("ELICITATION_SESSION_EXPIRED"):
             return _error(
@@ -122,6 +135,57 @@ def _service_error(exc: Exception) -> JSONResponse:
         status,
         remediation=_REMEDIATION.get(code, "Inspect the message and correct the request."),
     )
+
+
+def _id_list_option(name: str, value: Any) -> tuple[str, ...]:
+    """A list of ids; a lone string is one id, not one per character.
+
+    tuple("note-x") is ('n', 'o', 't', 'e', '-', 'x'): a replay asked for one
+    artifact matched none of them and answered 200 with an empty set.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, list | tuple) and all(isinstance(item, str) for item in value):
+        return tuple(value)
+    raise ValueError(f"VALIDATION_ERROR: {name} must be a list of ids")
+
+
+def _concurrency_option(value: Any) -> int | dict[str, Any] | None:
+    """A model-call concurrency limit: one integer, or a limit per model profile.
+
+    The protocol route read this with ``_integer_option`` alone, so the
+    per-profile form ``{profile: N}`` -- which the execute and resume routes,
+    the CLI and the service all accept -- was refused for protocol runs. The
+    scalar form is still coerced as before; a mapping goes to the service, which
+    checks its profiles against the build before any cell is created.
+    """
+    if isinstance(value, Mapping):
+        return dict(value)
+    return _integer_option("max_concurrency", value)
+
+
+_EXPORT_MODES = (ExportMode.EXPLORATION, ExportMode.REPRODUCIBILITY)
+
+
+def _export_mode(value: Any) -> str:
+    """An export mode the service reads; anything else is a client error.
+
+    The raw text was forwarded, so "REPRODUCIBILITY" took the exploration branch
+    (the comparison is exact) while the bundle manifest recorded the caller's
+    spelling as its export mode -- an exploration bundle labelled as one whose
+    build and execution manifest travel with it, which is how a reproducibility
+    claim is read.
+    """
+    if value is None:
+        return ExportMode.EXPLORATION
+    text = str(value)
+    if text not in _EXPORT_MODES:
+        raise ValueError(
+            f"VALIDATION_ERROR: export mode must be one of {', '.join(_EXPORT_MODES)}, not {text!r}"
+        )
+    return text
 
 
 def _integer_option(name: str, value: Any, default: int | None = None) -> int | None:
@@ -344,9 +408,13 @@ def create_app(
 
     @app.post("/packages", status_code=201)
     def create_package(payload: dict[str, Any]) -> Any:
-        package_id = (
-            payload.get("id")
-            or hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+        # The generated id must satisfy the same contract as a caller's: a hex
+        # digest starts with a digit nearly half the time, and create_package
+        # refuses that, so anonymous posts failed nondeterministically while the
+        # identical shape with a letter-leading digest succeeded. Prefixing keeps
+        # the id deterministic for the same payload.
+        package_id = payload.get("id") or (
+            "pkg-" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
         )
         try:
             return service.create_package({**payload, "id": package_id})
@@ -390,7 +458,12 @@ def create_app(
     def build_processes(build_ref: str) -> Any:
         try:
             build_path = service.resolve_path(build_ref)
-            processes = json.loads((build_path / "processes.json").read_text())
+            processes_file = build_path / "processes.json"
+            if not processes_file.is_file():
+                # A build that is not there is an absent resource, not an
+                # internal fault; reading it raised FileNotFoundError, a 500.
+                raise NotFoundError(f"build '{build_ref}'")
+            processes = json.loads(processes_file.read_text())
             return {
                 "build": build_ref,
                 "processes": [
@@ -415,7 +488,7 @@ def create_app(
         try:
             run_id = str(payload.get("run_id", payload.get("id", "")))
             output = str(payload.get("output", ""))
-            mode = str(payload.get("mode", "exploration"))
+            mode = _export_mode(payload.get("mode"))
             if not run_id or not output:
                 return _error("VALIDATION_ERROR", "run_id and output are required", 422)
             paths = service.export_run(run_id, output, mode=mode)
@@ -453,7 +526,7 @@ def create_app(
                 )
             tables, dictionary = service.run_datasets(run_id, analysis_build=analysis_build)
             if dataset_id not in tables:
-                raise KeyError(dataset_id)
+                raise NotFoundError(dataset_id)
             rows = tables[dataset_id]
             return {
                 "run_id": run_id,
@@ -491,9 +564,10 @@ def create_app(
     def package_snapshot(specification_id: str, version: int) -> Any:
         try:
             return service.get_package_snapshot(specification_id, version)
-        except KeyError:
-            return _service_error(KeyError(specification_id))
         except Exception as exc:
+            # The absence arrives as NotFoundError. Re-raising it as a plain
+            # KeyError here turned a missing specification or version into a 500
+            # once only NotFoundError meant 404.
             return _service_error(exc)
 
     @app.post("/imports", status_code=201)
@@ -706,7 +780,7 @@ def create_app(
                 max_workers=cast(
                     int, _integer_option("max_workers", options.get("max_workers"), 4)
                 ),
-                max_concurrency=_integer_option("max_concurrency", options.get("max_concurrency")),
+                max_concurrency=_concurrency_option(options.get("max_concurrency")),
             )
         except Exception as exc:
             return _service_error(exc)
@@ -806,7 +880,7 @@ def create_app(
             return service.replay_preview(
                 run_id,
                 mode=_replay_mode(body.get("mode", "full")),
-                artifact_ids=tuple(body.get("artifact_ids", ())),
+                artifact_ids=_id_list_option("artifact_ids", body.get("artifact_ids")),
                 boundary=body.get("boundary"),
                 overrides=body.get("overrides"),
                 justification=body.get("justification"),
@@ -821,7 +895,7 @@ def create_app(
             return service.replay_run(
                 run_id,
                 mode=_replay_mode(body.get("mode", "full")),
-                artifact_ids=tuple(body.get("artifact_ids", ())),
+                artifact_ids=_id_list_option("artifact_ids", body.get("artifact_ids")),
                 boundary=body.get("boundary"),
                 overrides=body.get("overrides"),
                 justification=body.get("justification"),

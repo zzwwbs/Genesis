@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import tempfile
+from collections import OrderedDict
 from collections.abc import Collection, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -15,7 +16,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Any, cast
+from urllib.parse import quote
 
+from genesis.errors import NotFoundError
 from genesis.state_encoding import (
     EVENT_BASE_COST_RATIO,
     FORM_BASE,
@@ -28,6 +31,8 @@ from genesis.state_encoding import (
 )
 
 _SCHEMA_VERSION = 11
+# Runs whose tail records the chain cache keeps decoded (two tables each).
+_CHAIN_CACHE_LIMIT = 16
 _RUN_STATUSES = {"created", "running", "paused", "completed", "failed", "cancelled"}
 # A SHA-256 object digest as it appears inside stored JSON records.
 _DIGEST_PATTERN = re.compile(r"\b[0-9a-f]{64}\b")
@@ -213,7 +218,15 @@ class ObjectStore:
 
 
 class PersistenceCoordinator:
-    def __init__(self, database: str | Path, objects: str | Path):
+    def __init__(self, database: str | Path, objects: str | Path, *, read_only: bool = False):
+        """Open a workspace's database and object store.
+
+        ``read_only`` opens the database with SQLite's own read-only flag and skips
+        migration and the journal-mode write, for a reader that must not change
+        what it inspects -- the evidence tools, which document themselves as
+        reading only. The schema is still checked, so a workspace that would need
+        migrating is reported rather than opened and silently rewritten.
+        """
         self._lock = RLock()
         # Last reconstructed predecessor per (table, run). Choosing a storage
         # form needs the value the new record follows; rebuilding it from the
@@ -221,14 +234,35 @@ class PersistenceCoordinator:
         # committing quadratic in run length. The entry is only used when it
         # still matches the row actually at the end of the chain, so a
         # concurrent writer or a reopened database falls back to reconstruction.
-        self._chain_cache: dict[tuple[str, str], tuple[tuple[int, str], dict[str, Any]]] = {}
+        # The decoded tail record per (table, run), so the next commit patches
+        # against it without re-reading. Bounded: it held a full state snapshot
+        # for every run the coordinator ever touched, for the life of the
+        # process, so a protocol with many cells kept one per cell. A miss only
+        # costs a re-read, so the least recently used entries are dropped.
+        self._chain_cache: OrderedDict[tuple[str, str], tuple[tuple[int, str], dict[str, Any]]] = (
+            OrderedDict()
+        )
         self.object_store = ObjectStore(objects)
-        self.connection = sqlite3.connect(database, isolation_level=None, check_same_thread=False)
+        if read_only:
+            # SQLite's own read-only flag: a missing database is refused rather
+            # than created, and no statement can write. The path is percent-encoded:
+            # a directory named ``x%20y`` was decoded as ``x y`` and opened a sibling.
+            resolved = Path(database).resolve().as_posix()
+            uri = "file:" + quote(resolved, safe="/:") + "?mode=ro"
+            self.connection = sqlite3.connect(
+                uri, uri=True, isolation_level=None, check_same_thread=False
+            )
+        else:
+            self.connection = sqlite3.connect(
+                database, isolation_level=None, check_same_thread=False
+            )
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=5000")
-        self._migrate_database()
+        if not read_only:
+            self._migrate_database()
         self._validate_schema()
-        self.connection.execute("PRAGMA journal_mode=WAL")
+        if not read_only:
+            self.connection.execute("PRAGMA journal_mode=WAL")
         for digest, media_type, size in self.connection.execute(
             "SELECT digest, media_type, size FROM objects"
         ):
@@ -246,7 +280,21 @@ class PersistenceCoordinator:
             v0_layout = self._validate_v0_schema(tables)
             if v0_layout == "immediate":
                 self.connection.execute("BEGIN IMMEDIATE")
+                # The version and layout above were read before this lock. A
+                # second process opening the same legacy workspace validated the
+                # v0 layout, then waited here while the first migrated it, and
+                # rebuilt the finished schema: columns dropped, user_version left
+                # at 2, and a workspace nothing could open. Re-read under the lock
+                # and leave an already-migrated database to the loop below.
+                current = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+                if current > 0:
+                    self.connection.execute("COMMIT")
+                    version = current
+                    v0_layout = "migrated"
+                    self._validate_schema_version(version)
+            if v0_layout == "immediate":
                 try:
+                    self._validate_v0_schema(set(self._user_tables()))
                     self._rebuild_v0_tables(immediate=True)
                     self._validate_schema_version(2)
                     self.connection.execute("PRAGMA user_version = 2")
@@ -257,10 +305,36 @@ class PersistenceCoordinator:
                     raise
                 version = 2
         elif version > 0:
-            self._validate_schema_version(version)
+            # The version was read before any lock, so a concurrent migrator could
+            # commit between that read and this validation and leave a healthy
+            # workspace failing to open. Re-read inside a transaction and validate
+            # what is there now. A deferred BEGIN is enough: this transaction only
+            # reads, and BEGIN IMMEDIATE took the write lock, so a normal open
+            # waited out every writer and then failed.
+            self.connection.execute("BEGIN")
+            try:
+                current = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+                self._validate_schema_version(current)
+                self.connection.execute("COMMIT")
+            except Exception:
+                self._rollback()
+                raise
+            version = current
         while version < _SCHEMA_VERSION:
             target = version + 1
             self.connection.execute("BEGIN IMMEDIATE")
+            # The version read above was taken outside this lock. Two processes
+            # opening a new workspace together can both read 0; the second then
+            # waits here while the first migrates, and ran _migration_1 against
+            # the finished schema -- which it took for a v0 layout and rebuilt,
+            # dropping events.commit_hash, events.form and states.form, rewinding
+            # user_version to 1 and leaving a workspace nothing could open again.
+            # Re-read under the lock and skip what another process has applied.
+            current = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+            if current >= target:
+                self.connection.execute("COMMIT")
+                version = current
+                continue
             try:
                 if target == 1:
                     self._migration_1()
@@ -317,7 +391,12 @@ class PersistenceCoordinator:
         }
 
     def _migration_1(self) -> None:
-        if self._user_tables():
+        tables = self._user_tables()
+        if tables:
+            # Rebuild only a layout this migration recognises as v0. A truthiness
+            # test took any non-empty schema for v0 -- including a fully migrated
+            # one -- and rebuilt it, discarding every column it did not list.
+            self._validate_v0_schema(set(tables))
             self._rebuild_v0_tables()
             return
         self._create_v1_tables()
@@ -889,7 +968,7 @@ class PersistenceCoordinator:
             refs = [*refs, state_object, event_object]
             for ref in refs:
                 self._record_object(ref)
-            self.connection.execute(
+            inserted_event = self.connection.execute(
                 """INSERT INTO events(
                        event_id, run_id, kind, payload_ref, event_hash, commit_hash, form
                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -917,7 +996,19 @@ class PersistenceCoordinator:
                 [(artifact_id, run_id, ref.digest) for artifact_id, run_id, ref in artifact_refs],
             )
             self.connection.execute("COMMIT")
-            self._remember_committed(str(event["run_id"]), event_bytes, state["payload"])
+            # The rows this commit wrote, known inside its own transaction. Read
+            # back after COMMIT, the tail could already be another writer's row,
+            # and the cache then held this writer's value under that row's key --
+            # the next commit patched against the wrong base, durably.
+            self._remember_committed(
+                str(event["run_id"]),
+                event_bytes,
+                state["payload"],
+                {
+                    "events": (int(inserted_event.lastrowid or 0), event_object.digest),
+                    "states": (int(state["state_version"]), state_object.digest),
+                },
+            )
         except Exception:
             self._rollback()
             raise
@@ -1090,7 +1181,7 @@ class PersistenceCoordinator:
             "SELECT payload_json FROM studies WHERE study_id = ?", (study_id,)
         ).fetchone()
         if row is None:
-            raise KeyError(study_id)
+            raise NotFoundError(study_id)
         return cast(dict[str, Any], json.loads(row[0]))
 
     def list_studies(self) -> list[dict[str, Any]]:
@@ -1147,7 +1238,7 @@ class PersistenceCoordinator:
             "SELECT payload_json FROM runs WHERE run_id = ?", (run_id,)
         ).fetchone()
         if row is None:
-            raise KeyError(run_id)
+            raise NotFoundError(run_id)
         return cast(dict[str, Any], json.loads(row[0]))
 
     def list_runs(self) -> list[dict[str, Any]]:
@@ -1280,6 +1371,19 @@ class PersistenceCoordinator:
             # fields are skipped before copying, so they are never duplicated.
             yield {key: copy_value(value) for key, value in event.items() if key not in excluded}
 
+    def event_marker(self, run_id: str) -> tuple[int, int]:
+        """How many events a run holds, and its newest row id.
+
+        Changes whenever a commit lands, which a run's version does not while it
+        is running, so a cache over a run's evidence can tell it is stale.
+        """
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row[0]), int(row[1])
+
     def list_events(
         self, run_id: str, *, exclude_fields: tuple[str, ...] = ()
     ) -> list[dict[str, Any]]:
@@ -1406,7 +1510,13 @@ class PersistenceCoordinator:
             since += self._object_size(ref)
         return 0, since
 
-    def _remember_committed(self, run_id: str, event_bytes: bytes, state_payload: Any) -> None:
+    def _remember_committed(
+        self,
+        run_id: str,
+        event_bytes: bytes,
+        state_payload: Any,
+        tails: Mapping[str, tuple[int, str]],
+    ) -> None:
         """Cache what this commit wrote as the predecessor of the next commit."""
         for table, payload in (("events", event_bytes), ("states", state_payload)):
             try:
@@ -1417,7 +1527,7 @@ class PersistenceCoordinator:
             if not isinstance(decoded, dict):
                 self._chain_cache.pop((table, run_id), None)
                 continue
-            self._remember_predecessor(table, run_id, decoded)
+            self._remember_predecessor(table, run_id, decoded, tails[table])
 
     def _cached_predecessor(
         self, table: str, run_id: str, tail: tuple[int, str]
@@ -1426,25 +1536,22 @@ class PersistenceCoordinator:
         entry = self._chain_cache.get((table, run_id))
         if entry is None or entry[0] != tail:
             return None
+        self._chain_cache.move_to_end((table, run_id))
         return entry[1]
 
-    def _remember_predecessor(self, table: str, run_id: str, value: dict[str, Any]) -> None:
+    def _remember_predecessor(
+        self, table: str, run_id: str, value: dict[str, Any], tail: tuple[int, str]
+    ) -> None:
         """Record a just-committed record as the predecessor of the next one.
 
         Called only after the transaction commits, so a rolled-back write never
-        becomes the base of a later patch. The stored key is the new tail row,
-        which is re-read here rather than assumed.
+        becomes the base of a later patch. Keyed by the row this commit inserted,
+        which the caller took from inside the transaction.
         """
-        order = "state_version" if table == "states" else "rowid"
-        row = self.connection.execute(
-            f"SELECT {order}, payload_ref FROM {table} WHERE run_id = ? "  # noqa: S608
-            f"ORDER BY {order} DESC LIMIT 1",
-            (run_id,),
-        ).fetchone()
-        if row is None:
-            self._chain_cache.pop((table, run_id), None)
-            return
-        self._chain_cache[(table, run_id)] = ((int(row[0]), str(row[1])), value)
+        self._chain_cache[(table, run_id)] = (tail, value)
+        self._chain_cache.move_to_end((table, run_id))
+        while len(self._chain_cache) > _CHAIN_CACHE_LIMIT:
+            self._chain_cache.popitem(last=False)
 
     def _object_size(self, digest: str) -> int:
         row = self.connection.execute(
@@ -1716,7 +1823,7 @@ class PersistenceCoordinator:
                 "SELECT status, version, payload_json FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
             if row is None:
-                raise KeyError(run_id)
+                raise NotFoundError(run_id)
             status, version, payload_json = row
             if version != expected_version:
                 raise ValueError(f"EXPECTED_VERSION: expected {expected_version}, found {version}")
@@ -1786,7 +1893,7 @@ class PersistenceCoordinator:
             (int(checkpoint_id),),
         ).fetchone()
         if not row:
-            raise KeyError(checkpoint_id)
+            raise NotFoundError(checkpoint_id)
         digest, expected = row
         ref_row = self.connection.execute(
             "SELECT media_type, size FROM objects WHERE digest = ?", (digest,)
@@ -1808,61 +1915,60 @@ class PersistenceCoordinator:
         status: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """Append one immutable StudyPackageVersion row (LIFE-001/002)."""
+        """Append one immutable StudyPackageVersion row (LIFE-001/002).
+
+        One savepoint around the implied study and the version: the connection
+        autocommits, so a study created here survived a version that was then
+        refused -- a phantom study with no package, the class record_study_build
+        was already fixed for.
+        """
         with self._lock:
-            self._ensure_study(study_id, str(payload.get("title", study_id)))
-            existing = self.connection.execute(
-                """SELECT status, content_hash FROM package_versions
-                   WHERE study_id = ? AND version = ?""",
-                (study_id, version),
-            ).fetchone()
-            if existing is not None:
-                if status == "approved" and existing[0] == "draft":
-                    # Approval transitions the version row; content is never rewritten.
-                    # The approval-time digest must equal the recorded draft digest.
-                    if existing[1] != content_hash:
-                        raise ValueError(
-                            "APPROVAL_HASH_MISMATCH: approved content hash "
-                            f"{content_hash[:12]} differs from the recorded draft hash "
-                            f"{existing[1][:12]} of version {version}"
-                        )
-                    self.connection.execute(
-                        """UPDATE package_versions SET status = ?, payload_json = ?
-                           WHERE study_id = ? AND version = ?""",
-                        (status, self._encode_record(payload), study_id, version),
-                    )
-                elif existing[1] != content_hash:
-                    raise ValueError(
-                        f"PACKAGE_VERSION_EXISTS: version {version} of '{study_id}' is immutable"
-                    )
-                return {
-                    "study_id": study_id,
-                    "version": version,
-                    "content_hash": content_hash,
-                    "parent_version": parent_version,
-                    "status": status,
-                }
-            row = (
-                study_id,
-                version,
-                content_hash,
-                parent_version,
-                status,
-                self._encode_record(payload),
-                str(payload.get("snapshot_digest", "")),
-            )
+            self.connection.execute("SAVEPOINT record_package_version")
             try:
-                self.connection.execute(
-                    """INSERT INTO package_versions(
-                           study_id, version, content_hash, parent_version, status,
-                           payload_json, snapshot_digest
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    row,
+                result = self._record_package_version(
+                    study_id, version, content_hash, parent_version, status, payload
                 )
-            except sqlite3.IntegrityError as exc:
+            except BaseException:
+                self.connection.execute("ROLLBACK TO SAVEPOINT record_package_version")
+                self.connection.execute("RELEASE SAVEPOINT record_package_version")
+                raise
+            self.connection.execute("RELEASE SAVEPOINT record_package_version")
+            return result
+
+    def _record_package_version(
+        self,
+        study_id: str,
+        version: int,
+        content_hash: str,
+        parent_version: int | None,
+        status: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._ensure_study(study_id, str(payload.get("title", study_id)))
+        existing = self.connection.execute(
+            """SELECT status, content_hash FROM package_versions
+               WHERE study_id = ? AND version = ?""",
+            (study_id, version),
+        ).fetchone()
+        if existing is not None:
+            if status == "approved" and existing[0] == "draft":
+                # Approval transitions the version row; content is never rewritten.
+                # The approval-time digest must equal the recorded draft digest.
+                if existing[1] != content_hash:
+                    raise ValueError(
+                        "APPROVAL_HASH_MISMATCH: approved content hash "
+                        f"{content_hash[:12]} differs from the recorded draft hash "
+                        f"{existing[1][:12]} of version {version}"
+                    )
+                self.connection.execute(
+                    """UPDATE package_versions SET status = ?, payload_json = ?
+                       WHERE study_id = ? AND version = ?""",
+                    (status, self._encode_record(payload), study_id, version),
+                )
+            elif existing[1] != content_hash:
                 raise ValueError(
                     f"PACKAGE_VERSION_EXISTS: version {version} of '{study_id}' is immutable"
-                ) from exc
+                )
             return {
                 "study_id": study_id,
                 "version": version,
@@ -1870,6 +1976,34 @@ class PersistenceCoordinator:
                 "parent_version": parent_version,
                 "status": status,
             }
+        row = (
+            study_id,
+            version,
+            content_hash,
+            parent_version,
+            status,
+            self._encode_record(payload),
+            str(payload.get("snapshot_digest", "")),
+        )
+        try:
+            self.connection.execute(
+                """INSERT INTO package_versions(
+                       study_id, version, content_hash, parent_version, status,
+                       payload_json, snapshot_digest
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                row,
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                f"PACKAGE_VERSION_EXISTS: version {version} of '{study_id}' is immutable"
+            ) from exc
+        return {
+            "study_id": study_id,
+            "version": version,
+            "content_hash": content_hash,
+            "parent_version": parent_version,
+            "status": status,
+        }
 
     def list_package_versions(self, study_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -1937,7 +2071,7 @@ class PersistenceCoordinator:
                 (experiment_id,),
             ).fetchone()
             if row is None:
-                raise KeyError(experiment_id)
+                raise NotFoundError(experiment_id)
             return cast(dict[str, Any], json.loads(row[0]))
 
     def list_experiments(self) -> list[dict[str, Any]]:
@@ -2417,4 +2551,5 @@ class PersistenceCoordinator:
 
     def close(self) -> None:
         with self._lock:
+            self._chain_cache.clear()
             self.connection.close()

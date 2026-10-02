@@ -21,8 +21,11 @@ class FakeResponse:
     def __init__(self, payload: dict[str, Any]):
         self.payload = payload
 
-    def read(self) -> bytes:
-        return json.dumps(self.payload).encode()
+    def read(self, amt: int | None = None) -> bytes:
+        # The real HTTPResponse.read takes a byte limit, which the client now
+        # passes so a response cannot grow without bound.
+        body = json.dumps(self.payload).encode()
+        return body if amt is None else body[:amt]
 
     def __enter__(self) -> FakeResponse:
         return self

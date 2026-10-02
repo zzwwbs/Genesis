@@ -13,6 +13,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from genesis.outcome_plan import _observation_key
+
 
 @dataclass(frozen=True)
 class OutcomePlan:
@@ -115,14 +117,17 @@ class _Accumulator:
             if end is not None and moment > end:
                 return False
         return all(
-            all(row.get(key) == value for key, value in predicate.items())
+            all(
+                _observation_key(row.get(key)) == _observation_key(value)
+                for key, value in predicate.items()
+            )
             for predicate in self.plan.filters
         )
 
     def add(self, row: Mapping[str, Any]) -> None:
         if not self._admits(row):
             return
-        key = tuple(row.get(name) for name in self.keys) if self.keys else None
+        key = tuple(_group_part(row.get(name)) for name in self.keys) if self.keys else None
         state = self.groups.get(key)
         if state is None:
             state = self.groups[key] = _GroupState()
@@ -228,6 +233,39 @@ class _Accumulator:
         return result
 
 
+_GROUP_TAGS = frozenset({"bool", "num", "json", "raw"})
+
+
+def _group_part(value: Any) -> Any:
+    """A grouping key that keeps ``True`` apart from ``1`` but not ``1`` from ``1.0``.
+
+    A dict keyed by the raw value merged ``True`` into the group of ``1``.
+    ``7`` and ``7.0`` are one score and stay one group; the group is labelled
+    with whichever spelling appeared first, as the raw-keyed dict did.
+    """
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int | float):
+        return ("num", value)
+    if isinstance(value, dict | list):
+        return ("json", json.dumps(value, sort_keys=True, default=str))
+    return ("raw", value)
+
+
+def _unwrap_group(part: Any) -> Any:
+    if isinstance(part, tuple) and len(part) == 2 and part[0] in _GROUP_TAGS:
+        if part[0] == "json":
+            # The tag stores canonical text so the key can be hashed. The label
+            # is the object again; leaving the text made it identical to a
+            # string key of that same JSON.
+            try:
+                return json.loads(part[1])
+            except json.JSONDecodeError:
+                return part[1]
+        return part[1]
+    return part
+
+
 def _iter_source(sources: Mapping[str, Any], name: str) -> Iterable[Mapping[str, Any]]:
     """A fresh walk of one relation.
 
@@ -280,11 +318,17 @@ class AnalysisEngine:
         if not keys:
             return {}
         if len(keys) == 1:
-            return {keys[0]: key if not isinstance(key, tuple) else key[0]}
+            shown = key if not isinstance(key, tuple) else key[0]
+            return {keys[0]: _unwrap_group(shown)}
         values = key if isinstance(key, tuple) else (key,)
-        result: dict[str, Any] = {f"group_{i}": item for i, item in enumerate(values)}
-        for name, item in zip(keys, values, strict=False):
-            result.setdefault(str(name), item)
+        # Declared names are written first. Positional ``group_N`` labels fill
+        # only the names still free, so a field that is itself called ``group_0``
+        # keeps its value.
+        result: dict[str, Any] = {
+            str(name): _unwrap_group(item) for name, item in zip(keys, values, strict=False)
+        }
+        for index, item in enumerate(values):
+            result.setdefault(f"group_{index}", _unwrap_group(item))
         return result
 
     def window(

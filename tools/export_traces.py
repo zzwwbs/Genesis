@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -38,18 +37,41 @@ sys.path.insert(0, str(ROOT))
 
 WORKSPACE = ROOT / "genesis-workspace"
 DB = WORKSPACE / ".genesis" / "genesis.db"
+OBJECTS = WORKSPACE / ".genesis" / "objects"
 
 
-def objs(digest: str):
-    for cand in (
-        WORKSPACE / ".genesis" / "objects" / digest[:2] / digest[2:],
-        WORKSPACE / ".genesis" / "objects" / digest,
-    ):
-        try:
-            return json.loads(cand.read_text())
-        except Exception:
+def take_matching_events(
+    events,
+    *,
+    process: str | None,
+    phase: int | None,
+    prefix: str | None,
+    limit: int | None,
+    values: str,
+) -> tuple[list[dict], set[str]]:
+    """Events that match the filters, stopping once ``limit`` of them are in hand.
+
+    ``--limit`` used to apply only while the output list was built, after every
+    matching event had already been reconstructed.
+    """
+    matched: list[dict] = []
+    needed: set[str] = set()
+    for payload in events:
+        if not payload:
             continue
-    return None
+        if process and payload.get("process_id") != process:
+            continue
+        if phase is not None and payload.get("phase") != phase:
+            continue
+        actors = payload.get("actors") or []
+        if prefix and not any(str(actor).startswith(prefix) for actor in actors):
+            continue
+        matched.append(payload)
+        if values != "NONE":
+            needed.update(str(ref) for ref in (payload.get("input_refs") or ()))
+        if limit and len(matched) >= limit:
+            break
+    return matched, needed
 
 
 def main() -> int:
@@ -68,34 +90,47 @@ def main() -> int:
     parser.add_argument("--out", default=None, help="output JSON path")
     args = parser.parse_args()
 
-    con = sqlite3.connect(DB)
+    from genesis.persistence import PersistenceCoordinator
+
+    store = PersistenceCoordinator(DB, OBJECTS, read_only=True)
     try:
-        run_rows = con.execute("SELECT run_id, status FROM runs").fetchall()
+        run_rows = store.connection.execute("SELECT run_id, status FROM runs").fetchall()
         if not any(r[0] == args.run for r in run_rows):
             print("available runs:", [r[0] for r in run_rows])
             return 1
-        # events store payloads in the object store; process/phase/actor filters are
-        # applied after decoding (bounded by the run's event count).
-        events = con.execute(
-            "SELECT event_id, payload_ref, kind FROM events WHERE run_id=?", (args.run,)
-        ).fetchall()
+        # Reconstructed, not decoded row by row: an event is stored whole or as a
+        # patch against its predecessor (STH-009), and a patch row decoded alone
+        # yields {'fields': ...} -- most events of a long run came out with no
+        # process id, so the filters below silently dropped them.
+        # Filtered as they are reconstructed. Listing the run first held every
+        # event at once (about 1.9 GB on the largest run) before any filter ran.
+        matched, needed = take_matching_events(
+            store.iter_events(args.run),
+            process=args.process,
+            phase=args.phase,
+            prefix=args.prefix,
+            limit=args.limit,
+            values=args.values,
+        )
+        artifacts: dict[str, dict] = {}
+        if needed:
+            for row in store.iter_artifacts(args.run):
+                artifact_id = str(row["artifact_id"])
+                if artifact_id not in needed:
+                    continue
+                payload_bytes = row["payload"]
+                try:
+                    value = json.loads(payload_bytes)
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                    value = {}
+                artifacts[artifact_id] = value if isinstance(value, dict) else {}
     finally:
-        con.close()
-
-    artifacts: dict[str, dict] = {}
-    con = sqlite3.connect(DB)
-    try:
-        for aid, pref in con.execute(
-            "SELECT artifact_id, payload_ref FROM artifacts WHERE run_id=?", (args.run,)
-        ).fetchall():
-            value = objs(str(pref))
-            artifacts[aid] = value or {}
-    finally:
-        con.close()
+        store.close()
 
     records = []
-    for event_id, pref, kind in events:
-        payload = objs(str(pref))
+    for payload in matched:
+        event_id = payload.get("event_id")
+        kind = payload.get("kind")
         if not payload:
             continue
         if args.process and payload.get("process_id") != args.process:

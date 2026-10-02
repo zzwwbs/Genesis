@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from genesis.errors import NotFoundError
+
 _ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 _VERSION = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?(?:[-+][0-9A-Za-z.-]+)?$")
 
@@ -101,7 +103,7 @@ class ExtensionRegistry:
         try:
             return self._entries[extension_id][1]
         except KeyError:
-            raise KeyError(f"extension unavailable: {extension_id}") from None
+            raise NotFoundError(f"extension unavailable: {extension_id}") from None
 
     def manifests(self) -> tuple[ExtensionManifest, ...]:
         return tuple(manifest for manifest, _ in self._entries.values())

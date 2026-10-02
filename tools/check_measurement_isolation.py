@@ -11,7 +11,11 @@ declarations rather than hardcoded study identifiers:
 * those artifacts must not appear in any context policy other than the
   measurement processes' own input-only policies;
 * a measurement process must declare no state effects (which would feed
-  downstream causal state) and must read only ``inputs``.
+  downstream causal state) and must read only ``inputs``;
+* a causal process may read a measurement's artifacts only when it declares
+  that use in ``measurement_use`` (the design makes the measurement an
+  instrument, e.g. a detector score that sets revenue) -- and then only through
+  its own context policy.
 
 Runs against the SOURCED package yaml (pre-compile) via the same serialization
 path the compiler uses; exits non-zero on violation.
@@ -83,8 +87,35 @@ def check_package(package: Path) -> list[str]:
         return []
 
     measurement_artifacts: set[str] = set()
-    for process in measurement.values():
-        measurement_artifacts |= _declared_outputs(process)
+    # Which measurement process produces each artifact, so a declared use can be
+    # matched to the artifacts it licenses.
+    artifact_source: dict[str, str] = {}
+    for mid, process in measurement.items():
+        outputs = _declared_outputs(process)
+        measurement_artifacts |= outputs
+        for artifact in outputs:
+            artifact_source[artifact] = mid
+    # measurement_use was ignored, so a design that makes a measurement an
+    # instrument -- declared, with its reason -- was reported as a leak. A use
+    # licenses its own process to read that source's artifacts, and that
+    # process's own context policy to carry them; nothing wider.
+    declared_uses: dict[str, set[str]] = {
+        pid: {
+            str(use.get("source"))
+            for use in process.get("measurement_use") or []
+            if isinstance(use, dict) and use.get("source")
+        }
+        for pid, process in processes.items()
+        if pid not in measurement
+    }
+    licensed_policies: dict[str, set[str]] = {}
+    for pid, sources in declared_uses.items():
+        policy = processes[pid].get("context_policy")
+        if not policy or not sources:
+            continue
+        licensed_policies.setdefault(str(policy), set()).update(
+            artifact for artifact, source in artifact_source.items() if source in sources
+        )
     measurement_policies = {
         str(process.get("context_policy"))
         for process in measurement.values()
@@ -97,7 +128,7 @@ def check_package(package: Path) -> list[str]:
     for policy_id, allowed in visibility.items():
         if policy_id in measurement_policies:
             continue
-        leaks = sorted(measurement_artifacts & allowed)
+        leaks = sorted((measurement_artifacts & allowed) - licensed_policies.get(policy_id, set()))
         if leaks:
             violations.append(f"policy {policy_id} exposes measurement artifacts {leaks}")
 
@@ -115,7 +146,12 @@ def check_package(package: Path) -> list[str]:
         if pid in measurement:
             continue
         declared_inputs = {str(item) for item in process.get("inputs") or []}
-        consumed = sorted(measurement_artifacts & declared_inputs)
+        licensed = {
+            artifact
+            for artifact, source in artifact_source.items()
+            if source in declared_uses.get(pid, set())
+        }
+        consumed = sorted((measurement_artifacts & declared_inputs) - licensed)
         if consumed:
             violations.append(f"causal process {pid} consumes measurement artifacts {consumed}")
     return violations

@@ -11,10 +11,37 @@ study-specific names such as ``evaluate-clickbait`` or ``titles``.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 OUTCOME_PLAN_VERSION = 1
+# A dataset id names the files it is exported to, so it has to be the same
+# stable kebab-case identifier the specification requires: a plain name that
+# cannot climb out of, or replace, the export directory.
+_DATASET_ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+
+
+def check_dataset_id(value: Any) -> str:
+    """The dataset id, refused unless it is a single stable identifier.
+
+    The id was spliced into export paths unchecked. A plan's ids are validated
+    when a specification is written, but a build's outcome_plan.json is loaded
+    as plain JSON -- and an imported bundle's plan is copied verbatim and
+    re-signed -- so `../../../escaped` wrote outside the export directory, and
+    an absolute id wrote anywhere on disk.
+    """
+    text = str(value or "")
+    if not text:
+        raise ValueError("OUTCOME_PLAN: dataset requires an id")
+    if not _DATASET_ID.fullmatch(text):
+        raise ValueError(
+            f"OUTCOME_PLAN: dataset id {text!r} is not a stable lowercase kebab-case "
+            "identifier; it names the dataset's export files, so it cannot contain a "
+            "path"
+        )
+    return text
+
 
 # What the outcome evaluator reads. A key outside these is never consulted, so a
 # declaration using one compiled clean and evaluated as something else: every
@@ -35,33 +62,160 @@ OUTCOME_JOIN_KEYS = frozenset({"left", "right", "on"})
 # A string is used so it can never collide with a real phase index (int).
 _INCOMPLETE_ROUND = "__incomplete_round__"
 
+
+def _number(value: Any) -> float | None:
+    """A real number, or ``None`` when the value is missing or not numeric.
+
+    A missing score used to become NaN. ``NaN >= 7`` is false, so the comparison
+    stored False and the mean counted it; arithmetic stored a bare NaN, which
+    ``json.dumps`` writes and which is not valid JSON.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and value != value:
+        return None
+    return float(value)
+
+
+def _arithmetic(operator: str, left: Any, right: Any) -> float | None:
+    a, b = _number(left), _number(right)
+    if a is None or b is None:
+        return None
+    if operator == "add":
+        return a + b
+    if operator == "subtract":
+        return a - b
+    if operator == "multiply":
+        return a * b
+    if operator == "divide":
+        return None if b == 0 else a / b
+    return None
+
+
+def _comparison(operator: str, left: Any, right: Any) -> bool | None:
+    # A missing operand is not an observation. ``None == 7`` is false in Python,
+    # and storing that false counted the gap: scores ``[7, 9, None, None]``
+    # averaged to 0.25 with nothing missing. ``ne`` counted every gap as true.
+    if left is None or right is None:
+        return None
+    if operator == "eq":
+        # ``True == 1`` and ``7 == 7.0``. Only the first pair is two values.
+        return bool(_observation_key(left) == _observation_key(right))
+    if operator == "ne":
+        return bool(_observation_key(left) != _observation_key(right))
+    a, b = _number(left), _number(right)
+    if a is None or b is None:
+        return None
+    if operator == "gt":
+        return a > b
+    if operator == "gte":
+        return a >= b
+    if operator == "lt":
+        return a < b
+    if operator == "lte":
+        return a <= b
+    return None
+
+
 ARITHMETIC_OPS: dict[str, Any] = {
-    "add": lambda a, b: _number(a) + _number(b),
-    "subtract": lambda a, b: _number(a) - _number(b),
-    "multiply": lambda a, b: _number(a) * _number(b),
-    "divide": lambda a, b: None if _number(b) == 0 else _number(a) / _number(b),
+    "add": lambda a, b: _arithmetic("add", a, b),
+    "subtract": lambda a, b: _arithmetic("subtract", a, b),
+    "multiply": lambda a, b: _arithmetic("multiply", a, b),
+    "divide": lambda a, b: _arithmetic("divide", a, b),
 }
 COMPARISON_OPS: dict[str, Any] = {
-    "eq": lambda a, b: a == b,
-    "ne": lambda a, b: a != b,
-    "gt": lambda a, b: _number(a) > _number(b),
-    "gte": lambda a, b: _number(a) >= _number(b),
-    "lt": lambda a, b: _number(a) < _number(b),
-    "lte": lambda a, b: _number(a) <= _number(b),
+    "eq": lambda a, b: _comparison("eq", a, b),
+    "ne": lambda a, b: _comparison("ne", a, b),
+    "gt": lambda a, b: _comparison("gt", a, b),
+    "gte": lambda a, b: _comparison("gte", a, b),
+    "lt": lambda a, b: _comparison("lt", a, b),
+    "lte": lambda a, b: _comparison("lte", a, b),
 }
 
 
-def _hashable(value: Any) -> Any:
-    """A deduplication key part: the value, or its canonical JSON when unhashable."""
+# Columns the store writes around a row. A payload copy repeats the row's own
+# fields; these do not count. ``declared_artifact_id`` does count: it sits
+# beside a nested ``value`` and is not one of that nested field's keys, which
+# is how the nested field is told apart from a copy of the whole row.
+_ROW_ENVELOPE = frozenset(
+    {
+        "artifact_id",
+        "run_id",
+        "time",
+        "condition_id",
+        "replication",
+        "experiment_id",
+        "invocation_id",
+        "process_id",
+        "producer_process",
+        "producer_event",
+        "phase",
+        "commit_order",
+        "state_version",
+        "owner",
+        "schema_ref",
+        "visibility",
+        "lifecycle_scope",
+        "lineage",
+        "actors",
+        "instance_id",
+    }
+)
+
+
+def _observation_key(value: Any) -> Any:
+    """An identity that keeps ``True`` apart from ``1`` but not ``1`` from ``1.0``.
+
+    ``True == 1`` and they share a hash, so a dedup set, a join index, or a
+    filter took a boolean for a count. ``7`` and ``7.0`` are one number: a model
+    may write a schema-valid integer score either way, and telling them apart
+    split one score into two groups and dropped ``7.0`` from a ``== 7`` filter.
+    Grouping uses the same rule.
+    """
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int | float):
+        # One tag for both, so ("num", 7) == ("num", 7.0) and they hash alike.
+        return ("num", value)
     if isinstance(value, dict | list | set | tuple):
         return ("json", json.dumps(value, sort_keys=True, default=str))
     return value
 
 
-def _number(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return float("nan")
-    return float(value)
+def _hashable(value: Any) -> Any:
+    """A deduplication key part."""
+    return _observation_key(value)
+
+
+def _value_repeats_row(value: Any, row: Mapping[str, Any]) -> bool:
+    """Whether ``value`` is the payload already copied onto ``row``.
+
+    A scalar is copied under the declared artifact id as well as ``value``.
+    A mapping is that copy only when it still carries every non-envelope field
+    of the row. A nested ``value`` can repeat some of those fields and still be
+    the record's own; an empty mapping is its own value too.
+    """
+    declared = row.get("declared_artifact_id")
+    if (
+        not isinstance(value, Mapping)
+        and isinstance(declared, str)
+        and declared
+        and declared != "value"
+        and _observation_key(row.get(declared)) == _observation_key(value)
+    ):
+        return True
+    if not isinstance(value, Mapping) or not value:
+        return False
+    if any(
+        key not in row or _observation_key(row[key]) != _observation_key(item)
+        for key, item in value.items()
+    ):
+        return False
+    return all(
+        key in value or key in _ROW_ENVELOPE or str(key).startswith("__")
+        for key in row
+        if key != "value"
+    )
 
 
 def _resolve_path(source: Mapping[str, Any], path: str) -> Any:
@@ -107,7 +261,9 @@ def _apply_fields(row: dict[str, Any], fields: list[Mapping[str, Any]]) -> dict[
             if handler is None:
                 operator = step.get("operator")
                 raise ValueError(f"OUTCOME_PLAN: unknown comparison operator '{operator}'")
-            row[name] = bool(handler(left, right))
+            result = handler(left, right)
+            # bool(None) is False, which is how a missing score was counted.
+            row[name] = None if result is None else bool(result)
         elif op == "conditional":
             condition = step.get("condition") or {}
             value = _resolve_path(row, str(condition.get("field") or ""))
@@ -126,15 +282,86 @@ def _matches(row: Mapping[str, Any], predicate: Mapping[str, Any]) -> bool:
         return not bool(actual)
     expected = predicate.get("value")
     if op == "eq":
-        return bool(actual == expected)
+        # The same identity as grouping: ``7`` matches ``7.0``, and ``True``
+        # does not match ``1``.
+        return bool(_observation_key(actual) == _observation_key(expected))
     if op == "ne":
-        return bool(actual != expected)
+        # None != 7 is true, so a missing score was kept as "not 7" and later
+        # counted. A gap is not an observation of inequality.
+        if actual is None:
+            return False
+        return bool(_observation_key(actual) != _observation_key(expected))
     if actual is None or expected is None:
         return False
     handler = COMPARISON_OPS.get(op)
     if handler is None:
         raise ValueError(f"OUTCOME_PLAN: unknown dataset filter operator '{op}'")
     return bool(handler(actual, expected))
+
+
+def _is_engine_column(key: str) -> bool:
+    """A column the engine writes to place a row in its run, cell and round."""
+    return key in _ROW_ENVELOPE or key.startswith("factor_")
+
+
+def _named_state_row(record: Mapping[str, Any], field: str) -> dict[str, Any]:
+    """One snapshot reduced to ``field``, with the round still attached.
+
+    A missing field is null rather than the rest of the snapshot. A missing
+    field named ``phase`` must not be written as null: the round is recorded
+    in that column afterwards, and the null hid it. A value that is present,
+    including a stored null, stays.
+    """
+    row: dict[str, Any] = {}
+    if field in record:
+        row[field] = record[field]
+    if "_round" in record:
+        row["_round"] = record["_round"]
+    if field not in row and not (field == "phase" and "_round" in record):
+        row[field] = None
+    return row
+
+
+def _container_column(parent: Mapping[str, Any], root: str, key: str) -> str:
+    """A free name for a container field that must not occupy an engine column.
+
+    ``{root}_{key}`` is the usual spelling. It is not used when that column
+    already holds a value, or when it is itself an engine column: a container
+    named ``factor`` would be written as ``factor_phase`` and replace the
+    treatment. A later spelling keeps both.
+    """
+    stem = f"{root}_{key}"
+    if stem not in parent and not _is_engine_column(stem):
+        return stem
+    # A suffix of ``factor_phase`` still starts with ``factor_``. The spare
+    # name has to begin somewhere else.
+    spare = f"from_{root}_{key}"
+    name = spare
+    suffix = 2
+    while name in parent or _is_engine_column(name):
+        name = f"{spare}_{suffix}"
+        suffix += 1
+    return name
+
+
+def _without_leaf(container: Mapping[str, Any], parts: list[str]) -> dict[str, Any]:
+    """The container with the exploded collection removed.
+
+    The collection's immediate siblings flatten onto the caller, so exploding
+    ``state_delta.rows`` keeps ``user`` as a column. A longer path keeps the
+    nested object, so an outer ``extra`` is not overwritten by an inner one.
+    """
+    key = parts[0]
+    rest = parts[1:]
+    if not rest:
+        return {name: item for name, item in container.items() if name != key}
+    kept: dict[str, Any] = {}
+    for name, item in container.items():
+        if name == key and isinstance(item, Mapping):
+            kept[name] = _without_leaf(item, rest)
+            continue
+        kept[name] = item
+    return kept
 
 
 def _exploded(rows: list[dict[str, Any]], path: str) -> list[dict[str, Any]]:
@@ -144,9 +371,12 @@ def _exploded(rows: list[dict[str, Any]], path: str) -> list[dict[str, Any]]:
     both carry; a scalar element is written under the path's last segment; a
     mapping entry's key is kept as ``<segment>_key``. The exploded value itself
     is not repeated on every row. A row with nothing at the path yields none.
+    Sibling fields of the container stay on the row.
     """
-    name = path.rsplit(".", 1)[-1]
-    head, _, _ = path.partition(".")
+    parts = [part for part in path.split(".") if part]
+    if not parts:
+        return []
+    name = parts[-1]
     exploded: list[dict[str, Any]] = []
     for row in rows:
         value = _resolve_path(row, path)
@@ -156,12 +386,46 @@ def _exploded(rows: list[dict[str, Any]], path: str) -> list[dict[str, Any]]:
             entries = [(None, item) for item in value]
         else:
             continue
-        parent = {key: item for key, item in row.items() if key != head}
+        # Only the payload column `value` is a copy of the exploded collection.
+        # Dropping every mapping that happened to hold an equal list removed a
+        # sibling such as `summary` and its `total`. The container is applied
+        # after the other fields, so its own `user` wins over an outer one
+        # whichever key was written first.
+        parent: dict[str, Any] = {}
+        root = parts[0]
+        for key, item in row.items():
+            if len(parts) == 1 and key == name:
+                continue
+            if (
+                key == "value"
+                and isinstance(item, Mapping)
+                and name in item
+                and item.get(name) == value
+            ):
+                continue
+            if len(parts) > 1 and key == root:
+                continue
+            parent[key] = item
+        if len(parts) > 1 and isinstance(row.get(root), Mapping):
+            for key, item in _without_leaf(row[root], parts[1:]).items():
+                # The container's own fields never replace an engine column. A
+                # state field called `phase` put "draft" where the round number
+                # was, and every outcome grouped or joined on it read the state.
+                # It is kept under the container's name instead.
+                if key in parent and _is_engine_column(key):
+                    parent[_container_column(parent, root, key)] = item
+                else:
+                    parent[key] = item
         for key, element in entries:
             child = dict(parent)
             if key is not None:
                 child[f"{name}_key"] = key
             if isinstance(element, Mapping):
+                # The element wins every name both carry, the round included. A
+                # record's own `phase` is the round it belongs to -- an article
+                # carries the round it was published in -- and by-round outcomes
+                # group on it. Keeping the row's round instead put every record
+                # of a final snapshot in the last round.
                 child.update(dict(element))
             else:
                 child[name] = element
@@ -183,24 +447,20 @@ def _relation(sources: Mapping[str, Any], name: str) -> Iterable[Any]:
     return relation
 
 
-def _final_position(entries: list[Any]) -> int:
-    """Index of the latest committed version among state entries.
+_NO_ROW = object()
 
-    Falls back to the last position when no entry carries a version, which is
-    what a caller supplying the full history in order has always received.
-    """
-    best, best_version = len(entries) - 1, None
-    for position, entry in enumerate(entries):
-        if isinstance(entry, Mapping):
-            version = entry.get("state_version")
-        elif isinstance(entry, tuple | list) and len(entry) == 2:
-            version = entry[0]
-        else:
-            version = None
-        if isinstance(version, int) and not isinstance(version, bool):
-            if best_version is None or version >= best_version:
-                best, best_version = position, version
-    return best
+
+def _entry_version(entry: Any) -> int | None:
+    """The committed version a state entry carries, or ``None``."""
+    if isinstance(entry, Mapping):
+        version = entry.get("state_version")
+    elif isinstance(entry, tuple | list) and len(entry) == 2:
+        version = entry[0]
+    else:
+        version = None
+    if isinstance(version, int) and not isinstance(version, bool):
+        return version
+    return None
 
 
 def materialize_datasets(
@@ -215,9 +475,7 @@ def materialize_datasets(
     datasets = plan.get("datasets") or []
     compiled: dict[str, list[dict[str, Any]]] = {}
     for dataset in datasets:
-        dataset_id = str(dataset.get("id", ""))
-        if not dataset_id:
-            raise ValueError("OUTCOME_PLAN: dataset requires an id")
+        dataset_id = check_dataset_id(dataset.get("id"))
         source = dataset.get("source") or {}
         kind = str(source.get("kind", "events"))
         rows: list[dict[str, Any]] = []
@@ -262,15 +520,41 @@ def materialize_datasets(
                     continue
                 row = {key: value for key, value in artifact.items() if key != "payload"}
                 if payload is not None:
+                    had_value = "value" in payload
+                    original = payload.get("value")
                     for key, value in payload.items():
                         if key not in row:
                             row[key] = value
-                    if isinstance(payload.get("value"), Mapping):
-                        row.update({key: value for key, value in payload["value"].items()})
+                    if isinstance(original, Mapping):
+                        # An inner field named value wins, and it is that field,
+                        # not the payload. Only a scalar payload is also stored
+                        # under the declared artifact id. A mapping with no field
+                        # of its own named value is the payload that was spread,
+                        # so the column still repeats those fields.
+                        row.update({key: value for key, value in original.items()})
+                        if "value" in original:
+                            row["__own_value__"] = True
+                        elif original:
+                            row["__mapping_payload__"] = True
+                    elif had_value and not isinstance(original, list | tuple):
+                        declared = str(payload.get("declared_artifact_id") or "")
+                        # The scalar is copied under the declared id, and the
+                        # `value` column is then the duplicate. When that id is
+                        # itself `value`, the column is the artifact and stays.
+                        # A list is the collection ``explode`` walks. Treating it
+                        # as a scalar removed ``value``, so ``explode: value``
+                        # yielded no rows.
+                        if declared and declared != "value" and declared not in row:
+                            row[declared] = original
+                            row["__scalar_payload__"] = True
                 rows.append(row)
         elif kind == "state":
             snapshot = str(source.get("snapshot", "final"))
-            state_rows = list(_relation(sources, "state"))
+            # Streamed, not listed: the service passes the history as a factory
+            # precisely so no round's snapshot stays resident, and listing it
+            # first held every snapshot at once -- 40 MB to return one `final`
+            # row from 40 rounds of 1 MB state.
+            state_rows = _relation(sources, "state")
 
             # The service supplies state history as dict-shaped snapshots
             # (with a state_version key); tolerate legacy (version, snapshot)
@@ -287,17 +571,37 @@ def materialize_datasets(
                     return entry[1]
                 return None
 
-            if snapshot == "final" and state_rows:
+            if snapshot == "final":
                 # The last *committed* version, not the last row: the service
                 # supplies one row per round, in round order, and rounds can
-                # interleave, so the final commit is not necessarily last.
-                record = _snapshot(state_rows[_final_position(state_rows)])
-                if record is not None:
-                    record = dict(record)
-                    field = str(source.get("state") or "")
-                    if field and field in record:
-                        record = {field: record[field]}
-                    rows.append(record)
+                # interleave, so the final commit is not necessarily last. Each
+                # candidate is projected as it arrives, so only one field is held.
+                field = str(source.get("state") or "")
+
+                def _projected(entry: Any, field: str = field) -> dict[str, Any] | None:
+                    record = _snapshot(entry)
+                    if record is None:
+                        return None
+                    if field:
+                        # The named field is the row, not the rest of the
+                        # snapshot. The round travels with it, as it does for
+                        # each completed round: a placeholder for a missing
+                        # field used to occupy ``phase`` and hide the round.
+                        return _named_state_row(record, field)
+                    return dict(record)
+
+                chosen: Any = _NO_ROW
+                last: Any = _NO_ROW
+                best_version: int | None = None
+                for entry in state_rows:
+                    last = entry
+                    version = _entry_version(entry)
+                    if version is not None and (best_version is None or version >= best_version):
+                        best_version, chosen = version, _projected(entry)
+                if best_version is None and last is not _NO_ROW:
+                    chosen = _projected(last)
+                if chosen is not _NO_ROW and chosen is not None:
+                    rows.append(chosen)
             elif snapshot == "each_completed_round":
                 # F8: keep the FINAL committed snapshot of each completed
                 # round, not one row per state commit (a phase may contain
@@ -308,14 +612,18 @@ def materialize_datasets(
                 # from a phase in which no round completed (a process failed,
                 # was left active, or was skipped) and are dropped (F4).
                 round_rows: dict[Any, dict[str, Any]] = {}
+                field = str(source.get("state") or "")
                 for entry in state_rows:
                     record = _snapshot(entry)
                     if record is None:
                         continue
-                    row = dict(record)
-                    round_key = row.get("_round")
+                    round_key = record.get("_round")
                     if round_key == _INCOMPLETE_ROUND:
                         continue
+                    if field:
+                        row = _named_state_row(record, field)
+                    else:
+                        row = dict(record)
                     if round_key is None:
                         round_rows.setdefault(id(row), row)
                     else:
@@ -342,6 +650,33 @@ def materialize_datasets(
                 }
                 for row in rows
             ]
+        if kind == "artifacts":
+            # Drop the payload copy before explode and derived fields. A scalar
+            # payload was already written under the declared artifact id. A
+            # record's own field named value is not that payload, so it stays.
+            field_names = {
+                str(step.get("name"))
+                for step in (dataset.get("fields") or [])
+                if isinstance(step, Mapping) and step.get("name")
+            }
+            prepared: list[dict[str, Any]] = []
+            for row in rows:
+                row = dict(row)
+                scalar_payload = bool(row.pop("__scalar_payload__", False))
+                mapping_payload = bool(row.pop("__mapping_payload__", False))
+                own_value = bool(row.pop("__own_value__", False))
+                repeats = isinstance(row.get("value"), Mapping) and _value_repeats_row(
+                    row["value"], row
+                )
+                if (
+                    not own_value
+                    and "value" not in field_names
+                    and "value" in row
+                    and (scalar_payload or mapping_payload or repeats)
+                ):
+                    del row["value"]
+                prepared.append(row)
+            rows = prepared
         explode = dataset.get("explode")
         if isinstance(explode, str) and explode:
             rows = _exploded(rows, explode)
@@ -389,6 +724,17 @@ def compile_outcome_plan(build_path: Any) -> dict[str, Any]:
     plan.setdefault("datasets", [])
     plan.setdefault("outcomes", [])
     plan.setdefault("traces", [])
+    seen: set[str] = set()
+    for dataset in plan["datasets"] or []:
+        if isinstance(dataset, Mapping):
+            dataset_id = check_dataset_id(dataset.get("id"))
+            # The compiler refuses a duplicate in a written specification, but a
+            # build's plan is loaded as plain JSON -- and an imported bundle's is
+            # copied verbatim -- and datasets materialise keyed by id, so the
+            # first declaration's rows silently vanished.
+            if dataset_id in seen:
+                raise ValueError(f"OUTCOME_PLAN: dataset id {dataset_id!r} is declared twice")
+            seen.add(dataset_id)
     return plan
 
 

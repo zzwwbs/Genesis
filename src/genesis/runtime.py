@@ -1982,11 +1982,23 @@ class Scheduler:
             raise ValueError("scheduled phase must be numeric")
         self._scheduled.append(ScheduledProcess(process_id, phase))
 
-    def consume_scheduled(self, process_id: str, phase: int | float) -> None:
+    def consume_scheduled(self, process_id: str, phase: int | float) -> ScheduledProcess | None:
+        """Remove and return the entry a turn consumes, or ``None`` if it had none.
+
+        Returned rather than only dropped so a turn that pauses without committing
+        can put it back: the entry is what made the process ready, and losing it
+        left the batch's remaining actors unrunnable -- one entry for a two-actor
+        batch, so the paused actor's retry consumed the entry its sibling needed.
+        """
         for index, item in enumerate(self._scheduled):
             if item.process_id == process_id and item.phase <= phase:
-                self._scheduled.pop(index)
-                return
+                return self._scheduled.pop(index)
+        return None
+
+    def restore_scheduled(self, entry: ScheduledProcess | None) -> None:
+        """Put back an entry a turn consumed but did not commit (see above)."""
+        if entry is not None:
+            self._scheduled.append(entry)
 
     def _untriggered(
         self, process_id: str, phase: int | float, state: Mapping[str, Any] | None
@@ -2308,10 +2320,16 @@ class RunController:
         self.lease_lost = False
         # The last declared phase of this run, for stopped_with_work_remaining.
         self._terminal_phase: int | None = None
+        # The phase a stop was noticed in, and whether nothing was left to run
+        # in it; see stopped_with_work_remaining.
+        self._stopped_at: tuple[int | float, bool] | None = None
         self._executed: list[str] = []
         # Invocation id -> the highest attempt already committed, so a resumed
         # run continues after it instead of re-emitting a committed attempt id.
         self._committed_attempts: dict[str, int] = {}
+        # Invocation id -> the (process, actors) turn it belongs to, so two
+        # different turns that spell the same id are refused, not merged.
+        self._invocation_owners: dict[str, tuple[str, tuple[str, ...]]] = {}
         self.state_store, self.persistence = state_store, persistence
         self.artifact_store = artifact_store
         self.output_schema_validator = output_schema_validator
@@ -2785,6 +2803,16 @@ class RunController:
                 self._committed_attempts[invocation] = max(
                     self._committed_attempts.get(invocation, 0), attempt
                 )
+            # Owners come from the ledger too, so a turn resumed after a pause
+            # cannot inherit an id a different turn committed before it.
+            if invocation and event.get("process_id") is not None:
+                self._invocation_owners.setdefault(
+                    invocation,
+                    (
+                        str(event.get("process_id")),
+                        tuple(str(actor) for actor in event.get("actors") or ()),
+                    ),
+                )
         if events:
             self._last_event_id = str(events[-1].get("event_id")) or None
         completed = [
@@ -3029,7 +3057,51 @@ class RunController:
         """
         if self._terminal_phase is None:
             return True
+        stopped = self._stopped_at
+        if stopped is not None and stopped[1] and stopped[0] >= self._terminal_phase:
+            return False
         return int(self._next_phase or 0) <= int(self._terminal_phase)
+
+    def _invocation_id(self, scope: _RunScope, turn: _ActorTurn) -> str:
+        """The id every attempt of one actor's turn shares, claimed for that turn.
+
+        Claimed here, not only when a call is prepared: the attempt cursor is
+        read from this id before anything is prepared, and a turn whose id
+        another turn already committed inherited that turn's attempts, ran none,
+        and was never prepared -- so the collision went unrefused and the turn
+        was silently skipped.
+        """
+        actor_suffix = f"-{'-'.join(turn.actor_ids)}" if turn.actor_ids else ""
+        invocation_id = f"{scope.run_id}-{turn.process_id}{actor_suffix}-{turn.phase}"
+        self._claim_invocation_id(invocation_id, turn.process_id, turn.actor_ids)
+        return invocation_id
+
+    def _claim_invocation_id(
+        self, invocation_id: str, process_id: str, actor_ids: tuple[str, ...]
+    ) -> None:
+        """Refuse an invocation id that already belongs to a different turn.
+
+        The id joins run, process, actors and phase with hyphens, and process and
+        actor ids contain hyphens themselves, so process `vote` with actor
+        `final-x` and process `vote-final` with actor `x` both became
+        `r-vote-final-x-0`. The retry cursor counts attempts per id, so the second
+        turn inherited the first's committed attempt, ran no attempts at all and
+        was still reported executed: a process silently dropped from a run that
+        reported completed. Before the cursor existed the same collision failed
+        loudly on a differing commit. The id format is kept -- changing it would
+        change the event id of every existing run -- and a collision is refused
+        instead, at the point it would happen.
+        """
+        owner = (str(process_id), tuple(str(actor) for actor in actor_ids))
+        held = self._invocation_owners.setdefault(str(invocation_id), owner)
+        if held != owner:
+            raise ValueError(
+                f"INVOCATION_ID_COLLISION: invocation '{invocation_id}' is claimed by "
+                f"process '{held[0]}' with actors {list(held[1])} and by process "
+                f"'{owner[0]}' with actors {list(owner[1])}; the process and actor ids "
+                "join ambiguously with '-', so rename one process or actor id so the "
+                "two cannot spell the same invocation"
+            )
 
     def _next_attempt(self, invocation_id: str) -> int:
         """The attempt number to dispatch next for one invocation.
@@ -3039,6 +3111,28 @@ class RunController:
         attempt id under a different dispatch order.
         """
         return self._committed_attempts.get(str(invocation_id), 0) + 1
+
+    def _next_attempt_or_fail(self, scope: _RunScope, turn: _ActorTurn) -> int:
+        """This turn's next attempt, refusing a turn whose retries are spent.
+
+        A ledger that already carries a terminal ``process_failed`` at
+        ``max_attempts`` -- a run stopped between that commit and its terminal
+        transition, or a replay of a failed run -- leaves no attempt to make. The
+        serial path ran none at all and let the invocation vanish while the run
+        reported completed; the concurrent path executed an attempt beyond the
+        declared policy. Both now end the run, as the uninterrupted run that
+        recorded that failure did.
+        """
+        invocation_id = self._invocation_id(scope, turn)
+        attempt = self._next_attempt(invocation_id)
+        if attempt > turn.max_attempts:
+            self.status = "failed"
+            raise _ReportedProcessFailure(
+                f"process {turn.process_id} has no attempt left for invocation "
+                f"'{invocation_id}': {turn.max_attempts} were declared and the ledger "
+                "already records a terminal failure at the last of them"
+            )
+        return attempt
 
     def _record_committed_attempt(self, invocation_id: str, attempt: int) -> None:
         self._committed_attempts[str(invocation_id)] = max(
@@ -3066,7 +3160,6 @@ class RunController:
         before the executor runs.
         """
         actor_seed_id = "\x1f".join(turn.actor_ids)
-        actor_suffix = f"-{'-'.join(turn.actor_ids)}" if turn.actor_ids else ""
         view = turn.view
         # A measurement used only under some conditions or rounds is not resolved
         # outside them, so the process cannot read it there at all.
@@ -3103,8 +3196,9 @@ class RunController:
             and stream_id in shared_streams
             else None
         )
+        invocation_id = self._invocation_id(scope, turn)
         call = ProcessInvocation(
-            f"{scope.run_id}-{turn.process_id}{actor_suffix}-{turn.phase}",
+            invocation_id,
             scope.run_id,
             turn.process_id,
             actor_ids=turn.actor_ids,
@@ -3860,6 +3954,96 @@ class RunController:
             self.budget_exhausted = True
         self.status = "completed"
 
+    def _ready_from(
+        self,
+        scheduler_state: Mapping[str, Any],
+        phase: int | float,
+        executed_this_phase: set[str],
+    ) -> list[ScheduledProcess]:
+        """The turns the scheduler would choose now, as the run loop chooses them.
+
+        Shared by the phase-start stop check and the inner loop, so a stop
+        observed at either point answers "was anything left to run?" the same
+        way. An open simultaneous batch finishes before anything else and its
+        trigger is not re-evaluated (CON-008).
+        """
+        ready = [
+            item
+            for item in self.scheduler.ready(phase, state=scheduler_state)
+            if item.process_id not in executed_this_phase
+        ]
+        open_batch = next(
+            (
+                process_id
+                for (process_id, batch_phase), open_view in self._batch_views.items()
+                if open_view.simultaneous
+                and batch_phase == phase
+                and process_id not in executed_this_phase
+                and self._actor_queues.get((process_id, batch_phase))
+            ),
+            None,
+        )
+        if open_batch is not None:
+            ready = [
+                ScheduledProcess(open_batch, phase),
+                *(entry for entry in ready if entry.process_id != open_batch),
+            ]
+        return ready
+
+    def _pending_work(
+        self,
+        ready: list[ScheduledProcess],
+        phase: int | float,
+        state: Mapping[str, Any],
+    ) -> bool:
+        """Whether a stop would leave a turn unrun.
+
+        ``ready`` includes a ``terminal_skip`` process, a process whose actors
+        resolve to nobody, and a feedback consumer deferred by ``skip_consumer``.
+        The loop runs none of those, so counting one as work left a finished run
+        ``running`` with ``RUN_LEASE_LOST``.
+        """
+        for item in ready:
+            process = self.scheduler.processes.get(item.process_id)
+            if not isinstance(process, Mapping):
+                return True
+            if (
+                self._terminal_phase is not None
+                and phase >= self._terminal_phase
+                and process.get("terminal_skip", False)
+            ):
+                continue
+            # skip_consumer defers the process and runs nothing until history
+            # exists. Counting it as ready left a finished phase ``running``.
+            # The parents this records belong to a real dispatch, so a stop
+            # check puts them back.
+            feedback_parents = self._feedback_parents
+            try:
+                try:
+                    _slots, feedback_blocked = self._feedback_history(process, phase)
+                except ValueError:
+                    return True
+            finally:
+                self._feedback_parents = feedback_parents
+            if feedback_blocked:
+                continue
+            actor_key = (item.process_id, phase)
+            queued = self._actor_queues.get(actor_key)
+            if queued is not None:
+                if queued:
+                    return True
+                continue
+            try:
+                groups = expand_actor_instances(process, state)
+            except ValueError:
+                return True
+            if any(
+                (item.process_id, phase, group) not in self._completed_actor_occurrences
+                for group in groups
+            ):
+                return True
+        return False
+
     def _run_batch_concurrently(
         self,
         scope: _RunScope,
@@ -3868,6 +4052,7 @@ class RunController:
         limit: int,
         max_events: int | None,
         executed: list[str],
+        first_entry: ScheduledProcess | None = None,
     ) -> bool:
         """Run a batch's remaining calls concurrently, committing in actor order (CON-012).
 
@@ -3876,12 +4061,20 @@ class RunController:
         so dispatch and commit orders, state and records match a one-at-a-time run.
         Returns ``False`` when the run must stop -- paused, cancelled or out of its
         event budget -- leaving unfinished actors queued for a resume (CON-014).
+
+        ``first_entry`` is the scheduled entry the caller consumed for this batch's
+        first turn; a turn that pauses without committing puts its own entry back,
+        and the first turn puts this one back.
         """
         queue = self._actor_queues[batch_key]
         pending: deque[tuple[_ActorTurn, ProcessInvocation, Future[Any]]] = deque()
         prepare_error: Exception | None = None
         stopped_cleanly = False
         first_turn = True
+        # Reinserted after pending calls are restored. Inserting it first put the
+        # paused actor at the head, and _discard_pending then placed its siblings
+        # in front of it, so resume committed them out of order.
+        paused_actor: tuple[str, ...] | None = None
         pool = ThreadPoolExecutor(
             max_workers=limit, thread_name_prefix=f"genesis-{template.process_id}"
         )
@@ -3903,7 +4096,15 @@ class RunController:
                 ):
                     turn = replace(template, actor_ids=queue.pop(0))
                     try:
-                        call = self._prepare_call(scope, turn, 1)
+                        # The next attempt after what the ledger holds. Prepared
+                        # as attempt 1 while committed from the cursor, a batch
+                        # resumed after a failed attempt ran an attempt-1
+                        # invocation recorded as attempt 2 -- a concurrent run
+                        # recording something a serial one would not (CON-012).
+                        # Refused outright when the ledger already spent them all.
+                        call = self._prepare_call(
+                            scope, turn, self._next_attempt_or_fail(scope, turn)
+                        )
                     except Exception as exc:
                         # A serial run commits every earlier actor before this one
                         # fails to prepare, so those are committed first. The actor
@@ -3923,12 +4124,26 @@ class RunController:
                     stopped_cleanly = True
                     return False
                 turn, call, future = pending.popleft()
-                if not first_turn:
-                    # The serial loop consumes one scheduled entry per actor turn;
-                    # the first was consumed before this batch began.
-                    self.scheduler.consume_scheduled(turn.process_id, turn.phase)
+                # The serial loop consumes one scheduled entry per actor turn; the
+                # first was consumed before this batch began, by the caller.
+                entry = (
+                    first_entry
+                    if first_turn
+                    else self.scheduler.consume_scheduled(turn.process_id, turn.phase)
+                )
                 first_turn = False
-                self._commit_turn(scope, turn, call, future.result())
+                try:
+                    self._commit_turn(scope, turn, call, future.result())
+                except _ProviderPause:
+                    # A pause commits nothing for this turn, so it goes back at the
+                    # head of its queue with the readiness it consumed. Left out,
+                    # an in-process resume skipped the actor and still reported the
+                    # run completed; left consumed, the entry its sibling needed
+                    # was gone. The serial path does the same. The insert happens
+                    # after pending calls are put back, or those calls land in front.
+                    self.scheduler.restore_scheduled(entry)
+                    paused_actor = turn.actor_ids
+                    raise
                 executed.append(turn.process_id)
                 self._event_count += 1
                 self.scheduler.mark_started(turn.process_id, turn.phase)
@@ -3946,6 +4161,8 @@ class RunController:
                 # them run on, and spend, after their results can no longer be used.
                 self.cancel_event.set()
             self._discard_pending(pending, queue)
+            if paused_actor is not None:
+                queue.insert(0, paused_actor)
             pool.shutdown(wait=False, cancel_futures=True)
 
     def _commit_turn(
@@ -3955,8 +4172,12 @@ class RunController:
         call: ProcessInvocation,
         outcome: ProcessResult | _ExecutorRaised,
     ) -> None:
-        """Commit one actor's executed attempt, then any retries, in serial order."""
-        attempt = self._next_attempt(call.invocation_id)
+        """Commit one actor's executed attempt, then any retries, in serial order.
+
+        Numbered by the attempt the call was prepared as, so what the executor
+        ran and what the ledger records cannot disagree.
+        """
+        attempt = int(call.attempt)
         while True:
             dispatch_order = self._log_dispatch(turn, call, attempt)
             if self._commit_attempt(turn, call, dispatch_order, attempt, outcome):
@@ -4218,6 +4439,7 @@ class RunController:
             raise ValueError("controller cannot be reused for a different run")
         self.status, self._run_id = "running", run_id
         self._terminal_phase = terminal_phase
+        self._stopped_at = None
         self._phase_start = int(phase_start)
         if self.state_store is None and state is not None:
             # A caller may provide a lightweight initial snapshot without a
@@ -4249,11 +4471,32 @@ class RunController:
         stop_phase = phase_end + 1 if phase_end is not None else phase_limit
         start_phase = max(self._next_phase, phase_start)
         for phase in range(start_phase, stop_phase):
+            executed_this_phase: set[str] = set()
+            # The state this phase starts from: the stop check below needs to know
+            # what is ready, and the phase-start ring snapshot is the same state,
+            # so it is captured once and read by both.
+            snapshot_now = self.state_store.snapshot() if self.state_store else dict(state or {})
+            start_state = {
+                **snapshot_now,
+                "condition": condition,
+                "protocol": {"phase": phase},
+            }
+            # Asked at the phase start with readiness known, so a stop says
+            # whether this phase had anything left. `_next_phase` advances only
+            # when a phase's loop ends and a resume sets it to the last committed
+            # phase, so a lease lost at the first check of a fully committed
+            # terminal phase reported work remaining and left a finished run
+            # running with its cell reported failed.
             if self._poll_external_status():
+                self._stopped_at = (
+                    phase,
+                    not self._pending_work(
+                        self._ready_from(start_state, phase, set()), phase, start_state
+                    ),
+                )
                 return executed
             if self.status in {"paused", "cancelled"}:
                 return executed
-            executed_this_phase: set[str] = set()
             # Capture the state snapshot at the START of every phase for the
             # state-feedback ring (feedback lag N reads the ring at phase - N).
             # Resuming re-enters the interrupted phase with state that is
@@ -4262,7 +4505,6 @@ class RunController:
             # is never overwritten. Otherwise pausing mid-round changed what
             # later readers saw, making an operational interruption alter the
             # simulation's information flow.
-            snapshot_now = self.state_store.snapshot() if self.state_store else dict(state or {})
             if self._speculative_round_start == phase:
                 # Reconstructed from the interrupted round before it finished;
                 # the round has now completed, so record its real end state.
@@ -4271,49 +4513,27 @@ class RunController:
             else:
                 self._round_state_at_phase.setdefault(phase, snapshot_now)
             while True:
-                if self._poll_external_status():
-                    return executed
-                scheduler_state = (
-                    self.state_store.snapshot() if self.state_store else dict(state or {})
-                )
                 scheduler_state = {
-                    **scheduler_state,
+                    **(self.state_store.snapshot() if self.state_store else dict(state or {})),
                     "condition": condition,
                     "protocol": {"phase": phase},
                 }
-                ready = [
-                    item
-                    for item in self.scheduler.ready(
+                ready = self._ready_from(scheduler_state, phase, executed_this_phase)
+                # Polled once what remains is known, so a stop says whether this
+                # phase had anything left (see the check at the phase start).
+                if self._poll_external_status():
+                    self._stopped_at = (
                         phase,
-                        state=scheduler_state,
+                        not self._pending_work(ready, phase, scheduler_state),
                     )
-                    if item.process_id not in executed_this_phase
-                ]
-                # An open simultaneous batch finishes before anything else runs,
-                # and its trigger is not re-evaluated: it was evaluated once, as
-                # the batch began, so a sibling's commit cannot stop the batch
-                # part-way (CON-008).
-                open_batch = next(
-                    (
-                        process_id
-                        for (process_id, batch_phase), open_view in self._batch_views.items()
-                        if open_view.simultaneous
-                        and batch_phase == phase
-                        and process_id not in executed_this_phase
-                        and self._actor_queues.get((process_id, batch_phase))
-                    ),
-                    None,
-                )
-                if open_batch is not None:
-                    ready = [
-                        ScheduledProcess(open_batch, phase),
-                        *(entry for entry in ready if entry.process_id != open_batch),
-                    ]
+                    return executed
                 if not ready:
                     break
                 item = ready[0]
                 executed_this_phase.add(item.process_id)
-                self.scheduler.consume_scheduled(item.process_id, phase)
+                # Kept, not merely dropped: if this turn pauses without
+                # committing, the readiness that made it run goes back with it.
+                consumed = self.scheduler.consume_scheduled(item.process_id, phase)
                 process = self.scheduler.processes[item.process_id]
                 feedback_slots, feedback_blocked = self._feedback_history(process, phase)
                 if feedback_blocked:
@@ -4414,8 +4634,11 @@ class RunController:
                         feedback_slots=feedback_slots,
                         view=self._batch_views.get(actor_key),
                     )
+                    # The batch's first turn is the one whose entry this loop
+                    # consumed; `_run_batch_concurrently` restores it, and its own
+                    # turns' entries, if a pause interrupts the batch.
                     if not self._run_batch_concurrently(
-                        scope, actor_key, template, batch_limit, max_events, executed
+                        scope, actor_key, template, batch_limit, max_events, executed, consumed
                     ):
                         return executed
                     self._actor_queues.pop(actor_key, None)
@@ -4434,13 +4657,26 @@ class RunController:
                     feedback_slots=feedback_slots,
                     view=self._batch_views.get(actor_key),
                 )
-                first_attempt = self._next_attempt(self._prepare_call(scope, turn, 1).invocation_id)
-                for attempt in range(first_attempt, max_attempts + 1):
-                    call = self._prepare_call(scope, turn, attempt)
-                    dispatch_order = self._log_dispatch(turn, call, attempt)
-                    outcome = self._execute_call(turn, call)
-                    if self._commit_attempt(turn, call, dispatch_order, attempt, outcome):
-                        break
+                # Refused outright when the ledger already spent every attempt:
+                # the range below would be empty and the invocation would vanish.
+                first_attempt = self._next_attempt_or_fail(scope, turn)
+                try:
+                    for attempt in range(first_attempt, max_attempts + 1):
+                        call = self._prepare_call(scope, turn, attempt)
+                        dispatch_order = self._log_dispatch(turn, call, attempt)
+                        outcome = self._execute_call(turn, call)
+                        if self._commit_attempt(turn, call, dispatch_order, attempt, outcome):
+                            break
+                except _ProviderPause:
+                    # The actor was taken off its queue before its turn, and a
+                    # pause commits nothing for it. Left off, an in-process
+                    # resume skipped it and still reported the run completed; and
+                    # with the readiness that made it run also dropped, a sibling
+                    # whose only readiness was that same effect was left without
+                    # one -- the paused actor's retry consumed the entry it needed.
+                    self._actor_queues[actor_key].insert(0, actor_ids)
+                    self.scheduler.restore_scheduled(consumed)
+                    raise
                 executed.append(item.process_id)
                 self._event_count += 1
                 self.scheduler.mark_started(item.process_id, phase)

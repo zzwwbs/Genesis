@@ -249,3 +249,36 @@ def test_a_dataset_may_declare_a_column_named_value(tmp_path: Path) -> None:
     assert "value" in tables["d"][0], "the declared column survives the artifact strip"
     assert tables["d"][0]["value"] == 1
     assert "value" in dictionary["d"]["columns"]
+
+
+def test_an_imported_run_keeps_the_dataset_tables_its_bundle_carried(tmp_path: Path) -> None:
+    """evaluate_outcomes returns an import's snapshot and never rebuilt datasets,
+    and the import never read the bundle's datasets/ -- so every table was lost
+    across the round trip (2026-09-26 N8)."""
+    service = GenesisService(tmp_path)
+    try:
+        draft = service.create_specification(STUDY)
+        service.approve_specification("tables", draft["version"], "researcher")
+        build = service.compile_study(None, "builds/tables", specification_id="tables")["path"]
+        service.create_run({"id": "run", "study_id": "tables", "build": build})
+        service.execute_run("run", executor_overrides={"tick": lambda _inv: {}})
+        service.export_run("run", "exports/run")
+        original, _ = service.run_datasets("run")
+    finally:
+        service.close()
+    # Imported elsewhere, as a bundle is: another workspace, with no build to
+    # rebuild the tables from.
+    import shutil
+
+    elsewhere = GenesisService(tmp_path / "elsewhere")
+    try:
+        shutil.copytree(tmp_path / "exports" / "run", tmp_path / "elsewhere" / "bundle")
+        elsewhere.import_run("bundle", run_id="imported")
+        tables, dictionary = elsewhere.run_datasets("imported")
+        assert list(tables) == ["rounds"]
+        assert [row["phase"] for row in tables["rounds"]] == [
+            row["phase"] for row in original["rounds"]
+        ]
+        assert dictionary["rounds"]["rows"] == 3
+    finally:
+        elsewhere.close()
