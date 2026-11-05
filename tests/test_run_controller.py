@@ -156,25 +156,6 @@ def test_context_uses_committed_state_for_later_processes() -> None:
     assert seen == [2]
 
 
-def test_preflight_reports_estimates_limits_and_dependency_availability() -> None:
-    c = controller(
-        [
-            {"id": "p", "context_policy": "private", "executor": {"mode": "generative"}},
-            {"id": "q", "context_policy": "private", "dependencies": {"after": ["p"]}},
-        ],
-        lambda call: {},
-    )
-
-    report = c.preflight(phase_limit=5, replications=3, conditions=2, max_events=10)
-
-    assert report["phase_limit"] == 5
-    assert report["estimated_runs"] == 6
-    assert report["estimated_process_invocations"] == 12
-    assert report["estimated_generative_calls"] == 3
-    assert report["limits"]["max_events"] == 10
-    assert report["dependencies_available"] is True
-
-
 def test_mid_run_cancellation_stops_dispatch(tmp_path) -> None:
     """AW-18: cancelling a running controller halts further dispatch."""
     import threading

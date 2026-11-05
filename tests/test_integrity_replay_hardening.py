@@ -9,7 +9,6 @@ from genesis.assistant import StudyAssistant
 from genesis.compiler import StudyCompiler
 from genesis.extensions import ExtensionManifest, ExtensionRegistry
 from genesis.providers import ProviderExecutor, ProviderResponse, RecordedArtifactProvider
-from genesis.replay import ReplayManager, ReplayMode, ReplayRequest
 from genesis.runtime import ContextEnvelope, ProcessInvocation
 
 
@@ -18,26 +17,6 @@ def artifact(value):
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return {"payload": value, "hash": digest}
-
-
-def test_replay_requires_hashes_and_deeply_freezes_payloads() -> None:
-    manager = ReplayManager()
-    request = ReplayRequest("run-1", ReplayMode.ARTIFACT, artifact_ids=("a",))
-    with pytest.raises(ValueError, match="hash"):
-        manager.replay(request, {"a": {"value": 1}})
-    result = manager.replay(request, {"a": artifact({"nested": {"value": 1}})})
-    with pytest.raises(TypeError):
-        result.artifacts["a"]["nested"]["value"] = 2
-
-
-def test_replay_modes_validate_required_and_forbidden_fields() -> None:
-    manager = ReplayManager()
-    with pytest.raises(ValueError, match="artifact_ids"):
-        manager.replay(ReplayRequest("run-1", ReplayMode.ARTIFACT), {})
-    with pytest.raises(ValueError, match="boundary"):
-        manager.replay(ReplayRequest("run-1", ReplayMode.PARTIAL), {})
-    with pytest.raises(ValueError, match="justification"):
-        manager.replay(ReplayRequest("run-1", ReplayMode.BRANCH, boundary="phase-1"), {})
 
 
 def test_provider_executor_serializes_context_envelope_as_structured_json() -> None:

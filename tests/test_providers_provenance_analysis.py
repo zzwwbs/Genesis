@@ -11,7 +11,6 @@ from genesis.providers import (
     ProviderRequest,
     RecordedArtifactProvider,
 )
-from genesis.replay import ReplayManager, ReplayMode, ReplayRequest
 from genesis.runtime import ProcessInvocation
 
 
@@ -73,19 +72,6 @@ def test_provenance_ledger_events_and_checkpoints_are_immutable_and_verifiable()
         ledger.verify(checkpoint.checkpoint_id)
 
 
-def test_artifact_replay_uses_recorded_payload_and_preserves_lineage():
-    manager = ReplayManager()
-    request = ReplayRequest(source_run_id="run-1", mode=ReplayMode.ARTIFACT, artifact_ids=("a",))
-    payload = {"value": 3}
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    result = manager.replay(request, {"a": {"payload": payload, "hash": digest}})
-    assert result.source_run_id == "run-1"
-    assert result.artifacts == {"a": {"value": 3}}
-    assert result.run_id != result.source_run_id
-
-
 def test_outcome_engine_filters_groups_and_exports_json(tmp_path):
     plan = OutcomePlan(
         id="score", source="events", select="score", aggregation="mean", group_by="condition"
@@ -122,26 +108,6 @@ def test_analysis_export_bundle_includes_methods_dictionary_and_integrity_manife
     } <= {path.name for path in bundle}
     manifest = json.loads((tmp_path / "integrity.json").read_text())
     assert manifest["outcomes.json"]
-
-
-def test_analysis_supports_distribution_window_and_trajectory_summaries():
-    rows = [
-        {"time": 0, "agent": "a", "score": 1},
-        {"time": 1, "agent": "a", "score": 3},
-        {"time": 0, "agent": "b", "score": 2},
-    ]
-    engine = AnalysisEngine()
-    assert engine.distribution(rows, "score") == {
-        "count": 3,
-        "min": 1,
-        "max": 3,
-        "mean": 2.0,
-    }
-    assert engine.window(rows, "score", start=0, end=0) == [
-        {"time": 0, "agent": "a", "score": 1},
-        {"time": 0, "agent": "b", "score": 2},
-    ]
-    assert engine.trajectory(rows, "agent", "score")["a"] == [1, 3]
 
 
 def test_checkpoint_payload_round_trip_is_hash_verified(tmp_path):

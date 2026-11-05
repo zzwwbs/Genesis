@@ -6,7 +6,6 @@ import csv
 import hashlib
 import json
 import math
-import statistics
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -330,45 +329,6 @@ class AnalysisEngine:
         for index, item in enumerate(values):
             result.setdefault(f"group_{index}", _unwrap_group(item))
         return result
-
-    def window(
-        self,
-        rows: list[dict[str, Any]],
-        field: str,
-        *,
-        start: int | float,
-        end: int | float,
-        time_field: str = "time",
-    ) -> list[dict[str, Any]]:
-        """Select rows whose declared temporal coordinate is within [start, end]."""
-        if end < start:
-            raise ValueError("window end must not precede start")
-        return [
-            dict(row) for row in rows if start <= row.get(time_field, 0) <= end and field in row
-        ]
-
-    def distribution(self, rows: list[dict[str, Any]], field: str) -> dict[str, Any]:
-        values = [row[field] for row in rows if row.get(field) is not None]
-        if not values:
-            return {"count": 0, "min": None, "max": None, "mean": None}
-        return {
-            "count": len(values),
-            "min": min(values),
-            "max": max(values),
-            "mean": statistics.mean(values),
-        }
-
-    def trajectory(
-        self, rows: list[dict[str, Any]], group_by: str, field: str, *, time_field: str = "time"
-    ) -> dict[Any, list[Any]]:
-        grouped: dict[Any, list[dict[str, Any]]] = {}
-        for row in rows:
-            if row.get(field) is not None:
-                grouped.setdefault(row.get(group_by), []).append(row)
-        return {
-            key: [row[field] for row in sorted(group, key=lambda item: item.get(time_field, 0))]
-            for key, group in grouped.items()
-        }
 
 
 def _duckdb_is_exact(

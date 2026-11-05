@@ -4,7 +4,6 @@ from genesis.runtime import (
     ArtifactStore,
     ContextEngine,
     ExecutorRegistry,
-    GenerativeExecutor,
     ProcessInvocation,
     ProcessResult,
     Scheduler,
@@ -112,18 +111,12 @@ def test_artifact_store_enforces_metadata_schema_owner_visibility_lineage_and_im
     assert store.metadata("a")["lineage"] == []
 
 
-def test_additional_executor_modes_and_generative_metadata_hook():
-    seen = []
+def test_additional_executor_modes():
     registry = ExecutorRegistry()
     registry.register("comp", lambda c: {"x": 1}, mode="computational")
     registry.register("ext", lambda c: {"x": 2}, mode="extension")
-    registry.register(
-        "gen", GenerativeExecutor(lambda c: {"x": 3}, metadata_hook=lambda m: seen.append(m))
-    )
     assert registry.execute("comp", call()).outputs == {"x": 1}
     assert registry.execute("ext", call()).outputs == {"x": 2}
-    registry.execute("gen", call())
-    assert seen
 
 
 def test_seed_includes_experiment_condition_replication_and_scheduler_repeats():

@@ -1020,20 +1020,3 @@ def validate_schema(schema: dict[str, Any], value: Any, path: str = "root") -> l
     carry full instance paths derived from the validator.
     """
     return _authoritative_validate_schema(schema, value)
-
-
-class ProviderRegistry:
-    def __init__(self, providers: dict[str, ModelProvider] | None = None):
-        self._providers = dict(providers or {})
-
-    def register(self, name: str, provider: ModelProvider) -> None:
-        self._providers[name] = provider
-
-    def get(self, name: str) -> ModelProvider:
-        try:
-            return self._providers[name]
-        except KeyError:
-            raise NotFoundError(f"provider unavailable: {name}") from None
-
-    def capabilities(self) -> dict[str, ProviderCapabilities]:
-        return {name: provider.capabilities() for name, provider in self._providers.items()}

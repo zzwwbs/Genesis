@@ -34,8 +34,8 @@ DB = WORKSPACE / ".genesis" / "genesis.db"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", default="pilot-large-gate-3")
-    parser.add_argument("--new-id", default="baseline-realization-1")
+    parser.add_argument("--run", required=True)
+    parser.add_argument("--new-id", required=True)
     args = parser.parse_args()
 
     con = sqlite3.connect(DB)

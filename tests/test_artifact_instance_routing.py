@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from genesis.persistence import PersistenceCoordinator
 from genesis.runtime import (
     ArtifactStore,
@@ -143,3 +145,41 @@ def test_recovered_controller_hydrates_prior_artifacts_for_pending_consumers(tmp
     assert len(consumer.calls) == 2
     assert all(len(call.inputs) == 1 for call in consumer.calls)
     persistence.close()
+
+
+def test_a_turn_whose_commit_fails_leaves_no_artifact_in_memory(tmp_path) -> None:
+    """The backup is now the set of ids; undo must still drop the failed turn's artifact."""
+    persistence = PersistenceCoordinator(tmp_path / "genesis.db", tmp_path / "objects")
+    real_commit = persistence.commit_process_result
+    calls = []
+
+    def commit_then_fail(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real_commit(*args, **kwargs)
+
+    persistence.commit_process_result = commit_then_fail  # type: ignore[method-assign]
+    store = ArtifactStore(
+        {"creator-strategy": {"id": "creator-strategy", "schema_ref": "strategy"}}
+    )
+    controller = RunController(
+        Scheduler(
+            [
+                {
+                    "id": "form-strategy",
+                    "actors": ["creator-1", "creator-2"],
+                    "context_policy": "private",
+                    "outputs": [{"artifact_type": "creator-strategy", "schema_ref": "strategy"}],
+                }
+            ]
+        ),
+        ExecutorRegistry({"form-strategy": StrategyProducer()}),
+        ContextEngine({"private": {"allow": []}}),
+        artifact_store=store,
+        persistence=persistence,
+    )
+    with pytest.raises(OSError, match="disk full"):
+        controller.run("study-run", phase_limit=1)
+    kept = store.resolve(["creator-strategy"], phase=0)
+    assert [record["value"]["creator"] for record in kept.values()] == ["creator-1"]

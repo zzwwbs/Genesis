@@ -1373,6 +1373,8 @@ class ArtifactStore:
         """
         resolved: dict[str, Any] = {}
         for reference in references:
+            # shortcut: scans every artifact per input (~3 s per input over an 11k-event
+            # run, quadratic); index by type and producer if runs pass ~50k events.
             eligible = [
                 instance_id
                 for instance_id, metadata in self._metadata.items()
@@ -1398,11 +1400,16 @@ class ArtifactStore:
                 }
         return resolved
 
-    def snapshot(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-        return copy.deepcopy(self._artifacts), copy.deepcopy(self._metadata)
+    def snapshot(self) -> frozenset[str]:
+        # The ids alone: `put` never replaces an instance, so undoing a turn only
+        # removes what it added. A deep copy of every artifact on every commit
+        # cost ~250 ms per turn at 11k artifacts.
+        return frozenset(self._artifacts)
 
-    def restore(self, snapshot: tuple[dict[str, Any], dict[str, dict[str, Any]]]) -> None:
-        self._artifacts, self._metadata = copy.deepcopy(snapshot)
+    def restore(self, snapshot: frozenset[str]) -> None:
+        for instance_id in [key for key in self._artifacts if key not in snapshot]:
+            del self._artifacts[instance_id]
+            self._metadata.pop(instance_id, None)
 
 
 class DeterministicExecutor:
@@ -1419,24 +1426,6 @@ class StochasticExecutor:
 
     def execute(self, invocation: ProcessInvocation) -> ProcessResult:
         return ProcessResult(outputs=self.function(invocation, random.Random(invocation.seed)))
-
-
-class GenerativeExecutor:
-    def __init__(
-        self,
-        function: Callable[[ProcessInvocation], Mapping[str, Any]],
-        metadata_hook: Callable[[Mapping[str, Any]], Any] | None = None,
-    ):
-        self.function = function
-        self.metadata_hook = metadata_hook
-
-    def execute(self, invocation: ProcessInvocation) -> ProcessResult:
-        output = self.function(invocation)
-        if self.metadata_hook:
-            self.metadata_hook(
-                {"executor": "generative", "invocation_id": invocation.invocation_id}
-            )
-        return ProcessResult(outputs=output, metadata={"mode": "generative"})
 
 
 def _invocation_namespace(invocation: ProcessInvocation) -> dict[str, Any]:
@@ -2696,6 +2685,8 @@ class RunController:
         dependencies = process.get("dependencies", {})
         after = dependencies.get("after", []) if isinstance(dependencies, Mapping) else []
         for dependency in after if isinstance(after, list | tuple) else []:
+            # shortcut: scans every completed event per turn (~3 s per dependency at 11k
+            # events, quadratic); index by process and actor if runs pass ~50k events.
             candidates = [
                 event
                 for event in self._completed_process_events
@@ -2731,38 +2722,6 @@ class RunController:
         }
         delta.update({key: None for key in before if key not in after})
         return delta
-
-    def preflight(
-        self,
-        *,
-        phase_limit: int = 100,
-        replications: int = 1,
-        conditions: int = 1,
-        max_events: int | None = None,
-    ) -> dict[str, Any]:
-        """Return a deterministic estimate without dispatching any executor."""
-        if phase_limit < 1 or replications < 1 or conditions < 1:
-            raise ValueError("phase_limit, replications, and conditions must be positive")
-        process_count = len(self.scheduler.processes)
-        estimated_runs = replications * conditions
-        generative_processes = sum(
-            1
-            for process in self.scheduler.processes.values()
-            if process.get("executor", {}).get("mode") == "generative"
-        )
-        return {
-            "status": "ready",
-            "phase_limit": phase_limit,
-            "estimated_runs": estimated_runs,
-            "estimated_process_invocations": estimated_runs * process_count,
-            "estimated_generative_calls": generative_processes * replications,
-            "dependencies_available": True,
-            "limits": {"max_events": max_events, "replications": replications},
-            "credentials_present": False,
-            "warnings": ["external provider credentials are not configured"]
-            if generative_processes
-            else [],
-        }
 
     def _restore_persisted_frontier(self, run_id: str) -> None:
         if (
@@ -3021,7 +2980,7 @@ class RunController:
 
     def _sync_persisted_state_version(self) -> None:
         if self.state_store:
-            self.state_store.restore(self.state_store.snapshot(), self._persisted_count)
+            self.state_store.version = self._persisted_count
 
     @staticmethod
     def expand_runs(

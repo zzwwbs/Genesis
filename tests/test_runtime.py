@@ -4,7 +4,6 @@ from genesis.runtime import (
     ContextEngine,
     DeterministicExecutor,
     ExecutorRegistry,
-    GenerativeExecutor,
     ProcessInvocation,
     RecordedArtifactExecutor,
     RunController,
@@ -58,13 +57,11 @@ def test_executor_registry_supports_modes_and_recorded_outputs():
     registry = ExecutorRegistry()
     registry.register("det", DeterministicExecutor(lambda call: {"value": call.seed}))
     registry.register("stoch", StochasticExecutor(lambda call, rng: {"value": rng.randrange(100)}))
-    registry.register("gen", GenerativeExecutor(lambda call: {"text": "hello"}))
     registry.register("rec", RecordedArtifactExecutor({"text": "saved"}))
     assert registry.execute("det", invocation()).outputs == {"value": 7}
     first = registry.execute("stoch", invocation(seed=11)).outputs
     second = registry.execute("stoch", invocation(seed=11)).outputs
     assert first == second
-    assert registry.execute("gen", invocation()).outputs == {"text": "hello"}
     assert registry.execute("rec", invocation()).outputs == {"text": "saved"}
 
 
